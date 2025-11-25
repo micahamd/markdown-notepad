@@ -16,6 +16,9 @@ import os
 import io
 import base64
 import hashlib
+import tempfile
+import zipfile
+import threading
 from pathlib import Path
 
 # Try to import PIL for image handling
@@ -47,6 +50,81 @@ try:
     MARKDOWN_AVAILABLE = True
 except ImportError:
     MARKDOWN_AVAILABLE = False
+
+
+class ImageExtractor:
+    """
+    Extracts images from documents alongside MarkItDown conversion.
+    Supports: DOCX, PPTX, XLSX (Office Open XML formats use ZIP with embedded images)
+    """
+    
+    SUPPORTED_EXTENSIONS = {'.docx', '.pptx', '.xlsx'}
+    IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.emf', '.wmf'}
+    
+    @staticmethod
+    def can_extract(filepath):
+        """Check if we can extract images from this file type"""
+        ext = Path(filepath).suffix.lower()
+        return ext in ImageExtractor.SUPPORTED_EXTENSIONS
+    
+    @staticmethod
+    def extract_images(filepath, output_dir):
+        """
+        Extract images from Office documents.
+        Returns a dict mapping original image paths to extracted file paths.
+        """
+        extracted = {}
+        ext = Path(filepath).suffix.lower()
+        
+        if ext not in ImageExtractor.SUPPORTED_EXTENSIONS:
+            return extracted
+        
+        try:
+            # Office Open XML formats are ZIP files
+            with zipfile.ZipFile(filepath, 'r') as zf:
+                for name in zf.namelist():
+                    # Images are typically in word/media/, ppt/media/, xl/media/
+                    if '/media/' in name.lower():
+                        img_ext = Path(name).suffix.lower()
+                        if img_ext in ImageExtractor.IMAGE_EXTENSIONS:
+                            # Extract to output directory
+                            img_filename = Path(name).name
+                            output_path = os.path.join(output_dir, img_filename)
+                            
+                            # Handle duplicates
+                            counter = 1
+                            base, ext_part = os.path.splitext(output_path)
+                            while os.path.exists(output_path):
+                                output_path = f"{base}_{counter}{ext_part}"
+                                counter += 1
+                            
+                            # Extract the image
+                            with zf.open(name) as src, open(output_path, 'wb') as dst:
+                                dst.write(src.read())
+                            
+                            extracted[name] = output_path
+        except Exception as e:
+            print(f"Error extracting images: {e}")
+        
+        return extracted
+    
+    @staticmethod
+    def insert_image_references(markdown_text, extracted_images, output_dir):
+        """
+        Append extracted image references to the markdown text.
+        """
+        if not extracted_images:
+            return markdown_text
+        
+        # Add a section for extracted images
+        image_section = "\n\n---\n\n## Extracted Images\n\n"
+        for orig_path, local_path in extracted_images.items():
+            filename = os.path.basename(local_path)
+            # Use relative path from output directory
+            rel_path = os.path.basename(local_path)
+            image_section += f"![{filename}]({rel_path})\n\n"
+        
+        return markdown_text + image_section
 
 
 class ImageHandler:
@@ -394,53 +472,58 @@ class ImageViewerWindow(tk.Toplevel):
 class MarkdownVisualWidget(tk.Frame):
     """
     A widget for rendering markdown visually with image support.
-    Falls back to styled text if tkhtmlview is not available.
+    Optimized for performance with large documents using a single Text widget.
     """
+    
+    # Chunk size for progressive rendering
+    RENDER_CHUNK_SIZE = 100  # lines per chunk
     
     def __init__(self, parent, base_path=None, **kwargs):
         super().__init__(parent, **kwargs)
         self.content = ""
         self.base_path = base_path or os.getcwd()
         self.image_handler = ImageHandler(self.base_path)
-        self.image_widgets = []  # Track embedded image widgets
+        self.embedded_images = {}  # Track embedded images by text index
+        self._render_job = None  # For cancelling pending renders
         self._setup_widget()
     
     def _setup_widget(self):
-        """Setup the visual rendering widget"""
-        # Always use text widget for better image control
-        # (tkhtmlview has limitations with images)
+        """Setup the visual rendering widget - single Text widget for performance"""
+        # Main text widget with scrollbar
+        self.text_frame = ttk.Frame(self)
+        self.text_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Create scrollable frame
-        self.canvas = tk.Canvas(self, bg="#ffffff", highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.canvas.yview)
-        self.scrollable_frame = ttk.Frame(self.canvas)
-        
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-        
-        self.canvas_frame = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-        
-        # Bind canvas resize to adjust frame width
-        self.canvas.bind('<Configure>', self._on_canvas_configure)
-        
-        # Bind mousewheel scrolling
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        
+        self.scrollbar = ttk.Scrollbar(self.text_frame, orient=tk.VERTICAL)
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        self.render_mode = "canvas"
-    
-    def _on_canvas_configure(self, event):
-        """Adjust scrollable frame width when canvas resizes"""
-        self.canvas.itemconfig(self.canvas_frame, width=event.width - 10)
+        self.text_widget = tk.Text(
+            self.text_frame,
+            wrap=tk.WORD,
+            font=("Segoe UI", 11),
+            padx=20,
+            pady=15,
+            bg="#ffffff",
+            relief=tk.FLAT,
+            borderwidth=0,
+            yscrollcommand=self.scrollbar.set,
+            cursor="arrow",
+            state=tk.DISABLED
+        )
+        self.text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.scrollbar.config(command=self.text_widget.yview)
+        
+        # Setup text tags for styling
+        self._setup_text_tags()
+        
+        # Bind mousewheel
+        self.text_widget.bind("<MouseWheel>", self._on_mousewheel)
+        
+        self.render_mode = "text"
     
     def _on_mousewheel(self, event):
         """Handle mousewheel scrolling"""
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.text_widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
     
     def set_base_path(self, path):
         """Set the base path for resolving relative image paths"""
@@ -448,185 +531,74 @@ class MarkdownVisualWidget(tk.Frame):
         self.image_handler.base_path = path
     
     def set_content(self, markdown_text):
-        """Set and render markdown content with images"""
+        """Set and render markdown content with images - optimized for large files"""
+        # Cancel any pending render
+        if self._render_job:
+            self.after_cancel(self._render_job)
+            self._render_job = None
+        
         self.content = markdown_text
         
         # Clear previous content
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-        self.image_widgets.clear()
+        self.text_widget.config(state=tk.NORMAL)
+        self.text_widget.delete(1.0, tk.END)
+        self.embedded_images.clear()
         self.image_handler.clear_caches()
         
         # Find all images in the text
         images = self.image_handler.find_images(markdown_text)
         
-        # Render content with images
-        self._render_with_images(markdown_text, images)
-    
-    def _render_with_images(self, markdown_text, images):
-        """Render markdown text with inline images"""
-        current_pos = 0
-        row = 0
+        # For small documents, render immediately
+        # For large documents, render progressively
+        line_count = markdown_text.count('\n')
         
-        for img_info in images:
-            # Render text before this image
-            if img_info['start'] > current_pos:
-                text_before = markdown_text[current_pos:img_info['start']]
-                if text_before.strip():
-                    row = self._render_text_block(text_before, row)
-            
-            # Render the image
-            row = self._render_image(img_info, row)
-            current_pos = img_info['end']
-        
-        # Render remaining text after last image
-        if current_pos < len(markdown_text):
-            text_after = markdown_text[current_pos:]
-            if text_after.strip():
-                self._render_text_block(text_after, row)
-    
-    def _render_text_block(self, text, row):
-        """Render a block of markdown text"""
-        text_widget = tk.Text(
-            self.scrollable_frame,
-            wrap=tk.WORD,
-            font=("Segoe UI", 11),
-            padx=20,
-            pady=10,
-            bg="#ffffff",
-            relief=tk.FLAT,
-            borderwidth=0,
-            height=1  # Start small, will resize
-        )
-        text_widget.grid(row=row, column=0, sticky="ew", padx=5, pady=2)
-        
-        # Configure text tags
-        self._setup_text_tags(text_widget)
-        
-        # Render the markdown
-        self._render_markdown_to_widget(text, text_widget)
-        
-        # Auto-resize to content
-        text_widget.update_idletasks()
-        line_count = int(text_widget.index('end-1c').split('.')[0])
-        text_widget.config(height=line_count)
-        text_widget.config(state=tk.DISABLED)
-        
-        return row + 1
-    
-    def _render_image(self, img_info, row):
-        """Render an image with thumbnail and click-to-expand"""
-        # Create frame for image
-        img_frame = ttk.Frame(self.scrollable_frame)
-        img_frame.grid(row=row, column=0, sticky="w", padx=25, pady=10)
-        
-        # Try to load the image
-        image = self.image_handler.load_image(img_info)
-        
-        if image and PIL_AVAILABLE:
-            # Create thumbnail
-            photo = self.image_handler.get_photo_image(image, thumbnail=True, max_size=(200, 200))
-            
-            if photo:
-                # Create clickable image label
-                img_label = ttk.Label(img_frame, image=photo, cursor="hand2")
-                img_label.image = photo  # Keep reference
-                img_label.pack(side=tk.LEFT)
-                
-                # Bind click to open full image
-                img_label.bind("<Button-1>", lambda e, img=image, alt=img_info.get('alt', ''): 
-                              self._show_full_image(img, alt))
-                
-                # Add hover effect
-                img_label.bind("<Enter>", lambda e, l=img_label: l.configure(relief="solid"))
-                img_label.bind("<Leave>", lambda e, l=img_label: l.configure(relief="flat"))
-                
-                self.image_widgets.append(img_label)
-                
-                # Add info label
-                alt_text = img_info.get('alt', '')
-                if image:
-                    size_info = f"{image.size[0]}x{image.size[1]}"
-                    info_text = f"{alt_text}\n{size_info} (click to expand)" if alt_text else f"{size_info} (click to expand)"
-                else:
-                    info_text = alt_text or "(click to expand)"
-                
-                info_label = ttk.Label(
-                    img_frame, 
-                    text=info_text,
-                    font=("Segoe UI", 9, "italic"),
-                    foreground="#666666"
-                )
-                info_label.pack(side=tk.LEFT, padx=10)
-            else:
-                self._render_image_placeholder(img_frame, img_info, "Could not render image")
+        if line_count < 500:
+            self._render_content(markdown_text, images)
+            self.text_widget.config(state=tk.DISABLED)
         else:
-            self._render_image_placeholder(img_frame, img_info, "Image not available")
-        
-        return row + 1
+            # Progressive rendering for large documents
+            self._render_progressive(markdown_text, images, 0)
     
-    def _render_image_placeholder(self, parent, img_info, message):
-        """Render a placeholder when image can't be displayed"""
-        placeholder = ttk.Frame(parent, relief="solid", borderwidth=1)
-        placeholder.pack(side=tk.LEFT)
+    def _render_progressive(self, full_text, images, start_line):
+        """Render content progressively to avoid UI freeze"""
+        lines = full_text.split('\n')
+        end_line = min(start_line + self.RENDER_CHUNK_SIZE, len(lines))
         
-        inner = ttk.Frame(placeholder, padding=10)
-        inner.pack()
+        # Render this chunk
+        chunk = '\n'.join(lines[start_line:end_line])
+        chunk_lines_text = '\n'.join(lines[start_line:end_line])
+        chunk_images = [img for img in images 
+                        if img.get('full_match') and img['full_match'] in chunk_lines_text]
         
-        ttk.Label(inner, text="🖼️", font=("Segoe UI", 24)).pack()
-        ttk.Label(inner, text=message, font=("Segoe UI", 9)).pack()
+        self._render_content(chunk, chunk_images, is_chunk=True)
         
-        alt_text = img_info.get('alt', '')
-        if alt_text:
-            ttk.Label(inner, text=alt_text, font=("Segoe UI", 9, "italic")).pack()
+        # Schedule next chunk or finalize
+        if end_line < len(lines):
+            self._render_job = self.after(10, 
+                lambda: self._render_progressive(full_text, images, end_line))
+        else:
+            self.text_widget.config(state=tk.DISABLED)
+            self._render_job = None
     
-    def _show_full_image(self, image, alt_text=""):
-        """Show full-size image in popup window"""
-        title = f"Image: {alt_text}" if alt_text else "Image Viewer"
-        ImageViewerWindow(self.winfo_toplevel(), image, title)
-    
-    def _setup_text_tags(self, text_widget):
-        """Setup text tags for markdown styling"""
-        # Heading styles
-        text_widget.tag_configure("h1", font=("Segoe UI", 24, "bold"), spacing3=10, foreground="#1a1a2e")
-        text_widget.tag_configure("h2", font=("Segoe UI", 20, "bold"), spacing3=8, foreground="#16213e")
-        text_widget.tag_configure("h3", font=("Segoe UI", 16, "bold"), spacing3=6, foreground="#1f4068")
-        text_widget.tag_configure("h4", font=("Segoe UI", 14, "bold"), spacing3=4, foreground="#1b1b2f")
-        text_widget.tag_configure("h5", font=("Segoe UI", 12, "bold"), spacing3=3, foreground="#1b1b2f")
-        text_widget.tag_configure("h6", font=("Segoe UI", 11, "bold"), spacing3=2, foreground="#1b1b2f")
+    def _render_content(self, markdown_text, images, is_chunk=False):
+        """Render markdown content efficiently into the single text widget"""
+        # Build a map of image positions
+        image_positions = {img['start']: img for img in images}
         
-        # Inline styles
-        text_widget.tag_configure("bold", font=("Segoe UI", 11, "bold"))
-        text_widget.tag_configure("italic", font=("Segoe UI", 11, "italic"))
-        text_widget.tag_configure("code", font=("Consolas", 10), background="#f0f0f0", foreground="#c7254e")
-        text_widget.tag_configure("code_block", font=("Consolas", 10), background="#2d2d2d", foreground="#f8f8f2", spacing1=5, spacing3=5)
-        
-        # Block styles
-        text_widget.tag_configure("blockquote", font=("Segoe UI", 11, "italic"), foreground="#6c757d", lmargin1=30, lmargin2=30)
-        text_widget.tag_configure("list_item", lmargin1=20, lmargin2=40)
-        text_widget.tag_configure("link", foreground="#0066cc", underline=True)
-        text_widget.tag_configure("hr", font=("Segoe UI", 6), foreground="#cccccc")
-        
-        # Table styles
-        text_widget.tag_configure("table", font=("Consolas", 10), background="#f9f9f9")
-    
-    def _render_markdown_to_widget(self, markdown_text, text_widget):
-        """Render markdown as styled text to a text widget"""
         lines = markdown_text.split('\n')
         in_code_block = False
         code_block_content = []
         
-        for i, line in enumerate(lines):
-            # Skip image lines (already rendered separately)
-            if re.match(r'!\[.*?\]\(.*?\)', line.strip()):
-                continue
+        for line in lines:
+            # Check if this line contains an image
+            img_match = re.match(r'!\[.*?\]\(.*?\)', line.strip())
             
             # Handle code blocks
             if line.strip().startswith('```'):
                 if in_code_block:
                     code_text = '\n'.join(code_block_content) + '\n'
-                    text_widget.insert(tk.END, code_text, "code_block")
-                    text_widget.insert(tk.END, '\n')
+                    self.text_widget.insert(tk.END, code_text, "code_block")
+                    self.text_widget.insert(tk.END, '\n')
                     code_block_content = []
                     in_code_block = False
                 else:
@@ -637,41 +609,134 @@ class MarkdownVisualWidget(tk.Frame):
                 code_block_content.append(line)
                 continue
             
+            # Handle images - insert placeholder with embedded image
+            if img_match and PIL_AVAILABLE:
+                # Find the matching image info
+                for img in images:
+                    if img.get('full_match') and img['full_match'] in line:
+                        self._insert_image_inline(img)
+                        break
+                else:
+                    # No matching image found, render as text
+                    self.text_widget.insert(tk.END, line + '\n')
+                continue
+            
             # Headers
             if line.startswith('######'):
-                text_widget.insert(tk.END, line[6:].strip() + '\n', "h6")
+                self.text_widget.insert(tk.END, line[6:].strip() + '\n', "h6")
             elif line.startswith('#####'):
-                text_widget.insert(tk.END, line[5:].strip() + '\n', "h5")
+                self.text_widget.insert(tk.END, line[5:].strip() + '\n', "h5")
             elif line.startswith('####'):
-                text_widget.insert(tk.END, line[4:].strip() + '\n', "h4")
+                self.text_widget.insert(tk.END, line[4:].strip() + '\n', "h4")
             elif line.startswith('###'):
-                text_widget.insert(tk.END, line[3:].strip() + '\n', "h3")
+                self.text_widget.insert(tk.END, line[3:].strip() + '\n', "h3")
             elif line.startswith('##'):
-                text_widget.insert(tk.END, line[2:].strip() + '\n', "h2")
+                self.text_widget.insert(tk.END, line[2:].strip() + '\n', "h2")
             elif line.startswith('#'):
-                text_widget.insert(tk.END, line[1:].strip() + '\n', "h1")
+                self.text_widget.insert(tk.END, line[1:].strip() + '\n', "h1")
             
             # Horizontal rule
             elif line.strip() in ['---', '***', '___']:
-                text_widget.insert(tk.END, '─' * 60 + '\n', "hr")
+                self.text_widget.insert(tk.END, '─' * 60 + '\n', "hr")
             
             # Blockquote
             elif line.startswith('>'):
-                text_widget.insert(tk.END, line[1:].strip() + '\n', "blockquote")
+                self.text_widget.insert(tk.END, '  │ ' + line[1:].strip() + '\n', "blockquote")
             
             # List items
             elif re.match(r'^[\*\-\+]\s', line.strip()):
-                text_widget.insert(tk.END, '  • ' + line.strip()[2:] + '\n', "list_item")
+                self.text_widget.insert(tk.END, '  • ' + line.strip()[2:] + '\n', "list_item")
             elif re.match(r'^\d+\.\s', line.strip()):
-                text_widget.insert(tk.END, '  ' + line.strip() + '\n', "list_item")
+                self.text_widget.insert(tk.END, '  ' + line.strip() + '\n', "list_item")
             
             # Table rows
             elif '|' in line:
-                text_widget.insert(tk.END, line + '\n', "table")
+                self.text_widget.insert(tk.END, line + '\n', "table")
             
             # Normal text
             else:
-                text_widget.insert(tk.END, line + '\n')
+                self.text_widget.insert(tk.END, line + '\n')
+    
+    def _insert_image_inline(self, img_info):
+        """Insert an image inline in the text widget"""
+        # Try to load the image
+        image = self.image_handler.load_image(img_info)
+        
+        if image:
+            # Create thumbnail
+            photo = self.image_handler.get_photo_image(image, thumbnail=True, max_size=(200, 200))
+            
+            if photo:
+                # Insert image into text widget
+                self.text_widget.image_create(tk.END, image=photo, padx=10, pady=5)
+                
+                # Store reference and image for click handling
+                index = self.text_widget.index(tk.END + "-2c")
+                self.embedded_images[index] = (photo, image, img_info.get('alt', ''))
+                
+                # Add caption
+                alt_text = img_info.get('alt', '')
+                size_info = f"{image.size[0]}x{image.size[1]}"
+                caption = f"  {alt_text} ({size_info})" if alt_text else f"  ({size_info})"
+                self.text_widget.insert(tk.END, caption + '\n', "image_caption")
+                
+                # Bind click on images
+                self.text_widget.tag_bind("image", "<Button-1>", self._on_image_click)
+                return
+        
+        # Fallback: show placeholder text
+        alt = img_info.get('alt', 'image')
+        self.text_widget.insert(tk.END, f"\n  [🖼️ {alt}]\n", "image_placeholder")
+    
+    def _on_image_click(self, event):
+        """Handle click on embedded image"""
+        # Find which image was clicked
+        index = self.text_widget.index(f"@{event.x},{event.y}")
+        for img_index, (photo, full_image, alt) in self.embedded_images.items():
+            # Check if click is near this image
+            if self.text_widget.compare(index, ">=", img_index + "-1c") and \
+               self.text_widget.compare(index, "<=", img_index + "+1c"):
+                self._show_full_image(full_image, alt)
+                break
+    
+    def _show_full_image(self, image, alt_text=""):
+        """Show full-size image in popup window"""
+        title = f"Image: {alt_text}" if alt_text else "Image Viewer"
+        ImageViewerWindow(self.winfo_toplevel(), image, title)
+    
+    def _setup_text_tags(self):
+        """Setup text tags for markdown styling on the main text widget"""
+        tw = self.text_widget
+        
+        # Heading styles
+        tw.tag_configure("h1", font=("Segoe UI", 24, "bold"), spacing3=10, foreground="#1a1a2e")
+        tw.tag_configure("h2", font=("Segoe UI", 20, "bold"), spacing3=8, foreground="#16213e")
+        tw.tag_configure("h3", font=("Segoe UI", 16, "bold"), spacing3=6, foreground="#1f4068")
+        tw.tag_configure("h4", font=("Segoe UI", 14, "bold"), spacing3=4, foreground="#1b1b2f")
+        tw.tag_configure("h5", font=("Segoe UI", 12, "bold"), spacing3=3, foreground="#1b1b2f")
+        tw.tag_configure("h6", font=("Segoe UI", 11, "bold"), spacing3=2, foreground="#1b1b2f")
+        
+        # Inline styles
+        tw.tag_configure("bold", font=("Segoe UI", 11, "bold"))
+        tw.tag_configure("italic", font=("Segoe UI", 11, "italic"))
+        tw.tag_configure("code", font=("Consolas", 10), background="#f0f0f0", foreground="#c7254e")
+        tw.tag_configure("code_block", font=("Consolas", 10), background="#2d2d2d", foreground="#f8f8f2", 
+                        spacing1=5, spacing3=5, lmargin1=20, lmargin2=20)
+        
+        # Block styles
+        tw.tag_configure("blockquote", font=("Segoe UI", 11, "italic"), foreground="#6c757d", 
+                        lmargin1=30, lmargin2=30, borderwidth=2)
+        tw.tag_configure("list_item", lmargin1=20, lmargin2=40)
+        tw.tag_configure("link", foreground="#0066cc", underline=True)
+        tw.tag_configure("hr", font=("Segoe UI", 6), foreground="#cccccc", justify="center")
+        
+        # Table styles
+        tw.tag_configure("table", font=("Consolas", 10), background="#f9f9f9", lmargin1=10)
+        
+        # Image styles
+        tw.tag_configure("image_caption", font=("Segoe UI", 9, "italic"), foreground="#666666")
+        tw.tag_configure("image_placeholder", font=("Segoe UI", 10), foreground="#999999", 
+                        background="#f5f5f5", lmargin1=20)
     
     def get_content(self):
         """Get the current content"""
@@ -692,6 +757,8 @@ class MarkdownNotepad(tk.Tk):
         self.current_file = None
         self.is_modified = False
         self.current_mode = "source"  # "source" or "visual"
+        self.word_wrap = True  # Word wrap toggle
+        self.extracted_images_dir = None  # Directory for extracted images
         
         # Initialize MarkItDown
         if MARKITDOWN_AVAILABLE:
@@ -779,6 +846,17 @@ class MarkdownNotepad(tk.Tk):
         view_menu.add_command(label="Visual Mode", command=self._show_visual_mode, accelerator="Ctrl+2")
         view_menu.add_separator()
         view_menu.add_command(label="Toggle Mode", command=self._toggle_mode, accelerator="Ctrl+E")
+        view_menu.add_separator()
+        
+        # Word wrap toggle
+        self.wrap_var = tk.BooleanVar(value=True)
+        view_menu.add_checkbutton(label="Word Wrap", variable=self.wrap_var, 
+                                   command=self._toggle_word_wrap, accelerator="Ctrl+W")
+        
+        # Large file mode
+        self.large_file_var = tk.BooleanVar(value=False)
+        view_menu.add_checkbutton(label="Large File Mode (faster)", variable=self.large_file_var,
+                                   command=self._toggle_large_file_mode)
         
         # Format menu (for source mode)
         format_menu = tk.Menu(menubar, tearoff=0)
@@ -861,11 +939,15 @@ class MarkdownNotepad(tk.Tk):
         self.position_label = ttk.Label(self.status_bar, text="Line 1, Col 1")
         self.position_label.pack(side=tk.RIGHT, padx=10)
         
+        # Wrap indicator
+        self.wrap_label = ttk.Label(self.status_bar, text="Wrap: On")
+        self.wrap_label.pack(side=tk.RIGHT, padx=10)
+        
         self.mode_label = ttk.Label(self.status_bar, text="Source Mode")
         self.mode_label.pack(side=tk.RIGHT, padx=10)
         
         # MarkItDown status
-        md_status = "MarkItDown: Available" if MARKITDOWN_AVAILABLE else "MarkItDown: Not installed"
+        md_status = "MarkItDown: ✓" if MARKITDOWN_AVAILABLE else "MarkItDown: ✗"
         self.md_status_label = ttk.Label(self.status_bar, text=md_status)
         self.md_status_label.pack(side=tk.RIGHT, padx=10)
     
@@ -885,11 +967,27 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-Key-1>", lambda e: self._show_source_mode())
         self.bind("<Control-Key-2>", lambda e: self._show_visual_mode())
         self.bind("<Control-e>", lambda e: self._toggle_mode())
+        self.bind("<Control-w>", lambda e: self._toggle_word_wrap())
         
-        # Track modifications
+        # Track modifications - debounced for performance
         self.source_editor.bind("<<Modified>>", self._on_modified)
-        self.source_editor.bind("<KeyRelease>", self._update_position)
+        self._position_update_pending = False
+        self.source_editor.bind("<KeyRelease>", self._schedule_position_update)
         self.source_editor.bind("<ButtonRelease>", self._update_position)
+        
+        # Handle window close
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+    
+    def _schedule_position_update(self, event=None):
+        """Schedule position update with debouncing for performance"""
+        if not self._position_update_pending:
+            self._position_update_pending = True
+            self.after(50, self._do_position_update)
+    
+    def _do_position_update(self):
+        """Actually update position after debounce"""
+        self._position_update_pending = False
+        self._update_position()
         
         # Handle window close
         self.protocol("WM_DELETE_WINDOW", self.quit_app)
@@ -924,6 +1022,32 @@ class MarkdownNotepad(tk.Tk):
         self.status_label.config(text=message)
     
     # === View Mode Methods ===
+    
+    def _toggle_word_wrap(self):
+        """Toggle word wrap in source editor"""
+        self.word_wrap = not self.word_wrap
+        self.wrap_var.set(self.word_wrap)
+        
+        wrap_mode = tk.WORD if self.word_wrap else tk.NONE
+        self.source_editor.config(wrap=wrap_mode)
+        
+        # Update status bar
+        self.wrap_label.config(text=f"Wrap: {'On' if self.word_wrap else 'Off'}")
+        status = "Word wrap enabled" if self.word_wrap else "Word wrap disabled (horizontal scroll)"
+        self._set_status(status)
+    
+    def _toggle_large_file_mode(self):
+        """Toggle large file mode for better performance with big files"""
+        is_large = self.large_file_var.get()
+        
+        if is_large:
+            # Disable expensive operations
+            self.source_editor.config(undo=False)
+            self._set_status("Large file mode: undo disabled for performance")
+        else:
+            # Re-enable
+            self.source_editor.config(undo=True)
+            self._set_status("Normal mode: full features enabled")
     
     def _show_source_mode(self):
         """Switch to source editing mode"""
@@ -999,7 +1123,7 @@ class MarkdownNotepad(tk.Tk):
                 messagebox.showerror("Error", f"Could not open file:\n{e}")
     
     def open_with_markitdown(self):
-        """Open any file and convert with MarkItDown"""
+        """Open any file and convert with MarkItDown, extracting images if possible"""
         if not MARKITDOWN_AVAILABLE:
             messagebox.showwarning(
                 "MarkItDown Not Available",
@@ -1029,8 +1153,43 @@ class MarkdownNotepad(tk.Tk):
                 self._set_status(f"Converting with MarkItDown: {filepath}...")
                 self.update()
                 
+                # Convert with MarkItDown
                 result = self.md_converter.convert(filepath)
                 content = result.text_content
+                
+                # Try to extract images from Office documents
+                extracted_images = {}
+                if ImageExtractor.can_extract(filepath):
+                    # Ask user if they want to extract images
+                    extract = messagebox.askyesno(
+                        "Extract Images?",
+                        "This document may contain images. Would you like to extract them?\n\n"
+                        "Images will be saved alongside your markdown file."
+                    )
+                    
+                    if extract:
+                        # Create output directory for images
+                        base_name = Path(filepath).stem
+                        output_dir = filedialog.askdirectory(
+                            title="Select folder to save extracted images",
+                            mustexist=True
+                        )
+                        
+                        if output_dir:
+                            self._set_status("Extracting images...")
+                            self.update()
+                            
+                            extracted_images = ImageExtractor.extract_images(filepath, output_dir)
+                            
+                            if extracted_images:
+                                # Append image references to content
+                                content = ImageExtractor.insert_image_references(
+                                    content, extracted_images, output_dir
+                                )
+                                
+                                # Set base path for visual viewer
+                                self.visual_viewer.set_base_path(output_dir)
+                                self.extracted_images_dir = output_dir
                 
                 self.source_editor.delete(1.0, tk.END)
                 self.source_editor.insert(1.0, content)
@@ -1039,13 +1198,25 @@ class MarkdownNotepad(tk.Tk):
                 self.current_file = None
                 self.is_modified = True
                 self._update_title()
-                self._set_status(f"Converted: {os.path.basename(filepath)}")
                 
-                messagebox.showinfo(
-                    "Conversion Complete",
-                    f"Successfully converted '{os.path.basename(filepath)}' to Markdown.\n\n"
-                    "Use 'Save As' to save the markdown output."
-                )
+                # Status message
+                img_count = len(extracted_images)
+                if img_count > 0:
+                    self._set_status(f"Converted: {os.path.basename(filepath)} ({img_count} images extracted)")
+                    messagebox.showinfo(
+                        "Conversion Complete",
+                        f"Successfully converted '{os.path.basename(filepath)}' to Markdown.\n\n"
+                        f"Extracted {img_count} image(s) to: {self.extracted_images_dir}\n\n"
+                        "Use 'Save As' to save the markdown output."
+                    )
+                else:
+                    self._set_status(f"Converted: {os.path.basename(filepath)}")
+                    messagebox.showinfo(
+                        "Conversion Complete",
+                        f"Successfully converted '{os.path.basename(filepath)}' to Markdown.\n\n"
+                        "Use 'Save As' to save the markdown output."
+                    )
+                    
             except Exception as e:
                 messagebox.showerror("Conversion Error", f"Could not convert file:\n{e}")
                 self._set_status("Conversion failed")
