@@ -1,0 +1,21 @@
+# MarkItDown Notepad Dependencies
+
+# Core - Microsoft's MarkItDown package with all converters
+markitdown[all]
+
+# Required for image display
+Pillow>=10.0.0
+
+# Optional: For enhanced visual markdown rendering
+tkhtmlview>=0.3.0
+markdown>=3.5.0
+
+# Note: If you only need specific file format support, you can install:
+# markitdown[pdf]       - PDF files
+# markitdown[docx]      - Word documents
+# markitdown[pptx]      - PowerPoint presentations
+# markitdown[xlsx]      - Excel files (newer format)
+# markitdown[xls]       - Excel files (older format)
+# markitdown[outlook]   - Outlook messages
+# markitdown[audio-transcription] - Audio transcription
+# markitdown[youtube-transcription] - YouTube transcription
