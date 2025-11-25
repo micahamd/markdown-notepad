@@ -10,7 +10,7 @@ Features:
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext, font
+from tkinter import ttk, filedialog, messagebox, scrolledtext, font, simpledialog
 import re
 import os
 import io
@@ -19,6 +19,8 @@ import hashlib
 import tempfile
 import zipfile
 import threading
+import queue
+import time
 from pathlib import Path
 
 # Try to import PIL for image handling
@@ -837,7 +839,10 @@ class MarkdownNotepad(tk.Tk):
         edit_menu.add_command(label="Paste", command=self.paste, accelerator="Ctrl+V")
         edit_menu.add_separator()
         edit_menu.add_command(label="Select All", command=self.select_all, accelerator="Ctrl+A")
+        edit_menu.add_separator()
         edit_menu.add_command(label="Find...", command=self.find_text, accelerator="Ctrl+F")
+        edit_menu.add_command(label="Find & Replace...", command=self.find_replace, accelerator="Ctrl+H")
+        edit_menu.add_command(label="Go to Line...", command=self.goto_line, accelerator="Ctrl+G")
         
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -962,12 +967,15 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-y>", lambda e: self.redo())
         self.bind("<Control-a>", lambda e: self.select_all())
         self.bind("<Control-f>", lambda e: self.find_text())
+        self.bind("<Control-h>", lambda e: self.find_replace())
+        self.bind("<Control-g>", lambda e: self.goto_line())
         self.bind("<Control-b>", lambda e: self._insert_format("**", "**"))
         self.bind("<Control-i>", lambda e: self._insert_format("*", "*"))
         self.bind("<Control-Key-1>", lambda e: self._show_source_mode())
         self.bind("<Control-Key-2>", lambda e: self._show_visual_mode())
         self.bind("<Control-e>", lambda e: self._toggle_mode())
         self.bind("<Control-w>", lambda e: self._toggle_word_wrap())
+        self.bind("<F3>", lambda e: self._find_next_f3())
         
         # Track modifications - debounced for performance
         self.source_editor.bind("<<Modified>>", self._on_modified)
@@ -988,9 +996,6 @@ class MarkdownNotepad(tk.Tk):
         """Actually update position after debounce"""
         self._position_update_pending = False
         self._update_position()
-        
-        # Handle window close
-        self.protocol("WM_DELETE_WINDOW", self.quit_app)
     
     def _on_modified(self, event=None):
         """Handle text modification"""
@@ -1346,6 +1351,26 @@ class MarkdownNotepad(tk.Tk):
             return
         self.source_editor.insert(tk.INSERT, text)
     
+    # === Search Methods ===
+    
+    def find_replace(self):
+        """Open find & replace dialog"""
+        FindReplaceDialog(self, self.source_editor)
+    
+    def goto_line(self):
+        """Open go to line dialog"""
+        GoToLineDialog(self, self.source_editor)
+    
+    def _find_next_f3(self):
+        """Find next using F3 (uses last search if available)"""
+        # If there's an active FindReplaceDialog, trigger its find_next
+        for widget in self.winfo_children():
+            if isinstance(widget, FindReplaceDialog):
+                widget.find_next()
+                return
+        # Otherwise open find dialog
+        self.find_text()
+    
     # === Application Methods ===
     
     def quit_app(self):
@@ -1398,6 +1423,330 @@ class MarkdownNotepad(tk.Tk):
             )
         
         messagebox.showinfo("MarkItDown Info", info)
+
+
+class FindReplaceDialog(tk.Toplevel):
+    """Advanced Find & Replace dialog with regex support"""
+    
+    def __init__(self, parent, text_widget):
+        super().__init__(parent)
+        self.text_widget = text_widget
+        self.parent = parent
+        self.title("Find & Replace")
+        self.geometry("500x220")
+        self.resizable(True, False)
+        self.transient(parent)
+        
+        # Track state
+        self.search_pos = "1.0"
+        self.match_count = 0
+        self.all_matches = []
+        
+        self._setup_ui()
+        self._setup_bindings()
+        
+        # Focus search entry
+        self.search_entry.focus()
+    
+    def _setup_ui(self):
+        """Setup the dialog UI"""
+        main_frame = ttk.Frame(self, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Search field
+        search_frame = ttk.Frame(main_frame)
+        search_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(search_frame, text="Find:", width=10).pack(side=tk.LEFT)
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=40)
+        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        # Replace field
+        replace_frame = ttk.Frame(main_frame)
+        replace_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(replace_frame, text="Replace:", width=10).pack(side=tk.LEFT)
+        self.replace_var = tk.StringVar()
+        self.replace_entry = ttk.Entry(replace_frame, textvariable=self.replace_var, width=40)
+        self.replace_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        # Options frame
+        options_frame = ttk.Frame(main_frame)
+        options_frame.pack(fill=tk.X, pady=10)
+        
+        self.case_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="Match case", variable=self.case_var).pack(side=tk.LEFT, padx=5)
+        
+        self.regex_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="Regex", variable=self.regex_var).pack(side=tk.LEFT, padx=5)
+        
+        self.whole_word_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="Whole word", variable=self.whole_word_var).pack(side=tk.LEFT, padx=5)
+        
+        # Buttons frame
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(btn_frame, text="Find Next", command=self.find_next, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Find All", command=self.find_all, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Replace", command=self.replace, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Replace All", command=self.replace_all, width=12).pack(side=tk.LEFT, padx=2)
+        
+        # Second row of buttons
+        btn_frame2 = ttk.Frame(main_frame)
+        btn_frame2.pack(fill=tk.X, pady=2)
+        
+        ttk.Button(btn_frame2, text="Clear Highlights", command=self.clear_highlights, width=14).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame2, text="Close", command=self.destroy, width=12).pack(side=tk.RIGHT, padx=2)
+        
+        # Status label
+        self.status_var = tk.StringVar(value="")
+        self.status_label = ttk.Label(main_frame, textvariable=self.status_var, foreground="gray")
+        self.status_label.pack(fill=tk.X, pady=5)
+    
+    def _setup_bindings(self):
+        """Setup keyboard bindings"""
+        self.search_entry.bind("<Return>", lambda e: self.find_next())
+        self.replace_entry.bind("<Return>", lambda e: self.replace())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<F3>", lambda e: self.find_next())
+        self.search_var.trace_add("write", lambda *args: self._on_search_change())
+    
+    def _on_search_change(self):
+        """Reset search position when search text changes"""
+        self.search_pos = "1.0"
+        self.status_var.set("")
+    
+    def _get_search_pattern(self):
+        """Build search pattern based on options"""
+        pattern = self.search_var.get()
+        if not pattern:
+            return None
+        
+        if not self.regex_var.get():
+            pattern = re.escape(pattern)
+        
+        if self.whole_word_var.get():
+            pattern = r'\b' + pattern + r'\b'
+        
+        flags = 0 if self.case_var.get() else re.IGNORECASE
+        
+        try:
+            return re.compile(pattern, flags)
+        except re.error as e:
+            self.status_var.set(f"Regex error: {e}")
+            return None
+    
+    def find_next(self):
+        """Find the next occurrence"""
+        pattern = self._get_search_pattern()
+        if not pattern:
+            return
+        
+        # Clear previous highlight
+        self.text_widget.tag_remove("search_current", "1.0", tk.END)
+        
+        # Get text from current position to end
+        content = self.text_widget.get(self.search_pos, tk.END)
+        match = pattern.search(content)
+        
+        if match:
+            # Calculate absolute position
+            start_idx = self.text_widget.index(f"{self.search_pos}+{match.start()}c")
+            end_idx = self.text_widget.index(f"{self.search_pos}+{match.end()}c")
+            
+            # Highlight current match
+            self.text_widget.tag_add("search_current", start_idx, end_idx)
+            self.text_widget.tag_config("search_current", background="#ffff00", foreground="#000000")
+            
+            # Move cursor and scroll
+            self.text_widget.mark_set(tk.INSERT, start_idx)
+            self.text_widget.see(start_idx)
+            
+            # Update position for next search
+            self.search_pos = end_idx
+            self.status_var.set(f"Found at line {start_idx.split('.')[0]}")
+        else:
+            # Try from beginning
+            if self.search_pos != "1.0":
+                self.search_pos = "1.0"
+                self.status_var.set("Wrapped to beginning...")
+                self.find_next()
+            else:
+                self.status_var.set("No matches found")
+    
+    def find_all(self):
+        """Find and highlight all occurrences"""
+        pattern = self._get_search_pattern()
+        if not pattern:
+            return
+        
+        # Clear previous highlights
+        self.text_widget.tag_remove("search", "1.0", tk.END)
+        self.text_widget.tag_remove("search_current", "1.0", tk.END)
+        
+        # Search entire content
+        content = self.text_widget.get("1.0", tk.END)
+        self.all_matches = list(pattern.finditer(content))
+        
+        # Highlight all matches
+        for match in self.all_matches:
+            start_idx = f"1.0+{match.start()}c"
+            end_idx = f"1.0+{match.end()}c"
+            self.text_widget.tag_add("search", start_idx, end_idx)
+        
+        self.text_widget.tag_config("search", background="#90EE90")
+        
+        count = len(self.all_matches)
+        self.status_var.set(f"Found {count} occurrence{'s' if count != 1 else ''}")
+        self.match_count = count
+    
+    def replace(self):
+        """Replace current occurrence"""
+        # Check if there's a current selection matching search
+        try:
+            sel_start = self.text_widget.index(tk.SEL_FIRST)
+            sel_end = self.text_widget.index(tk.SEL_LAST)
+            selected = self.text_widget.get(sel_start, sel_end)
+            
+            pattern = self._get_search_pattern()
+            if pattern and pattern.fullmatch(selected):
+                # Replace the selection
+                replacement = self.replace_var.get()
+                if self.regex_var.get():
+                    replacement = pattern.sub(replacement, selected)
+                
+                self.text_widget.delete(sel_start, sel_end)
+                self.text_widget.insert(sel_start, replacement)
+                self.status_var.set("Replaced")
+        except tk.TclError:
+            pass
+        
+        # Find next
+        self.find_next()
+    
+    def replace_all(self):
+        """Replace all occurrences"""
+        pattern = self._get_search_pattern()
+        if not pattern:
+            return
+        
+        replacement = self.replace_var.get()
+        content = self.text_widget.get("1.0", tk.END)
+        
+        # Count and replace
+        new_content, count = pattern.subn(replacement, content)
+        
+        if count > 0:
+            # Remember cursor position
+            cursor_pos = self.text_widget.index(tk.INSERT)
+            
+            # Replace all content
+            self.text_widget.delete("1.0", tk.END)
+            self.text_widget.insert("1.0", new_content.rstrip('\n'))
+            
+            # Try to restore cursor
+            try:
+                self.text_widget.mark_set(tk.INSERT, cursor_pos)
+            except:
+                pass
+            
+            self.status_var.set(f"Replaced {count} occurrence{'s' if count != 1 else ''}")
+        else:
+            self.status_var.set("No matches found")
+    
+    def clear_highlights(self):
+        """Clear all search highlights"""
+        self.text_widget.tag_remove("search", "1.0", tk.END)
+        self.text_widget.tag_remove("search_current", "1.0", tk.END)
+        self.status_var.set("Highlights cleared")
+
+
+class GoToLineDialog(tk.Toplevel):
+    """Simple go-to-line dialog"""
+    
+    def __init__(self, parent, text_widget):
+        super().__init__(parent)
+        self.text_widget = text_widget
+        self.title("Go to Line")
+        self.geometry("250x100")
+        self.resizable(False, False)
+        self.transient(parent)
+        
+        # Get current line count
+        self.max_line = int(text_widget.index('end-1c').split('.')[0])
+        
+        frame = ttk.Frame(self, padding=15)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(frame, text=f"Line number (1-{self.max_line}):").pack(anchor=tk.W)
+        
+        self.line_var = tk.StringVar()
+        self.line_entry = ttk.Entry(frame, textvariable=self.line_var, width=20)
+        self.line_entry.pack(fill=tk.X, pady=5)
+        self.line_entry.focus()
+        
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="Go", command=self.goto, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy, width=10).pack(side=tk.LEFT, padx=2)
+        
+        self.line_entry.bind("<Return>", lambda e: self.goto())
+        self.bind("<Escape>", lambda e: self.destroy())
+    
+    def goto(self):
+        """Go to the specified line"""
+        try:
+            line = int(self.line_var.get())
+            if 1 <= line <= self.max_line:
+                self.text_widget.mark_set(tk.INSERT, f"{line}.0")
+                self.text_widget.see(f"{line}.0")
+                self.destroy()
+            else:
+                messagebox.showwarning("Invalid Line", f"Line must be between 1 and {self.max_line}")
+        except ValueError:
+            messagebox.showwarning("Invalid Input", "Please enter a valid line number")
+
+
+class ProgressDialog(tk.Toplevel):
+    """Progress dialog for long operations"""
+    
+    def __init__(self, parent, title="Loading...", message="Please wait..."):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("350x120")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        
+        # Prevent closing
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.message_var = tk.StringVar(value=message)
+        ttk.Label(frame, textvariable=self.message_var).pack(pady=5)
+        
+        self.progress = ttk.Progressbar(frame, mode='determinate', length=300)
+        self.progress.pack(pady=10)
+        
+        self.detail_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.detail_var, foreground="gray").pack()
+        
+        # Center on parent
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+    
+    def update_progress(self, value, message=None, detail=None):
+        """Update progress bar and messages"""
+        self.progress['value'] = value
+        if message:
+            self.message_var.set(message)
+        if detail:
+            self.detail_var.set(detail)
+        self.update()
 
 
 class FindDialog(tk.Toplevel):
