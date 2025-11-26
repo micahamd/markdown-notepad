@@ -712,13 +712,21 @@ class MarkdownVisualWidget(tk.Frame):
         lines = markdown_text.split('\n')
         in_code_block = False
         code_block_content = []
+        in_table = False
+        table_rows = []
         
-        for line in lines:
+        for i, line in enumerate(lines):
             # Check if this line contains an image
             img_match = re.match(r'!\[.*?\]\(.*?\)', line.strip())
             
             # Handle code blocks
             if line.strip().startswith('```'):
+                # Flush any pending table
+                if in_table and table_rows:
+                    self._render_table(table_rows)
+                    table_rows = []
+                    in_table = False
+                
                 if in_code_block:
                     code_text = '\n'.join(code_block_content) + '\n'
                     self.text_widget.insert(tk.END, code_text, "code_block")
@@ -732,6 +740,19 @@ class MarkdownVisualWidget(tk.Frame):
             if in_code_block:
                 code_block_content.append(line)
                 continue
+            
+            # Handle tables - collect consecutive table rows
+            if '|' in line and line.strip().startswith('|'):
+                if not in_table:
+                    in_table = True
+                table_rows.append(line)
+                continue
+            else:
+                # End of table - render it
+                if in_table and table_rows:
+                    self._render_table(table_rows)
+                    table_rows = []
+                    in_table = False
             
             # Handle images - insert placeholder with embedded image
             if img_match and PIL_AVAILABLE:
@@ -773,13 +794,86 @@ class MarkdownVisualWidget(tk.Frame):
             elif re.match(r'^\d+\.\s', line.strip()):
                 self.text_widget.insert(tk.END, '  ' + line.strip() + '\n', "list_item")
             
-            # Table rows
-            elif '|' in line:
-                self.text_widget.insert(tk.END, line + '\n', "table")
-            
             # Normal text
             else:
                 self.text_widget.insert(tk.END, line + '\n')
+        
+        # Flush any remaining table at end of content
+        if in_table and table_rows:
+            self._render_table(table_rows)
+    
+    def _render_table(self, table_rows):
+        """Render a markdown table with proper formatting"""
+        if not table_rows:
+            return
+        
+        # Parse table structure
+        parsed_rows = []
+        separator_idx = -1
+        
+        for i, row in enumerate(table_rows):
+            # Split by | and strip whitespace
+            cells = [c.strip() for c in row.split('|')]
+            # Remove empty first/last cells from leading/trailing |
+            if cells and cells[0] == '':
+                cells = cells[1:]
+            if cells and cells[-1] == '':
+                cells = cells[:-1]
+            
+            # Check if this is the separator row (contains only -, :, and spaces)
+            if all(re.match(r'^[-:]+$', c) for c in cells if c):
+                separator_idx = i
+            else:
+                parsed_rows.append(cells)
+        
+        if not parsed_rows:
+            return
+        
+        # Calculate column widths
+        num_cols = max(len(row) for row in parsed_rows)
+        col_widths = [0] * num_cols
+        
+        for row in parsed_rows:
+            for j, cell in enumerate(row):
+                if j < num_cols:
+                    col_widths[j] = max(col_widths[j], len(cell))
+        
+        # Ensure minimum width
+        col_widths = [max(w, 3) for w in col_widths]
+        
+        # Build the formatted table
+        self.text_widget.insert(tk.END, '\n')
+        
+        # Top border
+        border = '┌' + '┬'.join('─' * (w + 2) for w in col_widths) + '┐\n'
+        self.text_widget.insert(tk.END, border, "table_border")
+        
+        for row_idx, row in enumerate(parsed_rows):
+            # Pad row to have correct number of columns
+            while len(row) < num_cols:
+                row.append('')
+            
+            # Data row
+            row_text = '│'
+            for j, cell in enumerate(row):
+                row_text += ' ' + cell.ljust(col_widths[j]) + ' │'
+            row_text += '\n'
+            
+            # Use different tag for header row
+            if row_idx == 0 and separator_idx == 1:
+                self.text_widget.insert(tk.END, row_text, "table_header")
+            else:
+                self.text_widget.insert(tk.END, row_text, "table_cell")
+            
+            # Add separator after header or between rows
+            if row_idx == 0 and separator_idx == 1:
+                sep = '├' + '┼'.join('─' * (w + 2) for w in col_widths) + '┤\n'
+                self.text_widget.insert(tk.END, sep, "table_border")
+        
+        # Bottom border
+        border = '└' + '┴'.join('─' * (w + 2) for w in col_widths) + '┘\n'
+        self.text_widget.insert(tk.END, border, "table_border")
+        self.text_widget.insert(tk.END, '\n')
     
     def _insert_image_inline(self, img_info):
         """Insert an image inline in the text widget with optional sizing"""
@@ -890,6 +984,12 @@ class MarkdownVisualWidget(tk.Frame):
         # Table styles
         tw.tag_configure("table", font=("Consolas", 10), background="#f8f9fa", lmargin1=15, 
                         spacing1=5, spacing3=5)
+        tw.tag_configure("table_border", font=("Consolas", 10), foreground="#6c757d", 
+                        lmargin1=20, lmargin2=20)
+        tw.tag_configure("table_header", font=("Consolas", 10, "bold"), background="#e9ecef",
+                        lmargin1=20, lmargin2=20)
+        tw.tag_configure("table_cell", font=("Consolas", 10), background="#f8f9fa",
+                        lmargin1=20, lmargin2=20)
         
         # Image styles
         tw.tag_configure("image_caption", font=("Segoe UI", 9, "italic"), foreground="#6c757d",
