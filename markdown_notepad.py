@@ -10,7 +10,7 @@ Features:
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext, font, simpledialog
+from tkinter import ttk, filedialog, messagebox, scrolledtext, font, simpledialog, colorchooser
 import re
 import os
 import io
@@ -21,6 +21,8 @@ import zipfile
 import threading
 import queue
 import time
+import json
+import shutil
 from pathlib import Path
 
 # Try to import PIL for image handling
@@ -474,19 +476,21 @@ class ImageViewerWindow(tk.Toplevel):
 class MarkdownVisualWidget(tk.Frame):
     """
     A widget for rendering markdown visually with image support.
+    Editable - changes sync back to source.
     Optimized for performance with large documents using a single Text widget.
     """
     
     # Chunk size for progressive rendering
     RENDER_CHUNK_SIZE = 100  # lines per chunk
     
-    def __init__(self, parent, base_path=None, **kwargs):
+    def __init__(self, parent, base_path=None, on_content_change=None, **kwargs):
         super().__init__(parent, **kwargs)
         self.content = ""
         self.base_path = base_path or os.getcwd()
         self.image_handler = ImageHandler(self.base_path)
         self.embedded_images = {}  # Track embedded images by text index
         self._render_job = None  # For cancelling pending renders
+        self.on_content_change = on_content_change  # Callback for content changes
         self._setup_widget()
     
     def _setup_widget(self):
@@ -502,14 +506,20 @@ class MarkdownVisualWidget(tk.Frame):
             self.text_frame,
             wrap=tk.WORD,
             font=("Segoe UI", 11),
-            padx=20,
-            pady=15,
+            padx=30,
+            pady=20,
             bg="#ffffff",
+            fg="#1a1a1a",
             relief=tk.FLAT,
             borderwidth=0,
             yscrollcommand=self.scrollbar.set,
-            cursor="arrow",
-            state=tk.DISABLED
+            cursor="xterm",
+            insertbackground="#333333",
+            selectbackground="#b3d9ff",
+            selectforeground="#000000",
+            spacing1=2,  # Space above lines
+            spacing2=1,  # Space between wrapped lines  
+            spacing3=4,  # Space below lines (paragraph spacing)
         )
         self.text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.scrollbar.config(command=self.text_widget.yview)
@@ -517,8 +527,10 @@ class MarkdownVisualWidget(tk.Frame):
         # Setup text tags for styling
         self._setup_text_tags()
         
-        # Bind mousewheel
+        # Bind mousewheel and editing events
         self.text_widget.bind("<MouseWheel>", self._on_mousewheel)
+        self.text_widget.bind("<KeyRelease>", self._on_edit)
+        self.text_widget.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
         
         self.render_mode = "text"
     
@@ -526,6 +538,19 @@ class MarkdownVisualWidget(tk.Frame):
         """Handle mousewheel scrolling"""
         self.text_widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
         return "break"
+    
+    def _on_ctrl_mousewheel(self, event):
+        """Handle Ctrl+MouseWheel for zoom (propagate to parent)"""
+        # Let the main app handle zoom
+        return
+    
+    def _on_edit(self, event=None):
+        """Handle text edits - notify parent of changes"""
+        if self.on_content_change:
+            # Get current text content (raw, without images)
+            content = self.text_widget.get("1.0", tk.END).rstrip()
+            self.content = content
+            self.on_content_change(content)
     
     def set_base_path(self, path):
         """Set the base path for resolving relative image paths"""
@@ -542,7 +567,6 @@ class MarkdownVisualWidget(tk.Frame):
         self.content = markdown_text
         
         # Clear previous content
-        self.text_widget.config(state=tk.NORMAL)
         self.text_widget.delete(1.0, tk.END)
         self.embedded_images.clear()
         self.image_handler.clear_caches()
@@ -556,7 +580,6 @@ class MarkdownVisualWidget(tk.Frame):
         
         if line_count < 500:
             self._render_content(markdown_text, images)
-            self.text_widget.config(state=tk.DISABLED)
         else:
             # Progressive rendering for large documents
             self._render_progressive(markdown_text, images, 0)
@@ -579,7 +602,6 @@ class MarkdownVisualWidget(tk.Frame):
             self._render_job = self.after(10, 
                 lambda: self._render_progressive(full_text, images, end_line))
         else:
-            self.text_widget.config(state=tk.DISABLED)
             self._render_job = None
     
     def _render_content(self, markdown_text, images, is_chunk=False):
@@ -710,43 +732,70 @@ class MarkdownVisualWidget(tk.Frame):
         """Setup text tags for markdown styling on the main text widget"""
         tw = self.text_widget
         
-        # Heading styles
-        tw.tag_configure("h1", font=("Segoe UI", 24, "bold"), spacing3=10, foreground="#1a1a2e")
-        tw.tag_configure("h2", font=("Segoe UI", 20, "bold"), spacing3=8, foreground="#16213e")
-        tw.tag_configure("h3", font=("Segoe UI", 16, "bold"), spacing3=6, foreground="#1f4068")
-        tw.tag_configure("h4", font=("Segoe UI", 14, "bold"), spacing3=4, foreground="#1b1b2f")
-        tw.tag_configure("h5", font=("Segoe UI", 12, "bold"), spacing3=3, foreground="#1b1b2f")
-        tw.tag_configure("h6", font=("Segoe UI", 11, "bold"), spacing3=2, foreground="#1b1b2f")
+        # Heading styles - improved spacing for document flow
+        tw.tag_configure("h1", font=("Segoe UI", 26, "bold"), spacing1=20, spacing3=12, foreground="#1a1a2e")
+        tw.tag_configure("h2", font=("Segoe UI", 22, "bold"), spacing1=18, spacing3=10, foreground="#16213e")
+        tw.tag_configure("h3", font=("Segoe UI", 18, "bold"), spacing1=14, spacing3=8, foreground="#1f4068")
+        tw.tag_configure("h4", font=("Segoe UI", 15, "bold"), spacing1=10, spacing3=6, foreground="#1b1b2f")
+        tw.tag_configure("h5", font=("Segoe UI", 13, "bold"), spacing1=8, spacing3=4, foreground="#1b1b2f")
+        tw.tag_configure("h6", font=("Segoe UI", 12, "bold"), spacing1=6, spacing3=3, foreground="#1b1b2f")
         
         # Inline styles
         tw.tag_configure("bold", font=("Segoe UI", 11, "bold"))
         tw.tag_configure("italic", font=("Segoe UI", 11, "italic"))
-        tw.tag_configure("code", font=("Consolas", 10), background="#f0f0f0", foreground="#c7254e")
-        tw.tag_configure("code_block", font=("Consolas", 10), background="#2d2d2d", foreground="#f8f8f2", 
-                        spacing1=5, spacing3=5, lmargin1=20, lmargin2=20)
+        tw.tag_configure("code", font=("Consolas", 10), background="#f5f2f0", foreground="#c7254e",
+                        relief=tk.FLAT)
+        tw.tag_configure("code_block", font=("Consolas", 10), background="#282c34", foreground="#abb2bf", 
+                        spacing1=10, spacing3=10, lmargin1=25, lmargin2=25, rmargin=25)
         
         # Block styles
         tw.tag_configure("blockquote", font=("Segoe UI", 11, "italic"), foreground="#6c757d", 
-                        lmargin1=30, lmargin2=30, borderwidth=2)
-        tw.tag_configure("list_item", lmargin1=20, lmargin2=40)
+                        lmargin1=40, lmargin2=40, spacing1=5, spacing3=5,
+                        background="#f8f9fa")
+        tw.tag_configure("list_item", lmargin1=25, lmargin2=45, spacing1=2, spacing3=2)
         tw.tag_configure("link", foreground="#0066cc", underline=True)
-        tw.tag_configure("hr", font=("Segoe UI", 6), foreground="#cccccc", justify="center")
+        tw.tag_configure("hr", font=("Segoe UI", 2), foreground="#dee2e6", spacing1=15, spacing3=15)
         
         # Table styles
-        tw.tag_configure("table", font=("Consolas", 10), background="#f9f9f9", lmargin1=10)
+        tw.tag_configure("table", font=("Consolas", 10), background="#f8f9fa", lmargin1=15, 
+                        spacing1=5, spacing3=5)
         
         # Image styles
-        tw.tag_configure("image_caption", font=("Segoe UI", 9, "italic"), foreground="#666666")
-        tw.tag_configure("image_placeholder", font=("Segoe UI", 10), foreground="#999999", 
-                        background="#f5f5f5", lmargin1=20)
+        tw.tag_configure("image_caption", font=("Segoe UI", 9, "italic"), foreground="#6c757d",
+                        spacing1=3, spacing3=8, justify="center")
+        tw.tag_configure("image_placeholder", font=("Segoe UI", 10), foreground="#868e96", 
+                        background="#f1f3f5", lmargin1=25, spacing1=5, spacing3=5)
+        
+        # Paragraph spacing (normal text)
+        tw.tag_configure("paragraph", spacing1=3, spacing3=6)
     
     def get_content(self):
         """Get the current content"""
         return self.content
+    
+    def apply_theme(self, theme):
+        """Apply theme settings to the visual widget"""
+        self.text_widget.config(
+            bg=theme.get('visual_bg', '#ffffff'),
+            fg=theme.get('visual_fg', '#1a1a1a'),
+            font=(theme.get('visual_font', 'Segoe UI'), theme.get('visual_font_size', 11))
+        )
 
 
 class MarkdownNotepad(tk.Tk):
     """Main application window"""
+    
+    # Default theme settings
+    DEFAULT_THEME = {
+        'source_bg': '#fefefe',
+        'source_fg': '#1a1a1a',
+        'source_font': 'Consolas',
+        'source_font_size': 11,
+        'visual_bg': '#ffffff',
+        'visual_fg': '#1a1a1a',
+        'visual_font': 'Segoe UI',
+        'visual_font_size': 11,
+    }
     
     def __init__(self):
         super().__init__()
@@ -762,6 +811,10 @@ class MarkdownNotepad(tk.Tk):
         self.word_wrap = True  # Word wrap toggle
         self.extracted_images_dir = None  # Directory for extracted images
         
+        # Theme settings
+        self.theme = self.DEFAULT_THEME.copy()
+        self._load_theme()
+        
         # Initialize MarkItDown
         if MARKITDOWN_AVAILABLE:
             self.md_converter = MarkItDown(enable_plugins=False)
@@ -771,6 +824,26 @@ class MarkdownNotepad(tk.Tk):
         self._setup_ui()
         self._setup_bindings()
         self._update_title()
+    
+    def _load_theme(self):
+        """Load theme from settings file"""
+        settings_path = Path.home() / '.markitdown_notepad_settings.json'
+        if settings_path.exists():
+            try:
+                with open(settings_path, 'r') as f:
+                    saved_theme = json.load(f)
+                    self.theme.update(saved_theme)
+            except:
+                pass
+    
+    def _save_theme(self):
+        """Save theme to settings file"""
+        settings_path = Path.home() / '.markitdown_notepad_settings.json'
+        try:
+            with open(settings_path, 'w') as f:
+                json.dump(self.theme, f, indent=2)
+        except:
+            pass
     
     def _setup_ui(self):
         """Setup the user interface"""
@@ -789,24 +862,42 @@ class MarkdownNotepad(tk.Tk):
         self.source_editor = scrolledtext.ScrolledText(
             self.source_frame,
             wrap=tk.WORD,
-            font=("Consolas", 11),
+            font=(self.theme['source_font'], self.theme['source_font_size']),
             undo=True,
-            padx=10,
-            pady=10,
-            bg="#fefefe",
+            padx=15,
+            pady=12,
+            bg=self.theme['source_bg'],
+            fg=self.theme['source_fg'],
+            insertbackground=self.theme['source_fg'],
+            selectbackground="#b3d9ff",
+            selectforeground="#000000",
             relief=tk.FLAT,
-            borderwidth=1
+            borderwidth=1,
+            spacing1=1,
+            spacing3=1,
         )
         self.source_editor.pack(fill=tk.BOTH, expand=True)
         self.source_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Visual mode viewer
+        # Visual mode viewer - with content change callback
         self.visual_frame = ttk.Frame(self.content_frame)
-        self.visual_viewer = MarkdownVisualWidget(self.visual_frame, base_path=os.getcwd())
+        self.visual_viewer = MarkdownVisualWidget(
+            self.visual_frame, 
+            base_path=os.getcwd(),
+            on_content_change=self._on_visual_edit
+        )
         self.visual_viewer.pack(fill=tk.BOTH, expand=True)
+        
+        # Apply theme to visual viewer
+        self.visual_viewer.apply_theme(self.theme)
         
         # Status bar
         self._create_status_bar()
+        
+        # Font size tracking for zoom
+        self.current_font_size = 11
+        self.min_font_size = 6
+        self.max_font_size = 48
         
         # Start in source mode
         self._show_source_mode()
@@ -863,6 +954,11 @@ class MarkdownNotepad(tk.Tk):
         view_menu.add_checkbutton(label="Large File Mode (faster)", variable=self.large_file_var,
                                    command=self._toggle_large_file_mode)
         
+        view_menu.add_separator()
+        view_menu.add_command(label="Zoom In", command=self.zoom_in, accelerator="Ctrl++")
+        view_menu.add_command(label="Zoom Out", command=self.zoom_out, accelerator="Ctrl+-")
+        view_menu.add_command(label="Reset Zoom", command=self.zoom_reset, accelerator="Ctrl+0")
+        
         # Format menu (for source mode)
         format_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Format", menu=format_menu)
@@ -881,7 +977,9 @@ class MarkdownNotepad(tk.Tk):
         format_menu.add_command(label="Horizontal Rule", command=lambda: self._insert_text("\n---\n"))
         format_menu.add_command(label="Code Block", command=lambda: self._insert_text("\n```\n\n```\n"))
         format_menu.add_command(label="Link", command=lambda: self._insert_format("[", "](url)"))
-        format_menu.add_command(label="Image", command=lambda: self._insert_format("![alt](", ")"))
+        format_menu.add_separator()
+        format_menu.add_command(label="Insert Image...", command=self.insert_image, accelerator="Ctrl+Shift+I")
+        format_menu.add_command(label="Manage Images...", command=self.manage_images)
         
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -932,6 +1030,12 @@ class MarkdownNotepad(tk.Tk):
         ttk.Button(toolbar, text="I", command=lambda: self._insert_format("*", "*"), width=3).pack(side=tk.LEFT, padx=1)
         ttk.Button(toolbar, text="</>" , command=lambda: self._insert_format("`", "`"), width=3).pack(side=tk.LEFT, padx=1)
         ttk.Button(toolbar, text="🔗", command=lambda: self._insert_format("[", "](url)"), width=3).pack(side=tk.LEFT, padx=1)
+        ttk.Button(toolbar, text="🖼️", command=self.insert_image, width=3).pack(side=tk.LEFT, padx=1)
+        
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
+        
+        # Theme button
+        ttk.Button(toolbar, text="🎨 Theme", command=self.open_theme_dialog, style="Toolbar.TButton").pack(side=tk.LEFT, padx=2)
     
     def _create_status_bar(self):
         """Create the status bar"""
@@ -943,6 +1047,10 @@ class MarkdownNotepad(tk.Tk):
         
         self.position_label = ttk.Label(self.status_bar, text="Line 1, Col 1")
         self.position_label.pack(side=tk.RIGHT, padx=10)
+        
+        # Zoom indicator
+        self.zoom_label = ttk.Label(self.status_bar, text="100%")
+        self.zoom_label.pack(side=tk.RIGHT, padx=10)
         
         # Wrap indicator
         self.wrap_label = ttk.Label(self.status_bar, text="Wrap: On")
@@ -963,6 +1071,7 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-O>", lambda e: self.open_with_markitdown())  # Ctrl+Shift+O
         self.bind("<Control-s>", lambda e: self.save_file())
         self.bind("<Control-S>", lambda e: self.save_file_as())  # Ctrl+Shift+S
+        self.bind("<Control-I>", lambda e: self.insert_image())  # Ctrl+Shift+I
         self.bind("<Control-z>", lambda e: self.undo())
         self.bind("<Control-y>", lambda e: self.redo())
         self.bind("<Control-a>", lambda e: self.select_all())
@@ -976,6 +1085,16 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-e>", lambda e: self._toggle_mode())
         self.bind("<Control-w>", lambda e: self._toggle_word_wrap())
         self.bind("<F3>", lambda e: self._find_next_f3())
+        
+        # Zoom bindings
+        self.bind("<Control-plus>", lambda e: self.zoom_in())
+        self.bind("<Control-equal>", lambda e: self.zoom_in())  # For keyboards without numpad
+        self.bind("<Control-minus>", lambda e: self.zoom_out())
+        self.bind("<Control-0>", lambda e: self.zoom_reset())
+        
+        # Mouse wheel zoom (Ctrl+Scroll) for both editors
+        self.source_editor.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
+        self.visual_viewer.text_widget.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
         
         # Track modifications - debounced for performance
         self.source_editor.bind("<<Modified>>", self._on_modified)
@@ -1054,8 +1173,58 @@ class MarkdownNotepad(tk.Tk):
             self.source_editor.config(undo=True)
             self._set_status("Normal mode: full features enabled")
     
+    def _on_ctrl_mousewheel(self, event):
+        """Handle Ctrl+MouseWheel for zoom"""
+        if event.delta > 0:
+            self.zoom_in()
+        else:
+            self.zoom_out()
+        return "break"  # Prevent default scrolling
+    
+    def zoom_in(self):
+        """Increase font size"""
+        if self.current_font_size < self.max_font_size:
+            self.current_font_size += 1
+            self._apply_font_size()
+    
+    def zoom_out(self):
+        """Decrease font size"""
+        if self.current_font_size > self.min_font_size:
+            self.current_font_size -= 1
+            self._apply_font_size()
+    
+    def zoom_reset(self):
+        """Reset font size to default"""
+        self.current_font_size = self.theme['source_font_size']
+        self._apply_font_size()
+    
+    def _apply_font_size(self):
+        """Apply current font size to both editors"""
+        # Apply to source editor
+        self.source_editor.config(font=(self.theme['source_font'], self.current_font_size))
+        
+        # Apply proportionally to visual editor
+        visual_base = self.theme['visual_font_size']
+        scale = self.current_font_size / self.theme['source_font_size']
+        visual_size = max(6, int(visual_base * scale))
+        self.visual_viewer.text_widget.config(
+            font=(self.theme['visual_font'], visual_size)
+        )
+        
+        # Update status bar with zoom level
+        zoom_pct = int((self.current_font_size / self.theme['source_font_size']) * 100)
+        self.zoom_label.config(text=f"{zoom_pct}%")
+    
     def _show_source_mode(self):
         """Switch to source editing mode"""
+        # Sync any changes from visual mode first
+        if self.current_mode == "visual":
+            visual_content = self.visual_viewer.get_content()
+            source_content = self.source_editor.get(1.0, tk.END).rstrip()
+            if visual_content != source_content:
+                self.source_editor.delete(1.0, tk.END)
+                self.source_editor.insert(1.0, visual_content)
+        
         self.visual_frame.pack_forget()
         self.source_frame.pack(fill=tk.BOTH, expand=True)
         self.current_mode = "source"
@@ -1074,7 +1243,12 @@ class MarkdownNotepad(tk.Tk):
         self.current_mode = "visual"
         self.mode_var.set("visual")
         self.mode_label.config(text="Visual Mode")
-        self._set_status("Visual mode - rendered markdown preview")
+        self._set_status("Visual mode - editable rendered preview")
+    
+    def _on_visual_edit(self, content):
+        """Called when visual editor content changes"""
+        self.is_modified = True
+        self._update_title()
     
     def _toggle_mode(self):
         """Toggle between source and visual mode"""
@@ -1351,6 +1525,159 @@ class MarkdownNotepad(tk.Tk):
             return
         self.source_editor.insert(tk.INSERT, text)
     
+    # === Image Management ===
+    
+    def _get_assets_folder(self):
+        """Get or create the assets folder for the current document"""
+        if not self.current_file:
+            return None
+        
+        doc_dir = os.path.dirname(self.current_file)
+        doc_name = os.path.splitext(os.path.basename(self.current_file))[0]
+        assets_folder = os.path.join(doc_dir, f"{doc_name}_assets")
+        
+        if not os.path.exists(assets_folder):
+            os.makedirs(assets_folder)
+        
+        return assets_folder
+    
+    def insert_image(self):
+        """Insert an image into the document with proper asset management"""
+        if self.current_mode != "source":
+            messagebox.showinfo("Info", "Please switch to Source mode to insert images.")
+            return
+        
+        # Select image file
+        filetypes = [
+            ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+            ("PNG files", "*.png"),
+            ("JPEG files", "*.jpg *.jpeg"),
+            ("GIF files", "*.gif"),
+            ("All files", "*.*")
+        ]
+        
+        image_path = filedialog.askopenfilename(
+            title="Select Image",
+            filetypes=filetypes
+        )
+        
+        if not image_path:
+            return
+        
+        # Get alt text
+        alt_text = simpledialog.askstring(
+            "Image Alt Text",
+            "Enter alt text for the image (for accessibility):",
+            initialvalue=os.path.splitext(os.path.basename(image_path))[0]
+        )
+        
+        if alt_text is None:
+            alt_text = ""
+        
+        # Determine how to handle the image
+        if self.current_file:
+            # Document is saved - copy to assets folder
+            assets_folder = self._get_assets_folder()
+            
+            # Copy image to assets folder
+            image_filename = os.path.basename(image_path)
+            # Handle duplicate names
+            dest_path = os.path.join(assets_folder, image_filename)
+            counter = 1
+            while os.path.exists(dest_path):
+                name, ext = os.path.splitext(image_filename)
+                dest_path = os.path.join(assets_folder, f"{name}_{counter}{ext}")
+                counter += 1
+            
+            shutil.copy2(image_path, dest_path)
+            
+            # Create relative path
+            doc_dir = os.path.dirname(self.current_file)
+            rel_path = os.path.relpath(dest_path, doc_dir).replace('\\', '/')
+            
+            # Insert markdown
+            markdown = f"![{alt_text}]({rel_path})"
+            self.source_editor.insert(tk.INSERT, markdown)
+            
+            self._set_status(f"Image added: {rel_path}")
+        else:
+            # Document not saved - ask user what to do
+            choice = messagebox.askyesnocancel(
+                "Unsaved Document",
+                "Your document hasn't been saved yet.\n\n"
+                "• Yes: Save document first, then add image\n"
+                "• No: Insert absolute path (not recommended)\n"
+                "• Cancel: Cancel image insertion"
+            )
+            
+            if choice is None:
+                return
+            elif choice:
+                # Save first
+                self.save_file_as()
+                if self.current_file:
+                    # Retry insertion now that file is saved
+                    self.insert_image()
+                return
+            else:
+                # Insert absolute path with warning
+                markdown = f"![{alt_text}]({image_path.replace(chr(92), '/')})"
+                self.source_editor.insert(tk.INSERT, markdown)
+                self._set_status("Warning: Absolute path used - save document to use relative paths")
+        
+        # Update visual viewer
+        if self.current_file:
+            self.visual_viewer.set_base_path(os.path.dirname(self.current_file))
+    
+    def manage_images(self):
+        """Open image manager dialog"""
+        if not self.current_file:
+            messagebox.showinfo(
+                "Save Required",
+                "Please save your document first to manage images.\n\n"
+                "Images are stored in a folder alongside your document."
+            )
+            return
+        
+        ImageManagerDialog(self, self.current_file, self.source_editor)
+    
+    def _find_document_images(self):
+        """Find all image references in the current document"""
+        content = self.source_editor.get(1.0, tk.END)
+        
+        # Find markdown image syntax: ![alt](path)
+        pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
+        matches = re.findall(pattern, content)
+        
+        images = []
+        doc_dir = os.path.dirname(self.current_file) if self.current_file else os.getcwd()
+        
+        for alt, path in matches:
+            # Skip base64 images
+            if path.startswith('data:'):
+                images.append({
+                    'alt': alt,
+                    'path': path[:50] + '...',
+                    'type': 'embedded',
+                    'exists': True
+                })
+            else:
+                # Check if file exists
+                if os.path.isabs(path):
+                    full_path = path
+                else:
+                    full_path = os.path.join(doc_dir, path)
+                
+                images.append({
+                    'alt': alt,
+                    'path': path,
+                    'full_path': full_path,
+                    'type': 'file',
+                    'exists': os.path.exists(full_path)
+                })
+        
+        return images
+
     # === Search Methods ===
     
     def find_replace(self):
@@ -1423,6 +1750,467 @@ class MarkdownNotepad(tk.Tk):
             )
         
         messagebox.showinfo("MarkItDown Info", info)
+    
+    def open_theme_dialog(self):
+        """Open theme settings dialog"""
+        ThemeDialog(self, self.theme, self._apply_theme)
+    
+    def _apply_theme(self, new_theme):
+        """Apply a new theme to the application"""
+        self.theme = new_theme
+        self._save_theme()
+        
+        # Apply to source editor
+        self.source_editor.config(
+            bg=self.theme['source_bg'],
+            fg=self.theme['source_fg'],
+            insertbackground=self.theme['source_fg'],
+            font=(self.theme['source_font'], self.theme['source_font_size'])
+        )
+        
+        # Apply to visual viewer
+        self.visual_viewer.apply_theme(self.theme)
+        
+        # Update current font size for zoom
+        self.current_font_size = self.theme['source_font_size']
+        self._apply_font_size()
+        
+        self._set_status("Theme applied")
+
+
+class ThemeDialog(tk.Toplevel):
+    """Dialog for customizing theme settings"""
+    
+    # Preset themes
+    PRESETS = {
+        'Light': {
+            'source_bg': '#fefefe', 'source_fg': '#1a1a1a',
+            'visual_bg': '#ffffff', 'visual_fg': '#1a1a1a',
+        },
+        'Dark': {
+            'source_bg': '#1e1e1e', 'source_fg': '#d4d4d4',
+            'visual_bg': '#252526', 'visual_fg': '#cccccc',
+        },
+        'Sepia': {
+            'source_bg': '#f4ecd8', 'source_fg': '#5b4636',
+            'visual_bg': '#f9f5eb', 'visual_fg': '#5b4636',
+        },
+        'Solarized Light': {
+            'source_bg': '#fdf6e3', 'source_fg': '#657b83',
+            'visual_bg': '#fdf6e3', 'visual_fg': '#657b83',
+        },
+        'Solarized Dark': {
+            'source_bg': '#002b36', 'source_fg': '#839496',
+            'visual_bg': '#073642', 'visual_fg': '#93a1a1',
+        },
+    }
+    
+    def __init__(self, parent, current_theme, on_apply):
+        super().__init__(parent)
+        self.parent = parent
+        self.theme = current_theme.copy()
+        self.on_apply = on_apply
+        
+        self.title("Theme Settings")
+        self.geometry("450x480")
+        self.resizable(False, False)
+        self.transient(parent)
+        
+        self._setup_ui()
+        
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda e: self.destroy())
+    
+    def _setup_ui(self):
+        """Setup the dialog UI"""
+        main_frame = ttk.Frame(self, padding=15)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Presets section
+        preset_frame = ttk.LabelFrame(main_frame, text="Presets", padding=10)
+        preset_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        preset_btn_frame = ttk.Frame(preset_frame)
+        preset_btn_frame.pack(fill=tk.X)
+        
+        for i, (name, _) in enumerate(self.PRESETS.items()):
+            btn = ttk.Button(preset_btn_frame, text=name, width=12,
+                           command=lambda n=name: self._apply_preset(n))
+            btn.grid(row=i//3, column=i%3, padx=2, pady=2)
+        
+        # Source Editor section
+        source_frame = ttk.LabelFrame(main_frame, text="Source Editor", padding=10)
+        source_frame.pack(fill=tk.X, pady=5)
+        
+        # Background color
+        bg_frame = ttk.Frame(source_frame)
+        bg_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(bg_frame, text="Background:", width=12).pack(side=tk.LEFT)
+        self.source_bg_var = tk.StringVar(value=self.theme['source_bg'])
+        self.source_bg_preview = tk.Label(bg_frame, width=3, bg=self.theme['source_bg'], relief=tk.SUNKEN)
+        self.source_bg_preview.pack(side=tk.LEFT, padx=5)
+        ttk.Entry(bg_frame, textvariable=self.source_bg_var, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bg_frame, text="Choose...", command=lambda: self._choose_color('source_bg')).pack(side=tk.LEFT, padx=2)
+        
+        # Foreground color
+        fg_frame = ttk.Frame(source_frame)
+        fg_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(fg_frame, text="Text Color:", width=12).pack(side=tk.LEFT)
+        self.source_fg_var = tk.StringVar(value=self.theme['source_fg'])
+        self.source_fg_preview = tk.Label(fg_frame, width=3, bg=self.theme['source_fg'], relief=tk.SUNKEN)
+        self.source_fg_preview.pack(side=tk.LEFT, padx=5)
+        ttk.Entry(fg_frame, textvariable=self.source_fg_var, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(fg_frame, text="Choose...", command=lambda: self._choose_color('source_fg')).pack(side=tk.LEFT, padx=2)
+        
+        # Font
+        font_frame = ttk.Frame(source_frame)
+        font_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(font_frame, text="Font:", width=12).pack(side=tk.LEFT)
+        self.source_font_var = tk.StringVar(value=self.theme['source_font'])
+        font_combo = ttk.Combobox(font_frame, textvariable=self.source_font_var, width=15,
+                                  values=['Consolas', 'Courier New', 'Cascadia Code', 'Fira Code', 
+                                         'Source Code Pro', 'Monaco', 'Menlo'])
+        font_combo.pack(side=tk.LEFT, padx=2)
+        
+        # Font size
+        ttk.Label(font_frame, text="Size:").pack(side=tk.LEFT, padx=(10, 2))
+        self.source_size_var = tk.IntVar(value=self.theme['source_font_size'])
+        size_spin = ttk.Spinbox(font_frame, from_=8, to=24, width=5, textvariable=self.source_size_var)
+        size_spin.pack(side=tk.LEFT, padx=2)
+        
+        # Visual Mode section
+        visual_frame = ttk.LabelFrame(main_frame, text="Visual Mode", padding=10)
+        visual_frame.pack(fill=tk.X, pady=5)
+        
+        # Background color
+        vbg_frame = ttk.Frame(visual_frame)
+        vbg_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(vbg_frame, text="Background:", width=12).pack(side=tk.LEFT)
+        self.visual_bg_var = tk.StringVar(value=self.theme['visual_bg'])
+        self.visual_bg_preview = tk.Label(vbg_frame, width=3, bg=self.theme['visual_bg'], relief=tk.SUNKEN)
+        self.visual_bg_preview.pack(side=tk.LEFT, padx=5)
+        ttk.Entry(vbg_frame, textvariable=self.visual_bg_var, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(vbg_frame, text="Choose...", command=lambda: self._choose_color('visual_bg')).pack(side=tk.LEFT, padx=2)
+        
+        # Foreground color
+        vfg_frame = ttk.Frame(visual_frame)
+        vfg_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(vfg_frame, text="Text Color:", width=12).pack(side=tk.LEFT)
+        self.visual_fg_var = tk.StringVar(value=self.theme['visual_fg'])
+        self.visual_fg_preview = tk.Label(vfg_frame, width=3, bg=self.theme['visual_fg'], relief=tk.SUNKEN)
+        self.visual_fg_preview.pack(side=tk.LEFT, padx=5)
+        ttk.Entry(vfg_frame, textvariable=self.visual_fg_var, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(vfg_frame, text="Choose...", command=lambda: self._choose_color('visual_fg')).pack(side=tk.LEFT, padx=2)
+        
+        # Visual Font
+        vfont_frame = ttk.Frame(visual_frame)
+        vfont_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(vfont_frame, text="Font:", width=12).pack(side=tk.LEFT)
+        self.visual_font_var = tk.StringVar(value=self.theme['visual_font'])
+        vfont_combo = ttk.Combobox(vfont_frame, textvariable=self.visual_font_var, width=15,
+                                   values=['Segoe UI', 'Arial', 'Calibri', 'Georgia', 'Times New Roman',
+                                          'Verdana', 'Trebuchet MS'])
+        vfont_combo.pack(side=tk.LEFT, padx=2)
+        
+        # Visual Font size
+        ttk.Label(vfont_frame, text="Size:").pack(side=tk.LEFT, padx=(10, 2))
+        self.visual_size_var = tk.IntVar(value=self.theme['visual_font_size'])
+        vsize_spin = ttk.Spinbox(vfont_frame, from_=8, to=24, width=5, textvariable=self.visual_size_var)
+        vsize_spin.pack(side=tk.LEFT, padx=2)
+        
+        # Buttons
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=(15, 0))
+        
+        ttk.Button(btn_frame, text="Apply", command=self._apply, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Reset to Default", command=self._reset).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy, width=10).pack(side=tk.RIGHT, padx=5)
+    
+    def _choose_color(self, key):
+        """Open color chooser for the specified key"""
+        # Get current color
+        if key == 'source_bg':
+            current = self.source_bg_var.get()
+        elif key == 'source_fg':
+            current = self.source_fg_var.get()
+        elif key == 'visual_bg':
+            current = self.visual_bg_var.get()
+        else:
+            current = self.visual_fg_var.get()
+        
+        color = colorchooser.askcolor(color=current, title=f"Choose {key.replace('_', ' ').title()}")
+        if color[1]:
+            if key == 'source_bg':
+                self.source_bg_var.set(color[1])
+                self.source_bg_preview.config(bg=color[1])
+            elif key == 'source_fg':
+                self.source_fg_var.set(color[1])
+                self.source_fg_preview.config(bg=color[1])
+            elif key == 'visual_bg':
+                self.visual_bg_var.set(color[1])
+                self.visual_bg_preview.config(bg=color[1])
+            else:
+                self.visual_fg_var.set(color[1])
+                self.visual_fg_preview.config(bg=color[1])
+    
+    def _apply_preset(self, preset_name):
+        """Apply a preset theme"""
+        preset = self.PRESETS[preset_name]
+        
+        self.source_bg_var.set(preset['source_bg'])
+        self.source_bg_preview.config(bg=preset['source_bg'])
+        self.source_fg_var.set(preset['source_fg'])
+        self.source_fg_preview.config(bg=preset['source_fg'])
+        self.visual_bg_var.set(preset['visual_bg'])
+        self.visual_bg_preview.config(bg=preset['visual_bg'])
+        self.visual_fg_var.set(preset['visual_fg'])
+        self.visual_fg_preview.config(bg=preset['visual_fg'])
+    
+    def _apply(self):
+        """Apply the current settings"""
+        self.theme = {
+            'source_bg': self.source_bg_var.get(),
+            'source_fg': self.source_fg_var.get(),
+            'source_font': self.source_font_var.get(),
+            'source_font_size': self.source_size_var.get(),
+            'visual_bg': self.visual_bg_var.get(),
+            'visual_fg': self.visual_fg_var.get(),
+            'visual_font': self.visual_font_var.get(),
+            'visual_font_size': self.visual_size_var.get(),
+        }
+        self.on_apply(self.theme)
+        self.destroy()
+    
+    def _reset(self):
+        """Reset to default theme"""
+        default = MarkdownNotepad.DEFAULT_THEME
+        
+        self.source_bg_var.set(default['source_bg'])
+        self.source_bg_preview.config(bg=default['source_bg'])
+        self.source_fg_var.set(default['source_fg'])
+        self.source_fg_preview.config(bg=default['source_fg'])
+        self.source_font_var.set(default['source_font'])
+        self.source_size_var.set(default['source_font_size'])
+        self.visual_bg_var.set(default['visual_bg'])
+        self.visual_bg_preview.config(bg=default['visual_bg'])
+        self.visual_fg_var.set(default['visual_fg'])
+        self.visual_fg_preview.config(bg=default['visual_fg'])
+        self.visual_font_var.set(default['visual_font'])
+        self.visual_size_var.set(default['visual_font_size'])
+
+
+class ImageManagerDialog(tk.Toplevel):
+    """Dialog for managing document images"""
+    
+    def __init__(self, parent, document_path, text_widget):
+        super().__init__(parent)
+        self.parent = parent
+        self.document_path = document_path
+        self.text_widget = text_widget
+        self.doc_dir = os.path.dirname(document_path)
+        
+        self.title("Image Manager")
+        self.geometry("600x450")
+        self.resizable(True, True)
+        self.transient(parent)
+        
+        self._setup_ui()
+        self._load_images()
+        
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda e: self.destroy())
+    
+    def _setup_ui(self):
+        """Setup the dialog UI"""
+        main_frame = ttk.Frame(self, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Info label
+        info_text = f"Document: {os.path.basename(self.document_path)}"
+        ttk.Label(main_frame, text=info_text, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
+        
+        # Image list
+        list_frame = ttk.Frame(main_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        
+        # Treeview for images
+        columns = ("alt", "path", "status")
+        self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=12)
+        self.tree.heading("alt", text="Alt Text")
+        self.tree.heading("path", text="Path")
+        self.tree.heading("status", text="Status")
+        self.tree.column("alt", width=150)
+        self.tree.column("path", width=300)
+        self.tree.column("status", width=80)
+        
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Buttons
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Button(btn_frame, text="Add Image...", command=self._add_image).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Remove Selected", command=self._remove_image).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Fix Broken Paths", command=self._fix_broken).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Open Assets Folder", command=self._open_assets_folder).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Refresh", command=self._load_images).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Close", command=self.destroy).pack(side=tk.RIGHT, padx=2)
+        
+        # Stats
+        self.stats_label = ttk.Label(main_frame, text="")
+        self.stats_label.pack(anchor=tk.W, pady=(10, 0))
+    
+    def _load_images(self):
+        """Load and display images from the document"""
+        # Clear existing
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # Find images in document
+        content = self.text_widget.get(1.0, tk.END)
+        pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
+        matches = re.findall(pattern, content)
+        
+        total = len(matches)
+        found = 0
+        missing = 0
+        embedded = 0
+        
+        for alt, path in matches:
+            if path.startswith('data:'):
+                self.tree.insert("", tk.END, values=(alt or "(no alt)", "Embedded base64", "✓ Embedded"))
+                embedded += 1
+            else:
+                # Check if file exists
+                if os.path.isabs(path):
+                    full_path = path
+                else:
+                    full_path = os.path.join(self.doc_dir, path)
+                
+                if os.path.exists(full_path):
+                    self.tree.insert("", tk.END, values=(alt or "(no alt)", path, "✓ Found"))
+                    found += 1
+                else:
+                    self.tree.insert("", tk.END, values=(alt or "(no alt)", path, "✗ Missing"), tags=("missing",))
+                    missing += 1
+        
+        # Style missing items
+        self.tree.tag_configure("missing", foreground="red")
+        
+        # Update stats
+        self.stats_label.config(
+            text=f"Total: {total} images | Found: {found} | Missing: {missing} | Embedded: {embedded}"
+        )
+    
+    def _add_image(self):
+        """Add a new image to the document"""
+        self.parent.insert_image()
+        self._load_images()
+    
+    def _remove_image(self):
+        """Remove selected image reference from document"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("No Selection", "Please select an image to remove.")
+            return
+        
+        item = selection[0]
+        values = self.tree.item(item, "values")
+        alt, path, status = values
+        
+        if messagebox.askyesno("Confirm Removal", 
+                               f"Remove this image reference from the document?\n\n"
+                               f"Alt: {alt}\nPath: {path}\n\n"
+                               "Note: This only removes the reference, not the actual file."):
+            # Find and remove from document
+            content = self.text_widget.get(1.0, tk.END)
+            
+            # Escape special regex characters in path
+            escaped_path = re.escape(path)
+            escaped_alt = re.escape(alt) if alt != "(no alt)" else "[^\\]]*"
+            
+            pattern = rf'!\[{escaped_alt}\]\({escaped_path}\)'
+            new_content = re.sub(pattern, '', content, count=1)
+            
+            # Update document
+            self.text_widget.delete(1.0, tk.END)
+            self.text_widget.insert(1.0, new_content.rstrip())
+            
+            self._load_images()
+    
+    def _fix_broken(self):
+        """Try to fix broken image paths"""
+        content = self.text_widget.get(1.0, tk.END)
+        pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
+        
+        fixed_count = 0
+        
+        def fix_match(match):
+            nonlocal fixed_count
+            alt = match.group(1)
+            path = match.group(2)
+            
+            # Skip embedded images
+            if path.startswith('data:'):
+                return match.group(0)
+            
+            # Check if file exists
+            if os.path.isabs(path):
+                full_path = path
+            else:
+                full_path = os.path.join(self.doc_dir, path)
+            
+            if os.path.exists(full_path):
+                return match.group(0)
+            
+            # Try to find the file
+            filename = os.path.basename(path)
+            
+            # Search in document directory and assets folder
+            search_locations = [
+                self.doc_dir,
+                os.path.join(self.doc_dir, f"{os.path.splitext(os.path.basename(self.document_path))[0]}_assets"),
+            ]
+            
+            for location in search_locations:
+                if os.path.exists(location):
+                    for root, dirs, files in os.walk(location):
+                        if filename in files:
+                            found_path = os.path.join(root, filename)
+                            rel_path = os.path.relpath(found_path, self.doc_dir).replace('\\', '/')
+                            fixed_count += 1
+                            return f"![{alt}]({rel_path})"
+            
+            return match.group(0)
+        
+        new_content = re.sub(pattern, fix_match, content)
+        
+        if fixed_count > 0:
+            self.text_widget.delete(1.0, tk.END)
+            self.text_widget.insert(1.0, new_content.rstrip())
+            messagebox.showinfo("Fixed", f"Fixed {fixed_count} broken image path(s).")
+            self._load_images()
+        else:
+            messagebox.showinfo("No Fixes", "No broken paths could be automatically fixed.")
+    
+    def _open_assets_folder(self):
+        """Open the assets folder in file explorer"""
+        doc_name = os.path.splitext(os.path.basename(self.document_path))[0]
+        assets_folder = os.path.join(self.doc_dir, f"{doc_name}_assets")
+        
+        if not os.path.exists(assets_folder):
+            if messagebox.askyesno("Create Folder?", 
+                                   f"Assets folder doesn't exist:\n{assets_folder}\n\nCreate it?"):
+                os.makedirs(assets_folder)
+            else:
+                return
+        
+        # Open in file explorer (Windows)
+        os.startfile(assets_folder)
 
 
 class FindReplaceDialog(tk.Toplevel):
@@ -1445,8 +2233,16 @@ class FindReplaceDialog(tk.Toplevel):
         self._setup_ui()
         self._setup_bindings()
         
+        # Clear highlights when dialog closes
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        
         # Focus search entry
         self.search_entry.focus()
+    
+    def _on_close(self):
+        """Handle dialog close - clear highlights"""
+        self.clear_highlights()
+        self.destroy()
     
     def _setup_ui(self):
         """Setup the dialog UI"""
@@ -1496,7 +2292,7 @@ class FindReplaceDialog(tk.Toplevel):
         btn_frame2.pack(fill=tk.X, pady=2)
         
         ttk.Button(btn_frame2, text="Clear Highlights", command=self.clear_highlights, width=14).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame2, text="Close", command=self.destroy, width=12).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(btn_frame2, text="Close", command=self._on_close, width=12).pack(side=tk.RIGHT, padx=2)
         
         # Status label
         self.status_var = tk.StringVar(value="")
@@ -1507,7 +2303,7 @@ class FindReplaceDialog(tk.Toplevel):
         """Setup keyboard bindings"""
         self.search_entry.bind("<Return>", lambda e: self.find_next())
         self.replace_entry.bind("<Return>", lambda e: self.replace())
-        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Escape>", lambda e: self._on_close())
         self.bind("<F3>", lambda e: self.find_next())
         self.search_var.trace_add("write", lambda *args: self._on_search_change())
     
@@ -1774,13 +2570,22 @@ class FindDialog(tk.Toplevel):
         btn_frame.grid(row=1, column=0, columnspan=2, pady=10)
         
         ttk.Button(btn_frame, text="Find Next", command=self.find_next).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Close", command=self.destroy).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Close", command=self._on_close).pack(side=tk.LEFT, padx=5)
         
-        # Bind Enter key
+        # Bind Enter and Escape keys
         self.search_entry.bind("<Return>", lambda e: self.find_next())
+        self.bind("<Escape>", lambda e: self._on_close())
+        
+        # Clear highlights when dialog closes
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         
         # Track search position
         self.search_pos = "1.0"
+    
+    def _on_close(self):
+        """Handle dialog close - clear highlights"""
+        self.text_widget.tag_remove("search", "1.0", tk.END)
+        self.destroy()
     
     def find_next(self):
         """Find the next occurrence"""
