@@ -160,10 +160,21 @@ class ImageHandler:
     )
     
     # Regex for file path images: ![alt](path/to/image.ext)
+    # Also captures optional HTML-style attributes or size suffix
     FILE_IMAGE_PATTERN = re.compile(
-        r'!\[([^\]]*)\]\(([^)]+\.(?:png|jpe?g|gif|webp|bmp))\)',
+        r'!\[([^\]]*)\]\(([^)\s]+\.(?:png|jpe?g|gif|webp|bmp))(?:\s*["\']([^"\']*)["\'])?\)',
         re.IGNORECASE
     )
+    
+    # Regex for HTML img tags (commonly used for sizing)
+    HTML_IMG_PATTERN = re.compile(
+        r'<img\s+[^>]*src=["\']([^"\']+)["\'][^>]*>',
+        re.IGNORECASE
+    )
+    
+    # Regex to extract width/height from HTML attributes
+    WIDTH_PATTERN = re.compile(r'width\s*[=:]\s*["\']?(\d+)(?:px)?["\']?', re.IGNORECASE)
+    HEIGHT_PATTERN = re.compile(r'height\s*[=:]\s*["\']?(\d+)(?:px)?["\']?', re.IGNORECASE)
     
     # Size limits for safety
     MAX_BASE64_LENGTH = 10 * 1024 * 1024  # 10MB max decoded size
@@ -193,9 +204,12 @@ class ImageHandler:
     def find_images(self, markdown_text):
         """
         Find all valid images in markdown text.
+        Supports:
+        - Standard markdown: ![alt](path)
+        - HTML img tags: <img src="path" width="200">
+        - Size hints in alt: ![alt|200x100](path)
         
-        Returns a list of tuples: (match_start, match_end, alt_text, image_type, image_data_or_path)
-        image_type is either 'base64' or 'file'
+        Returns a list of dicts with image info including optional width/height.
         """
         images = []
         
@@ -204,6 +218,9 @@ class ImageHandler:
             alt_text = match.group(1)
             mime_type = match.group(2)
             base64_data = match.group(3)
+            
+            # Parse size from alt text (format: "alt|200x100" or "alt|200")
+            alt_text, width, height = self._parse_alt_size(alt_text)
             
             # Validate the base64 data
             if self._validate_base64(base64_data):
@@ -214,10 +231,12 @@ class ImageHandler:
                     'alt': alt_text,
                     'type': 'base64',
                     'mime': mime_type,
-                    'data': base64_data
+                    'data': base64_data,
+                    'width': width,
+                    'height': height
                 })
         
-        # Find file path images
+        # Find file path images (markdown syntax)
         for match in self.FILE_IMAGE_PATTERN.finditer(markdown_text):
             # Skip if this overlaps with a base64 match
             if any(img['start'] <= match.start() < img['end'] for img in images):
@@ -225,10 +244,20 @@ class ImageHandler:
                 
             alt_text = match.group(1)
             file_path = match.group(2)
+            title = match.group(3) if match.lastindex >= 3 else None
             
             # Skip data URIs that might have been partially matched
             if file_path.startswith('data:'):
                 continue
+            
+            # Parse size from alt text
+            alt_text, width, height = self._parse_alt_size(alt_text)
+            
+            # Also check title for size hints
+            if title and not width:
+                w, h = self._parse_size_string(title)
+                if w:
+                    width, height = w, h
             
             images.append({
                 'start': match.start(),
@@ -236,10 +265,81 @@ class ImageHandler:
                 'full_match': match.group(0),
                 'alt': alt_text,
                 'type': 'file',
-                'path': file_path
+                'path': file_path,
+                'width': width,
+                'height': height
+            })
+        
+        # Find HTML img tags
+        for match in self.HTML_IMG_PATTERN.finditer(markdown_text):
+            # Skip if overlaps with existing matches
+            if any(img['start'] <= match.start() < img['end'] for img in images):
+                continue
+            
+            full_tag = match.group(0)
+            src = match.group(1)
+            
+            # Skip data URIs
+            if src.startswith('data:'):
+                continue
+            
+            # Extract width and height from tag
+            width_match = self.WIDTH_PATTERN.search(full_tag)
+            height_match = self.HEIGHT_PATTERN.search(full_tag)
+            
+            width = int(width_match.group(1)) if width_match else None
+            height = int(height_match.group(1)) if height_match else None
+            
+            # Try to find alt attribute
+            alt_match = re.search(r'alt\s*=\s*["\']([^"\']*)["\']', full_tag, re.IGNORECASE)
+            alt_text = alt_match.group(1) if alt_match else ''
+            
+            images.append({
+                'start': match.start(),
+                'end': match.end(),
+                'full_match': full_tag,
+                'alt': alt_text,
+                'type': 'file',
+                'path': src,
+                'width': width,
+                'height': height,
+                'is_html': True
             })
         
         return sorted(images, key=lambda x: x['start'])
+    
+    def _parse_alt_size(self, alt_text):
+        """
+        Parse size hints from alt text.
+        Supports formats:
+        - "description|200x100" -> (description, 200, 100)
+        - "description|200" -> (description, 200, None)
+        - "description" -> (description, None, None)
+        """
+        if '|' in alt_text:
+            parts = alt_text.rsplit('|', 1)
+            alt = parts[0].strip()
+            size_str = parts[1].strip()
+            width, height = self._parse_size_string(size_str)
+            return alt, width, height
+        return alt_text, None, None
+    
+    def _parse_size_string(self, size_str):
+        """Parse a size string like '200x100' or '200'"""
+        if not size_str:
+            return None, None
+        
+        # Try "WIDTHxHEIGHT" format
+        match = re.match(r'(\d+)\s*[xX×]\s*(\d+)', size_str)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        
+        # Try just width
+        match = re.match(r'(\d+)', size_str)
+        if match:
+            return int(match.group(1)), None
+        
+        return None, None
     
     def _validate_base64(self, data):
         """
@@ -682,13 +782,38 @@ class MarkdownVisualWidget(tk.Frame):
                 self.text_widget.insert(tk.END, line + '\n')
     
     def _insert_image_inline(self, img_info):
-        """Insert an image inline in the text widget"""
+        """Insert an image inline in the text widget with optional sizing"""
         # Try to load the image
         image = self.image_handler.load_image(img_info)
         
         if image:
-            # Create thumbnail
-            photo = self.image_handler.get_photo_image(image, thumbnail=True, max_size=(200, 200))
+            # Determine display size
+            # Priority: explicit size > default thumbnail
+            display_width = img_info.get('width')
+            display_height = img_info.get('height')
+            
+            if display_width or display_height:
+                # Calculate size maintaining aspect ratio
+                orig_w, orig_h = image.size
+                
+                if display_width and display_height:
+                    max_size = (display_width, display_height)
+                elif display_width:
+                    # Calculate height to maintain aspect ratio
+                    ratio = display_width / orig_w
+                    max_size = (display_width, int(orig_h * ratio))
+                else:
+                    # Calculate width to maintain aspect ratio
+                    ratio = display_height / orig_h
+                    max_size = (int(orig_w * ratio), display_height)
+                
+                # Cap at reasonable maximum
+                max_size = (min(max_size[0], 800), min(max_size[1], 600))
+            else:
+                # Default thumbnail size
+                max_size = (200, 200)
+            
+            photo = self.image_handler.get_photo_image(image, thumbnail=True, max_size=max_size)
             
             if photo:
                 # Insert image into text widget
@@ -698,10 +823,16 @@ class MarkdownVisualWidget(tk.Frame):
                 index = self.text_widget.index(tk.END + "-2c")
                 self.embedded_images[index] = (photo, image, img_info.get('alt', ''))
                 
-                # Add caption
+                # Add caption with size info
                 alt_text = img_info.get('alt', '')
-                size_info = f"{image.size[0]}x{image.size[1]}"
-                caption = f"  {alt_text} ({size_info})" if alt_text else f"  ({size_info})"
+                orig_size = f"{image.size[0]}×{image.size[1]}"
+                display_size = f"{photo.width()}×{photo.height()}"
+                
+                if display_width or display_height:
+                    caption = f"  {alt_text} ({display_size}, original: {orig_size})" if alt_text else f"  ({display_size})"
+                else:
+                    caption = f"  {alt_text} ({orig_size})" if alt_text else f"  ({orig_size})"
+                
                 self.text_widget.insert(tk.END, caption + '\n', "image_caption")
                 
                 # Bind click on images
@@ -782,6 +913,107 @@ class MarkdownVisualWidget(tk.Frame):
         )
 
 
+class DocumentTab(ttk.Frame):
+    """
+    Represents a single document tab with its own editor state.
+    Encapsulates the source editor, visual viewer, and document state.
+    Inherits from ttk.Frame so it can be added directly to a Notebook.
+    """
+    
+    def __init__(self, parent, theme, on_modified_callback=None, on_content_change=None):
+        super().__init__(parent)
+        self.theme = theme
+        self.on_modified = on_modified_callback
+        self.on_content_change_callback = on_content_change
+        
+        # Document state
+        self.file_path = None
+        self.is_modified = False
+        self.current_mode = "source"
+        self.word_wrap = True
+        
+        # Source mode editor
+        self.source_frame = ttk.Frame(self)
+        self.source_editor = scrolledtext.ScrolledText(
+            self.source_frame,
+            wrap=tk.WORD,
+            font=(theme['source_font'], theme['source_font_size']),
+            undo=True,
+            padx=15,
+            pady=12,
+            bg=theme['source_bg'],
+            fg=theme['source_fg'],
+            insertbackground=theme['source_fg'],
+            selectbackground="#b3d9ff",
+            selectforeground="#000000",
+            relief=tk.FLAT,
+            borderwidth=1,
+            spacing1=1,
+            spacing3=1,
+        )
+        self.source_editor.pack(fill=tk.BOTH, expand=True)
+        self.source_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Visual mode viewer
+        self.visual_frame = ttk.Frame(self)
+        self.visual_viewer = MarkdownVisualWidget(
+            self.visual_frame,
+            base_path=os.getcwd(),
+            on_content_change=self._on_visual_edit
+        )
+        self.visual_viewer.pack(fill=tk.BOTH, expand=True)
+        self.visual_viewer.apply_theme(theme)
+        
+        # Setup modification tracking
+        self.source_editor.bind("<<Modified>>", self._on_text_modified)
+    
+    def _on_text_modified(self, event=None):
+        """Handle text modification"""
+        if self.source_editor.edit_modified():
+            self.is_modified = True
+            self.source_editor.edit_modified(False)
+            if self.on_modified:
+                self.on_modified()
+    
+    def _on_visual_edit(self, content):
+        """Handle visual editor changes"""
+        self.is_modified = True
+        if self.on_modified:
+            self.on_modified()
+        if self.on_content_change_callback:
+            self.on_content_change_callback(content)
+    
+    def get_display_name(self):
+        """Get display title for tab"""
+        if self.file_path:
+            return os.path.basename(self.file_path)
+        return "Untitled"
+    
+    def get_content(self):
+        """Get current document content"""
+        if self.current_mode == "visual":
+            return self.visual_viewer.get_content()
+        return self.source_editor.get(1.0, tk.END).rstrip()
+    
+    def set_content(self, content):
+        """Set document content"""
+        self.source_editor.delete(1.0, tk.END)
+        self.source_editor.insert(1.0, content)
+        self.source_editor.edit_modified(False)
+        self.is_modified = False
+    
+    def apply_theme(self, theme):
+        """Apply theme to this tab"""
+        self.theme = theme
+        self.source_editor.config(
+            bg=theme['source_bg'],
+            fg=theme['source_fg'],
+            insertbackground=theme['source_fg'],
+            font=(theme['source_font'], theme['source_font_size'])
+        )
+        self.visual_viewer.apply_theme(theme)
+
+
 class MarkdownNotepad(tk.Tk):
     """Main application window"""
     
@@ -804,11 +1036,10 @@ class MarkdownNotepad(tk.Tk):
         self.geometry("1000x700")
         self.configure(bg="#f5f5f5")
         
-        # Application state
-        self.current_file = None
-        self.is_modified = False
-        self.current_mode = "source"  # "source" or "visual"
-        self.word_wrap = True  # Word wrap toggle
+        # Application state - now tab-based
+        self.tabs = []  # List of DocumentTab instances
+        self.current_tab = None  # Currently active tab
+        self.word_wrap = True  # Word wrap toggle (global setting)
         self.extracted_images_dir = None  # Directory for extracted images
         
         # Theme settings
@@ -823,6 +1054,9 @@ class MarkdownNotepad(tk.Tk):
         
         self._setup_ui()
         self._setup_bindings()
+        
+        # Create initial empty tab
+        self.new_tab()
         self._update_title()
     
     def _load_theme(self):
@@ -853,43 +1087,19 @@ class MarkdownNotepad(tk.Tk):
         # Toolbar
         self._create_toolbar()
         
-        # Main content area
+        # Main content area with notebook for tabs
         self.content_frame = ttk.Frame(self)
         self.content_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Source mode editor
-        self.source_frame = ttk.Frame(self.content_frame)
-        self.source_editor = scrolledtext.ScrolledText(
-            self.source_frame,
-            wrap=tk.WORD,
-            font=(self.theme['source_font'], self.theme['source_font_size']),
-            undo=True,
-            padx=15,
-            pady=12,
-            bg=self.theme['source_bg'],
-            fg=self.theme['source_fg'],
-            insertbackground=self.theme['source_fg'],
-            selectbackground="#b3d9ff",
-            selectforeground="#000000",
-            relief=tk.FLAT,
-            borderwidth=1,
-            spacing1=1,
-            spacing3=1,
-        )
-        self.source_editor.pack(fill=tk.BOTH, expand=True)
-        self.source_frame.pack(fill=tk.BOTH, expand=True)
+        # Notebook widget for tabs
+        self.notebook = ttk.Notebook(self.content_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
         
-        # Visual mode viewer - with content change callback
-        self.visual_frame = ttk.Frame(self.content_frame)
-        self.visual_viewer = MarkdownVisualWidget(
-            self.visual_frame, 
-            base_path=os.getcwd(),
-            on_content_change=self._on_visual_edit
-        )
-        self.visual_viewer.pack(fill=tk.BOTH, expand=True)
+        # Bind tab change event
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         
-        # Apply theme to visual viewer
-        self.visual_viewer.apply_theme(self.theme)
+        # Configure right-click menu for tabs
+        self.notebook.bind("<Button-3>", self._show_tab_context_menu)
         
         # Status bar
         self._create_status_bar()
@@ -898,9 +1108,6 @@ class MarkdownNotepad(tk.Tk):
         self.current_font_size = 11
         self.min_font_size = 6
         self.max_font_size = 48
-        
-        # Start in source mode
-        self._show_source_mode()
     
     def _create_menu(self):
         """Create the menu bar"""
@@ -910,9 +1117,11 @@ class MarkdownNotepad(tk.Tk):
         # File menu
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="New", command=self.new_file, accelerator="Ctrl+N")
+        file_menu.add_command(label="New Tab", command=self.new_tab, accelerator="Ctrl+N")
         file_menu.add_command(label="Open...", command=self.open_file, accelerator="Ctrl+O")
         file_menu.add_command(label="Open with MarkItDown...", command=self.open_with_markitdown, accelerator="Ctrl+Shift+O")
+        file_menu.add_separator()
+        file_menu.add_command(label="Close Tab", command=self.close_tab, accelerator="Ctrl+W")
         file_menu.add_separator()
         file_menu.add_command(label="Save", command=self.save_file, accelerator="Ctrl+S")
         file_menu.add_command(label="Save As...", command=self.save_file_as, accelerator="Ctrl+Shift+S")
@@ -947,7 +1156,7 @@ class MarkdownNotepad(tk.Tk):
         # Word wrap toggle
         self.wrap_var = tk.BooleanVar(value=True)
         view_menu.add_checkbutton(label="Word Wrap", variable=self.wrap_var, 
-                                   command=self._toggle_word_wrap, accelerator="Ctrl+W")
+                                   command=self._toggle_word_wrap, accelerator="Ctrl+Shift+W")
         
         # Large file mode
         self.large_file_var = tk.BooleanVar(value=False)
@@ -997,13 +1206,12 @@ class MarkdownNotepad(tk.Tk):
         style.configure("Toolbar.TButton", padding=5)
         
         # File operations
-        ttk.Button(toolbar, text="📄 New", command=self.new_file, style="Toolbar.TButton").pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="📄 New", command=self.new_tab, style="Toolbar.TButton").pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="📂 Open", command=self.open_file, style="Toolbar.TButton").pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="🔄 MarkItDown", command=self.open_with_markitdown, style="Toolbar.TButton").pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="💾 Save", command=self.save_file, style="Toolbar.TButton").pack(side=tk.LEFT, padx=2)
         
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
-        
         # Mode toggle
         self.mode_var = tk.StringVar(value="source")
         ttk.Label(toolbar, text="Mode:").pack(side=tk.LEFT, padx=(5, 2))
@@ -1066,12 +1274,14 @@ class MarkdownNotepad(tk.Tk):
     
     def _setup_bindings(self):
         """Setup keyboard bindings"""
-        self.bind("<Control-n>", lambda e: self.new_file())
+        self.bind("<Control-n>", lambda e: self.new_tab())
         self.bind("<Control-o>", lambda e: self.open_file())
         self.bind("<Control-O>", lambda e: self.open_with_markitdown())  # Ctrl+Shift+O
         self.bind("<Control-s>", lambda e: self.save_file())
         self.bind("<Control-S>", lambda e: self.save_file_as())  # Ctrl+Shift+S
         self.bind("<Control-I>", lambda e: self.insert_image())  # Ctrl+Shift+I
+        self.bind("<Control-w>", lambda e: self.close_tab())  # Close tab
+        self.bind("<Control-W>", lambda e: self._toggle_word_wrap())  # Ctrl+Shift+W for word wrap
         self.bind("<Control-z>", lambda e: self.undo())
         self.bind("<Control-y>", lambda e: self.redo())
         self.bind("<Control-a>", lambda e: self.select_all())
@@ -1083,8 +1293,11 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-Key-1>", lambda e: self._show_source_mode())
         self.bind("<Control-Key-2>", lambda e: self._show_visual_mode())
         self.bind("<Control-e>", lambda e: self._toggle_mode())
-        self.bind("<Control-w>", lambda e: self._toggle_word_wrap())
         self.bind("<F3>", lambda e: self._find_next_f3())
+        
+        # Tab navigation
+        self.bind("<Control-Tab>", lambda e: self._next_tab())
+        self.bind("<Control-Shift-Tab>", lambda e: self._prev_tab())
         
         # Zoom bindings
         self.bind("<Control-plus>", lambda e: self.zoom_in())
@@ -1092,18 +1305,165 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-minus>", lambda e: self.zoom_out())
         self.bind("<Control-0>", lambda e: self.zoom_reset())
         
-        # Mouse wheel zoom (Ctrl+Scroll) for both editors
-        self.source_editor.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
-        self.visual_viewer.text_widget.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
-        
-        # Track modifications - debounced for performance
-        self.source_editor.bind("<<Modified>>", self._on_modified)
+        # Position update state
         self._position_update_pending = False
-        self.source_editor.bind("<KeyRelease>", self._schedule_position_update)
-        self.source_editor.bind("<ButtonRelease>", self._update_position)
         
         # Handle window close
         self.protocol("WM_DELETE_WINDOW", self.quit_app)
+    
+    # === Tab Management Methods ===
+    
+    def new_tab(self, file_path=None, content=""):
+        """Create a new tab"""
+        tab = DocumentTab(
+            self.notebook,
+            theme=self.theme,
+            on_modified_callback=lambda: self._on_tab_modified(),
+            on_content_change=lambda c: self._on_visual_edit(c)
+        )
+        
+        # Add to notebook
+        tab_name = tab.get_display_name() if not file_path else os.path.basename(file_path)
+        self.notebook.add(tab, text=tab_name)
+        self.tabs.append(tab)
+        
+        # Set file path if provided
+        if file_path:
+            tab.file_path = file_path
+        
+        # Set content if provided
+        if content:
+            tab.set_content(content)
+        
+        # Setup bindings for this tab
+        self._setup_tab_bindings(tab)
+        
+        # Select the new tab
+        self.notebook.select(tab)
+        self.current_tab = tab
+        
+        self._update_title()
+        return tab
+    
+    def _setup_tab_bindings(self, tab):
+        """Setup bindings for a specific tab"""
+        # Mouse wheel zoom
+        tab.source_editor.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
+        tab.visual_viewer.text_widget.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
+        
+        # Position tracking
+        tab.source_editor.bind("<KeyRelease>", self._schedule_position_update)
+        tab.source_editor.bind("<ButtonRelease>", self._update_position)
+    
+    def close_tab(self, tab=None):
+        """Close a tab"""
+        if tab is None:
+            tab = self.current_tab
+        
+        if tab is None:
+            return
+        
+        # Check if modified
+        if tab.is_modified:
+            response = messagebox.askyesnocancel(
+                "Unsaved Changes",
+                f"'{tab.get_display_name()}' has unsaved changes.\n\nDo you want to save before closing?",
+                parent=self
+            )
+            if response is None:  # Cancel
+                return
+            if response:  # Yes - save
+                self.current_tab = tab
+                if not self.save_file():
+                    return  # Save was cancelled
+        
+        # Get tab index
+        tab_index = self.tabs.index(tab)
+        
+        # Remove from notebook
+        self.notebook.forget(tab)
+        self.tabs.remove(tab)
+        
+        # If no tabs left, create new empty tab
+        if not self.tabs:
+            self.new_tab()
+        else:
+            # Select adjacent tab
+            new_index = min(tab_index, len(self.tabs) - 1)
+            self.notebook.select(self.tabs[new_index])
+        
+        self._update_title()
+    
+    def _on_tab_changed(self, event=None):
+        """Handle tab selection change"""
+        try:
+            current = self.notebook.select()
+            if current:
+                # Find the tab widget
+                for tab in self.tabs:
+                    if str(tab) == current:
+                        self.current_tab = tab
+                        self._update_title()
+                        self._update_mode_display()
+                        self._update_position()
+                        break
+        except:
+            pass
+    
+    def _on_tab_modified(self):
+        """Called when any tab is modified"""
+        if self.current_tab:
+            # Update tab title to show modified indicator
+            self._update_tab_title(self.current_tab)
+            self._update_title()
+    
+    def _update_tab_title(self, tab):
+        """Update the tab title in the notebook"""
+        try:
+            tab_id = self.tabs.index(tab)
+            name = tab.get_display_name()
+            if tab.is_modified:
+                name = f"*{name}"
+            self.notebook.tab(tab, text=name)
+        except:
+            pass
+    
+    def _next_tab(self):
+        """Switch to next tab"""
+        if len(self.tabs) > 1:
+            current_idx = self.tabs.index(self.current_tab)
+            next_idx = (current_idx + 1) % len(self.tabs)
+            self.notebook.select(self.tabs[next_idx])
+    
+    def _prev_tab(self):
+        """Switch to previous tab"""
+        if len(self.tabs) > 1:
+            current_idx = self.tabs.index(self.current_tab)
+            prev_idx = (current_idx - 1) % len(self.tabs)
+            self.notebook.select(self.tabs[prev_idx])
+    
+    def _show_tab_context_menu(self, event):
+        """Show context menu for tab"""
+        # Find which tab was clicked
+        try:
+            clicked_tab_idx = self.notebook.index(f"@{event.x},{event.y}")
+            if clicked_tab_idx >= 0 and clicked_tab_idx < len(self.tabs):
+                clicked_tab = self.tabs[clicked_tab_idx]
+                
+                menu = tk.Menu(self, tearoff=0)
+                menu.add_command(label="Close Tab", command=lambda: self.close_tab(clicked_tab))
+                menu.add_command(label="Close Other Tabs", command=lambda: self._close_other_tabs(clicked_tab))
+                menu.add_separator()
+                menu.add_command(label="New Tab", command=self.new_tab)
+                menu.tk_popup(event.x_root, event.y_root)
+        except:
+            pass
+    
+    def _close_other_tabs(self, keep_tab):
+        """Close all tabs except the specified one"""
+        tabs_to_close = [t for t in self.tabs if t != keep_tab]
+        for tab in tabs_to_close:
+            self.close_tab(tab)
     
     def _schedule_position_update(self, event=None):
         """Schedule position update with debouncing for performance"""
@@ -1117,29 +1477,41 @@ class MarkdownNotepad(tk.Tk):
         self._update_position()
     
     def _on_modified(self, event=None):
-        """Handle text modification"""
-        if self.source_editor.edit_modified():
-            self.is_modified = True
+        """Handle text modification - called by tab's source editor"""
+        if self.current_tab and self.current_tab.source_editor.edit_modified():
+            self.current_tab.is_modified = True
+            self._update_tab_title(self.current_tab)
             self._update_title()
-            self.source_editor.edit_modified(False)
+            self.current_tab.source_editor.edit_modified(False)
     
     def _update_position(self, event=None):
         """Update cursor position in status bar"""
         try:
-            pos = self.source_editor.index(tk.INSERT)
-            line, col = pos.split('.')
-            self.position_label.config(text=f"Line {line}, Col {int(col)+1}")
+            if self.current_tab:
+                pos = self.current_tab.source_editor.index(tk.INSERT)
+                line, col = pos.split('.')
+                self.position_label.config(text=f"Line {line}, Col {int(col)+1}")
         except:
             pass
     
     def _update_title(self):
         """Update window title"""
         title = "MarkItDown Notepad"
-        if self.current_file:
-            title = f"{os.path.basename(self.current_file)} - {title}"
-        if self.is_modified:
-            title = f"*{title}"
+        if self.current_tab:
+            if self.current_tab.file_path:
+                title = f"{os.path.basename(self.current_tab.file_path)} - {title}"
+            else:
+                title = f"{self.current_tab.get_display_name()} - {title}"
+            if self.current_tab.is_modified:
+                title = f"*{title}"
         self.title(title)
+    
+    def _update_mode_display(self):
+        """Update mode display in status bar for current tab"""
+        if self.current_tab:
+            mode = self.current_tab.current_mode
+            self.mode_var.set(mode)
+            self.mode_label.config(text=f"{mode.capitalize()} Mode")
     
     def _set_status(self, message):
         """Set status bar message"""
@@ -1152,8 +1524,10 @@ class MarkdownNotepad(tk.Tk):
         self.word_wrap = not self.word_wrap
         self.wrap_var.set(self.word_wrap)
         
-        wrap_mode = tk.WORD if self.word_wrap else tk.NONE
-        self.source_editor.config(wrap=wrap_mode)
+        # Apply to current tab
+        if self.current_tab:
+            wrap_mode = tk.WORD if self.word_wrap else tk.NONE
+            self.current_tab.source_editor.config(wrap=wrap_mode)
         
         # Update status bar
         self.wrap_label.config(text=f"Wrap: {'On' if self.word_wrap else 'Off'}")
@@ -1164,14 +1538,15 @@ class MarkdownNotepad(tk.Tk):
         """Toggle large file mode for better performance with big files"""
         is_large = self.large_file_var.get()
         
-        if is_large:
-            # Disable expensive operations
-            self.source_editor.config(undo=False)
-            self._set_status("Large file mode: undo disabled for performance")
-        else:
-            # Re-enable
-            self.source_editor.config(undo=True)
-            self._set_status("Normal mode: full features enabled")
+        if self.current_tab:
+            if is_large:
+                # Disable expensive operations
+                self.current_tab.source_editor.config(undo=False)
+                self._set_status("Large file mode: undo disabled for performance")
+            else:
+                # Re-enable
+                self.current_tab.source_editor.config(undo=True)
+                self._set_status("Normal mode: full features enabled")
     
     def _on_ctrl_mousewheel(self, event):
         """Handle Ctrl+MouseWheel for zoom"""
@@ -1199,60 +1574,71 @@ class MarkdownNotepad(tk.Tk):
         self._apply_font_size()
     
     def _apply_font_size(self):
-        """Apply current font size to both editors"""
-        # Apply to source editor
-        self.source_editor.config(font=(self.theme['source_font'], self.current_font_size))
-        
-        # Apply proportionally to visual editor
-        visual_base = self.theme['visual_font_size']
-        scale = self.current_font_size / self.theme['source_font_size']
-        visual_size = max(6, int(visual_base * scale))
-        self.visual_viewer.text_widget.config(
-            font=(self.theme['visual_font'], visual_size)
-        )
+        """Apply current font size to all tabs"""
+        for tab in self.tabs:
+            # Apply to source editor
+            tab.source_editor.config(font=(self.theme['source_font'], self.current_font_size))
+            
+            # Apply proportionally to visual editor
+            visual_base = self.theme['visual_font_size']
+            scale = self.current_font_size / self.theme['source_font_size']
+            visual_size = max(6, int(visual_base * scale))
+            tab.visual_viewer.text_widget.config(
+                font=(self.theme['visual_font'], visual_size)
+            )
         
         # Update status bar with zoom level
         zoom_pct = int((self.current_font_size / self.theme['source_font_size']) * 100)
         self.zoom_label.config(text=f"{zoom_pct}%")
     
     def _show_source_mode(self):
-        """Switch to source editing mode"""
+        """Switch current tab to source editing mode"""
+        if not self.current_tab:
+            return
+            
         # Sync any changes from visual mode first
-        if self.current_mode == "visual":
-            visual_content = self.visual_viewer.get_content()
-            source_content = self.source_editor.get(1.0, tk.END).rstrip()
+        if self.current_tab.current_mode == "visual":
+            visual_content = self.current_tab.visual_viewer.get_content()
+            source_content = self.current_tab.source_editor.get(1.0, tk.END).rstrip()
             if visual_content != source_content:
-                self.source_editor.delete(1.0, tk.END)
-                self.source_editor.insert(1.0, visual_content)
+                self.current_tab.source_editor.delete(1.0, tk.END)
+                self.current_tab.source_editor.insert(1.0, visual_content)
         
-        self.visual_frame.pack_forget()
-        self.source_frame.pack(fill=tk.BOTH, expand=True)
-        self.current_mode = "source"
+        self.current_tab.visual_frame.pack_forget()
+        self.current_tab.source_frame.pack(fill=tk.BOTH, expand=True)
+        self.current_tab.current_mode = "source"
         self.mode_var.set("source")
         self.mode_label.config(text="Source Mode")
         self._set_status("Source mode - edit raw markdown")
     
     def _show_visual_mode(self):
-        """Switch to visual rendering mode"""
+        """Switch current tab to visual rendering mode"""
+        if not self.current_tab:
+            return
+            
         # Update visual view with current content
-        content = self.source_editor.get(1.0, tk.END).rstrip()
-        self.visual_viewer.set_content(content)
+        content = self.current_tab.source_editor.get(1.0, tk.END).rstrip()
+        self.current_tab.visual_viewer.set_content(content)
         
-        self.source_frame.pack_forget()
-        self.visual_frame.pack(fill=tk.BOTH, expand=True)
-        self.current_mode = "visual"
+        self.current_tab.source_frame.pack_forget()
+        self.current_tab.visual_frame.pack(fill=tk.BOTH, expand=True)
+        self.current_tab.current_mode = "visual"
         self.mode_var.set("visual")
         self.mode_label.config(text="Visual Mode")
         self._set_status("Visual mode - editable rendered preview")
     
     def _on_visual_edit(self, content):
         """Called when visual editor content changes"""
-        self.is_modified = True
-        self._update_title()
+        if self.current_tab:
+            self.current_tab.is_modified = True
+            self._update_tab_title(self.current_tab)
+            self._update_title()
     
     def _toggle_mode(self):
         """Toggle between source and visual mode"""
-        if self.current_mode == "source":
+        if not self.current_tab:
+            return
+        if self.current_tab.current_mode == "source":
             self._show_visual_mode()
         else:
             self._show_source_mode()
@@ -1260,23 +1646,12 @@ class MarkdownNotepad(tk.Tk):
     # === File Operations ===
     
     def new_file(self):
-        """Create a new file"""
-        if self.is_modified:
-            if not self._confirm_discard():
-                return
-        
-        self.source_editor.delete(1.0, tk.END)
-        self.current_file = None
-        self.is_modified = False
-        self._update_title()
+        """Create a new file - now creates a new tab"""
+        self.new_tab()
         self._set_status("New file created")
     
     def open_file(self):
-        """Open a markdown file directly"""
-        if self.is_modified:
-            if not self._confirm_discard():
-                return
-        
+        """Open a markdown file in a new tab"""
         filetypes = [
             ("Markdown files", "*.md *.markdown"),
             ("Text files", "*.txt"),
@@ -1285,19 +1660,26 @@ class MarkdownNotepad(tk.Tk):
         
         filepath = filedialog.askopenfilename(filetypes=filetypes)
         if filepath:
+            # Check if already open in a tab
+            for tab in self.tabs:
+                if tab.file_path == filepath:
+                    # Switch to that tab
+                    self.notebook.select(tab)
+                    self._set_status(f"File already open: {os.path.basename(filepath)}")
+                    return
+            
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     content = f.read()
                 
-                self.source_editor.delete(1.0, tk.END)
-                self.source_editor.insert(1.0, content)
-                self.current_file = filepath
-                self.is_modified = False
-                self._update_title()
+                # Create a new tab for this file
+                tab = self.new_tab(file_path=filepath, content=content)
+                tab.is_modified = False
+                self._update_tab_title(tab)
                 self._set_status(f"Opened: {filepath}")
                 
                 # Update visual viewer base path for relative image resolution
-                self.visual_viewer.set_base_path(os.path.dirname(filepath))
+                tab.visual_viewer.set_base_path(os.path.dirname(filepath))
             except Exception as e:
                 messagebox.showerror("Error", f"Could not open file:\n{e}")
     
@@ -1309,10 +1691,6 @@ class MarkdownNotepad(tk.Tk):
                 "MarkItDown is not installed.\n\nInstall with:\npip install 'markitdown[all]'"
             )
             return
-        
-        if self.is_modified:
-            if not self._confirm_discard():
-                return
         
         filetypes = [
             ("All supported files", "*.pdf *.docx *.pptx *.xlsx *.xls *.html *.htm *.csv *.json *.xml *.epub *.jpg *.jpeg *.png *.gif *.bmp *.wav *.mp3 *.msg"),
@@ -1365,18 +1743,16 @@ class MarkdownNotepad(tk.Tk):
                                 content = ImageExtractor.insert_image_references(
                                     content, extracted_images, output_dir
                                 )
-                                
-                                # Set base path for visual viewer
-                                self.visual_viewer.set_base_path(output_dir)
                                 self.extracted_images_dir = output_dir
                 
-                self.source_editor.delete(1.0, tk.END)
-                self.source_editor.insert(1.0, content)
+                # Create a new tab for the converted content
+                tab = self.new_tab(content=content)
+                tab.is_modified = True  # Mark as modified since not yet saved
+                self._update_tab_title(tab)
                 
-                # Keep original file reference but mark as new (not the original)
-                self.current_file = None
-                self.is_modified = True
-                self._update_title()
+                # Set base path for visual viewer
+                if extracted_images and output_dir:
+                    tab.visual_viewer.set_base_path(output_dir)
                 
                 # Status message
                 img_count = len(extracted_images)
@@ -1401,22 +1777,31 @@ class MarkdownNotepad(tk.Tk):
                 self._set_status("Conversion failed")
     
     def save_file(self):
-        """Save the current file"""
-        if self.current_file:
+        """Save the current tab's file"""
+        if not self.current_tab:
+            return False
+            
+        if self.current_tab.file_path:
             try:
-                content = self.source_editor.get(1.0, tk.END).rstrip()
-                with open(self.current_file, 'w', encoding='utf-8') as f:
+                content = self.current_tab.get_content()
+                with open(self.current_tab.file_path, 'w', encoding='utf-8') as f:
                     f.write(content)
-                self.is_modified = False
+                self.current_tab.is_modified = False
+                self._update_tab_title(self.current_tab)
                 self._update_title()
-                self._set_status(f"Saved: {self.current_file}")
+                self._set_status(f"Saved: {self.current_tab.file_path}")
+                return True
             except Exception as e:
                 messagebox.showerror("Error", f"Could not save file:\n{e}")
+                return False
         else:
-            self.save_file_as()
+            return self.save_file_as()
     
     def save_file_as(self):
-        """Save the file with a new name"""
+        """Save the current tab's file with a new name"""
+        if not self.current_tab:
+            return False
+            
         filetypes = [
             ("Markdown files", "*.md"),
             ("Text files", "*.txt"),
@@ -1430,18 +1815,28 @@ class MarkdownNotepad(tk.Tk):
         
         if filepath:
             try:
-                content = self.source_editor.get(1.0, tk.END).rstrip()
+                content = self.current_tab.get_content()
                 with open(filepath, 'w', encoding='utf-8') as f:
                     f.write(content)
-                self.current_file = filepath
-                self.is_modified = False
+                self.current_tab.file_path = filepath
+                self.current_tab.is_modified = False
+                self._update_tab_title(self.current_tab)
                 self._update_title()
                 self._set_status(f"Saved: {filepath}")
+                
+                # Update visual viewer base path
+                self.current_tab.visual_viewer.set_base_path(os.path.dirname(filepath))
+                return True
             except Exception as e:
                 messagebox.showerror("Error", f"Could not save file:\n{e}")
+                return False
+        return False
     
     def _confirm_discard(self):
-        """Ask user to confirm discarding changes"""
+        """Ask user to confirm discarding changes - returns True if OK to proceed"""
+        if not self.current_tab or not self.current_tab.is_modified:
+            return True
+            
         result = messagebox.askyesnocancel(
             "Unsaved Changes",
             "You have unsaved changes. Do you want to save them?"
@@ -1449,91 +1844,99 @@ class MarkdownNotepad(tk.Tk):
         if result is None:  # Cancel
             return False
         if result:  # Yes
-            self.save_file()
-            return not self.is_modified
+            return self.save_file()
         return True  # No
     
     # === Edit Operations ===
     
     def undo(self):
         """Undo last action"""
-        try:
-            self.source_editor.edit_undo()
-        except tk.TclError:
-            pass
+        if self.current_tab:
+            try:
+                self.current_tab.source_editor.edit_undo()
+            except tk.TclError:
+                pass
     
     def redo(self):
         """Redo last undone action"""
-        try:
-            self.source_editor.edit_redo()
-        except tk.TclError:
-            pass
+        if self.current_tab:
+            try:
+                self.current_tab.source_editor.edit_redo()
+            except tk.TclError:
+                pass
     
     def cut(self):
         """Cut selected text"""
-        self.source_editor.event_generate("<<Cut>>")
+        if self.current_tab:
+            self.current_tab.source_editor.event_generate("<<Cut>>")
     
     def copy(self):
         """Copy selected text"""
-        self.source_editor.event_generate("<<Copy>>")
+        if self.current_tab:
+            self.current_tab.source_editor.event_generate("<<Copy>>")
     
     def paste(self):
         """Paste from clipboard"""
-        self.source_editor.event_generate("<<Paste>>")
+        if self.current_tab:
+            self.current_tab.source_editor.event_generate("<<Paste>>")
     
     def select_all(self):
         """Select all text"""
-        self.source_editor.tag_add(tk.SEL, "1.0", tk.END)
+        if self.current_tab:
+            self.current_tab.source_editor.tag_add(tk.SEL, "1.0", tk.END)
         return "break"
     
     def find_text(self):
         """Open find dialog"""
-        FindDialog(self, self.source_editor)
+        if self.current_tab:
+            FindDialog(self, self.current_tab.source_editor)
     
     # === Format Operations ===
     
     def _insert_format(self, prefix, suffix):
         """Insert formatting around selected text"""
-        if self.current_mode != "source":
+        if not self.current_tab or self.current_tab.current_mode != "source":
             return
         
+        editor = self.current_tab.source_editor
         try:
-            selected = self.source_editor.get(tk.SEL_FIRST, tk.SEL_LAST)
-            self.source_editor.delete(tk.SEL_FIRST, tk.SEL_LAST)
-            self.source_editor.insert(tk.INSERT, f"{prefix}{selected}{suffix}")
+            selected = editor.get(tk.SEL_FIRST, tk.SEL_LAST)
+            editor.delete(tk.SEL_FIRST, tk.SEL_LAST)
+            editor.insert(tk.INSERT, f"{prefix}{selected}{suffix}")
         except tk.TclError:
             # No selection, just insert the formatting
-            self.source_editor.insert(tk.INSERT, f"{prefix}{suffix}")
+            editor.insert(tk.INSERT, f"{prefix}{suffix}")
             # Move cursor between the markers
-            pos = self.source_editor.index(tk.INSERT)
+            pos = editor.index(tk.INSERT)
             line, col = pos.split('.')
             new_col = int(col) - len(suffix)
-            self.source_editor.mark_set(tk.INSERT, f"{line}.{new_col}")
+            editor.mark_set(tk.INSERT, f"{line}.{new_col}")
     
     def _insert_line_prefix(self, prefix):
         """Insert prefix at the beginning of the current line"""
-        if self.current_mode != "source":
+        if not self.current_tab or self.current_tab.current_mode != "source":
             return
         
-        pos = self.source_editor.index(tk.INSERT)
+        editor = self.current_tab.source_editor
+        pos = editor.index(tk.INSERT)
         line = pos.split('.')[0]
-        self.source_editor.insert(f"{line}.0", prefix)
+        editor.insert(f"{line}.0", prefix)
     
     def _insert_text(self, text):
         """Insert text at cursor position"""
-        if self.current_mode != "source":
+        if not self.current_tab or self.current_tab.current_mode != "source":
             return
-        self.source_editor.insert(tk.INSERT, text)
+        self.current_tab.source_editor.insert(tk.INSERT, text)
     
     # === Image Management ===
     
     def _get_assets_folder(self):
         """Get or create the assets folder for the current document"""
-        if not self.current_file:
+        if not self.current_tab or not self.current_tab.file_path:
             return None
         
-        doc_dir = os.path.dirname(self.current_file)
-        doc_name = os.path.splitext(os.path.basename(self.current_file))[0]
+        doc_dir = os.path.dirname(self.current_tab.file_path)
+        doc_name = os.path.splitext(os.path.basename(self.current_tab.file_path))[0]
         assets_folder = os.path.join(doc_dir, f"{doc_name}_assets")
         
         if not os.path.exists(assets_folder):
@@ -1543,95 +1946,18 @@ class MarkdownNotepad(tk.Tk):
     
     def insert_image(self):
         """Insert an image into the document with proper asset management"""
-        if self.current_mode != "source":
+        if not self.current_tab:
+            return
+        if self.current_tab.current_mode != "source":
             messagebox.showinfo("Info", "Please switch to Source mode to insert images.")
             return
         
-        # Select image file
-        filetypes = [
-            ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
-            ("PNG files", "*.png"),
-            ("JPEG files", "*.jpg *.jpeg"),
-            ("GIF files", "*.gif"),
-            ("All files", "*.*")
-        ]
-        
-        image_path = filedialog.askopenfilename(
-            title="Select Image",
-            filetypes=filetypes
-        )
-        
-        if not image_path:
-            return
-        
-        # Get alt text
-        alt_text = simpledialog.askstring(
-            "Image Alt Text",
-            "Enter alt text for the image (for accessibility):",
-            initialvalue=os.path.splitext(os.path.basename(image_path))[0]
-        )
-        
-        if alt_text is None:
-            alt_text = ""
-        
-        # Determine how to handle the image
-        if self.current_file:
-            # Document is saved - copy to assets folder
-            assets_folder = self._get_assets_folder()
-            
-            # Copy image to assets folder
-            image_filename = os.path.basename(image_path)
-            # Handle duplicate names
-            dest_path = os.path.join(assets_folder, image_filename)
-            counter = 1
-            while os.path.exists(dest_path):
-                name, ext = os.path.splitext(image_filename)
-                dest_path = os.path.join(assets_folder, f"{name}_{counter}{ext}")
-                counter += 1
-            
-            shutil.copy2(image_path, dest_path)
-            
-            # Create relative path
-            doc_dir = os.path.dirname(self.current_file)
-            rel_path = os.path.relpath(dest_path, doc_dir).replace('\\', '/')
-            
-            # Insert markdown
-            markdown = f"![{alt_text}]({rel_path})"
-            self.source_editor.insert(tk.INSERT, markdown)
-            
-            self._set_status(f"Image added: {rel_path}")
-        else:
-            # Document not saved - ask user what to do
-            choice = messagebox.askyesnocancel(
-                "Unsaved Document",
-                "Your document hasn't been saved yet.\n\n"
-                "• Yes: Save document first, then add image\n"
-                "• No: Insert absolute path (not recommended)\n"
-                "• Cancel: Cancel image insertion"
-            )
-            
-            if choice is None:
-                return
-            elif choice:
-                # Save first
-                self.save_file_as()
-                if self.current_file:
-                    # Retry insertion now that file is saved
-                    self.insert_image()
-                return
-            else:
-                # Insert absolute path with warning
-                markdown = f"![{alt_text}]({image_path.replace(chr(92), '/')})"
-                self.source_editor.insert(tk.INSERT, markdown)
-                self._set_status("Warning: Absolute path used - save document to use relative paths")
-        
-        # Update visual viewer
-        if self.current_file:
-            self.visual_viewer.set_base_path(os.path.dirname(self.current_file))
+        # Open image insert dialog
+        InsertImageDialog(self, self.current_tab.source_editor, self.current_tab.file_path, self._get_assets_folder)
     
     def manage_images(self):
         """Open image manager dialog"""
-        if not self.current_file:
+        if not self.current_tab or not self.current_tab.file_path:
             messagebox.showinfo(
                 "Save Required",
                 "Please save your document first to manage images.\n\n"
@@ -1639,18 +1965,21 @@ class MarkdownNotepad(tk.Tk):
             )
             return
         
-        ImageManagerDialog(self, self.current_file, self.source_editor)
+        ImageManagerDialog(self, self.current_tab.file_path, self.current_tab.source_editor)
     
     def _find_document_images(self):
         """Find all image references in the current document"""
-        content = self.source_editor.get(1.0, tk.END)
+        if not self.current_tab:
+            return []
+            
+        content = self.current_tab.source_editor.get(1.0, tk.END)
         
         # Find markdown image syntax: ![alt](path)
         pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
         matches = re.findall(pattern, content)
         
         images = []
-        doc_dir = os.path.dirname(self.current_file) if self.current_file else os.getcwd()
+        doc_dir = os.path.dirname(self.current_tab.file_path) if self.current_tab.file_path else os.getcwd()
         
         for alt, path in matches:
             # Skip base64 images
@@ -1682,11 +2011,13 @@ class MarkdownNotepad(tk.Tk):
     
     def find_replace(self):
         """Open find & replace dialog"""
-        FindReplaceDialog(self, self.source_editor)
+        if self.current_tab:
+            FindReplaceDialog(self, self.current_tab.source_editor)
     
     def goto_line(self):
         """Open go to line dialog"""
-        GoToLineDialog(self, self.source_editor)
+        if self.current_tab:
+            GoToLineDialog(self, self.current_tab.source_editor)
     
     def _find_next_f3(self):
         """Find next using F3 (uses last search if available)"""
@@ -1702,9 +2033,21 @@ class MarkdownNotepad(tk.Tk):
     
     def quit_app(self):
         """Exit the application"""
-        if self.is_modified:
-            if not self._confirm_discard():
-                return
+        # Check all tabs for unsaved changes
+        for tab in self.tabs:
+            if tab.is_modified:
+                response = messagebox.askyesnocancel(
+                    "Unsaved Changes",
+                    f"'{tab.get_display_name()}' has unsaved changes.\n\nDo you want to save before exiting?",
+                    parent=self
+                )
+                if response is None:  # Cancel
+                    return
+                if response:  # Yes - save
+                    self.current_tab = tab
+                    self.notebook.select(tab)
+                    if not self.save_file():
+                        return  # Save was cancelled
         self.destroy()
     
     def show_about(self):
@@ -1760,16 +2103,15 @@ class MarkdownNotepad(tk.Tk):
         self.theme = new_theme
         self._save_theme()
         
-        # Apply to source editor
-        self.source_editor.config(
-            bg=self.theme['source_bg'],
-            fg=self.theme['source_fg'],
-            insertbackground=self.theme['source_fg'],
-            font=(self.theme['source_font'], self.theme['source_font_size'])
-        )
-        
-        # Apply to visual viewer
-        self.visual_viewer.apply_theme(self.theme)
+        # Apply to all tabs
+        for tab in self.tabs:
+            tab.source_editor.config(
+                bg=self.theme['source_bg'],
+                fg=self.theme['source_fg'],
+                insertbackground=self.theme['source_fg'],
+                font=(self.theme['source_font'], self.theme['source_font_size'])
+            )
+            tab.visual_viewer.apply_theme(self.theme)
         
         # Update current font size for zoom
         self.current_font_size = self.theme['source_font_size']
@@ -1997,6 +2339,231 @@ class ThemeDialog(tk.Toplevel):
         self.visual_fg_preview.config(bg=default['visual_fg'])
         self.visual_font_var.set(default['visual_font'])
         self.visual_size_var.set(default['visual_font_size'])
+
+
+class InsertImageDialog(tk.Toplevel):
+    """Dialog for inserting images with size options"""
+    
+    def __init__(self, parent, text_widget, current_file, get_assets_folder_func):
+        super().__init__(parent)
+        self.parent = parent
+        self.text_widget = text_widget
+        self.current_file = current_file
+        self.get_assets_folder = get_assets_folder_func
+        self.image_path = None
+        self.original_size = (0, 0)
+        
+        self.title("Insert Image")
+        self.geometry("500x400")
+        self.resizable(True, False)
+        self.transient(parent)
+        
+        self._setup_ui()
+        
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda e: self.destroy())
+    
+    def _setup_ui(self):
+        """Setup the dialog UI"""
+        main_frame = ttk.Frame(self, padding=15)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # File selection
+        file_frame = ttk.LabelFrame(main_frame, text="Image File", padding=10)
+        file_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.file_var = tk.StringVar()
+        file_entry = ttk.Entry(file_frame, textvariable=self.file_var, width=50)
+        file_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ttk.Button(file_frame, text="Browse...", command=self._browse_image).pack(side=tk.LEFT)
+        
+        # Preview area
+        preview_frame = ttk.LabelFrame(main_frame, text="Preview", padding=10)
+        preview_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        self.preview_label = ttk.Label(preview_frame, text="No image selected", anchor="center")
+        self.preview_label.pack(fill=tk.BOTH, expand=True)
+        
+        self.size_info_label = ttk.Label(preview_frame, text="")
+        self.size_info_label.pack()
+        
+        # Options
+        options_frame = ttk.LabelFrame(main_frame, text="Options", padding=10)
+        options_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Alt text
+        alt_frame = ttk.Frame(options_frame)
+        alt_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(alt_frame, text="Alt text:", width=12).pack(side=tk.LEFT)
+        self.alt_var = tk.StringVar()
+        ttk.Entry(alt_frame, textvariable=self.alt_var, width=40).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        # Size options
+        size_frame = ttk.Frame(options_frame)
+        size_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(size_frame, text="Display size:", width=12).pack(side=tk.LEFT)
+        
+        self.size_mode = tk.StringVar(value="original")
+        ttk.Radiobutton(size_frame, text="Original", variable=self.size_mode, 
+                       value="original", command=self._update_size_preview).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(size_frame, text="Custom", variable=self.size_mode,
+                       value="custom", command=self._update_size_preview).pack(side=tk.LEFT, padx=5)
+        
+        # Custom size inputs
+        custom_frame = ttk.Frame(options_frame)
+        custom_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(custom_frame, text="", width=12).pack(side=tk.LEFT)
+        
+        ttk.Label(custom_frame, text="Width:").pack(side=tk.LEFT)
+        self.width_var = tk.StringVar()
+        self.width_entry = ttk.Entry(custom_frame, textvariable=self.width_var, width=6)
+        self.width_entry.pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(custom_frame, text="Height:").pack(side=tk.LEFT, padx=(10, 0))
+        self.height_var = tk.StringVar()
+        self.height_entry = ttk.Entry(custom_frame, textvariable=self.height_var, width=6)
+        self.height_entry.pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(custom_frame, text="(leave blank to auto-calculate)").pack(side=tk.LEFT, padx=5)
+        
+        # Syntax choice
+        syntax_frame = ttk.Frame(options_frame)
+        syntax_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(syntax_frame, text="Syntax:", width=12).pack(side=tk.LEFT)
+        
+        self.syntax_mode = tk.StringVar(value="markdown")
+        ttk.Radiobutton(syntax_frame, text="Markdown ![alt|size](path)", 
+                       variable=self.syntax_mode, value="markdown").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(syntax_frame, text="HTML <img>", 
+                       variable=self.syntax_mode, value="html").pack(side=tk.LEFT, padx=5)
+        
+        # Buttons
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X)
+        
+        ttk.Button(btn_frame, text="Insert", command=self._insert_image).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=5)
+    
+    def _browse_image(self):
+        """Browse for an image file"""
+        filetypes = [
+            ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+            ("All files", "*.*")
+        ]
+        
+        path = filedialog.askopenfilename(title="Select Image", filetypes=filetypes)
+        if path:
+            self.file_var.set(path)
+            self.image_path = path
+            self.alt_var.set(os.path.splitext(os.path.basename(path))[0])
+            self._load_preview()
+    
+    def _load_preview(self):
+        """Load and display image preview"""
+        if not self.image_path or not PIL_AVAILABLE:
+            return
+        
+        try:
+            img = Image.open(self.image_path)
+            self.original_size = img.size
+            
+            # Create thumbnail for preview
+            preview_size = (200, 150)
+            img.thumbnail(preview_size, Image.Resampling.LANCZOS)
+            
+            photo = ImageTk.PhotoImage(img)
+            self.preview_label.config(image=photo, text="")
+            self.preview_label.image = photo  # Keep reference
+            
+            self.size_info_label.config(
+                text=f"Original size: {self.original_size[0]} × {self.original_size[1]} pixels"
+            )
+            
+            # Set default custom size
+            self.width_var.set(str(self.original_size[0]))
+            self.height_var.set(str(self.original_size[1]))
+            
+        except Exception as e:
+            self.preview_label.config(image="", text=f"Error loading image: {e}")
+            self.size_info_label.config(text="")
+    
+    def _update_size_preview(self):
+        """Update size entry states based on mode"""
+        if self.size_mode.get() == "custom":
+            self.width_entry.config(state="normal")
+            self.height_entry.config(state="normal")
+        else:
+            self.width_entry.config(state="disabled")
+            self.height_entry.config(state="disabled")
+    
+    def _insert_image(self):
+        """Insert the image into the document"""
+        if not self.image_path:
+            messagebox.showwarning("No Image", "Please select an image file first.")
+            return
+        
+        alt_text = self.alt_var.get()
+        
+        # Determine the path to use
+        if self.current_file:
+            # Copy to assets folder
+            assets_folder = self.get_assets_folder()
+            if assets_folder:
+                image_filename = os.path.basename(self.image_path)
+                dest_path = os.path.join(assets_folder, image_filename)
+                counter = 1
+                while os.path.exists(dest_path):
+                    name, ext = os.path.splitext(image_filename)
+                    dest_path = os.path.join(assets_folder, f"{name}_{counter}{ext}")
+                    counter += 1
+                
+                shutil.copy2(self.image_path, dest_path)
+                doc_dir = os.path.dirname(self.current_file)
+                rel_path = os.path.relpath(dest_path, doc_dir).replace('\\', '/')
+            else:
+                rel_path = self.image_path.replace('\\', '/')
+        else:
+            # No saved document - use absolute path with warning
+            if not messagebox.askyesno("Unsaved Document",
+                    "Document not saved. Image will use absolute path which may break "
+                    "if you move files. Continue?"):
+                return
+            rel_path = self.image_path.replace('\\', '/')
+        
+        # Build the markdown/HTML
+        if self.size_mode.get() == "custom":
+            width = self.width_var.get().strip()
+            height = self.height_var.get().strip()
+        else:
+            width = height = ""
+        
+        if self.syntax_mode.get() == "html":
+            # HTML img tag
+            attrs = [f'src="{rel_path}"']
+            if alt_text:
+                attrs.append(f'alt="{alt_text}"')
+            if width:
+                attrs.append(f'width="{width}"')
+            if height:
+                attrs.append(f'height="{height}"')
+            
+            markdown = f'<img {" ".join(attrs)}>'
+        else:
+            # Markdown syntax with optional size in alt text
+            if width or height:
+                size_str = f"{width}x{height}" if width and height else (width or height)
+                markdown = f"![{alt_text}|{size_str}]({rel_path})"
+            else:
+                markdown = f"![{alt_text}]({rel_path})"
+        
+        # Insert into editor
+        self.text_widget.insert(tk.INSERT, markdown)
+        
+        # Update status
+        if hasattr(self.parent, '_set_status'):
+            self.parent._set_status(f"Image inserted: {rel_path}")
+        
+        self.destroy()
 
 
 class ImageManagerDialog(tk.Toplevel):
