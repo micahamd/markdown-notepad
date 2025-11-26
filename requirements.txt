@@ -12,6 +12,7 @@ markdown>=3.5.0
 
 # Optional: For AI chat functionality
 anthropic>=0.30.0
+google-genai>=1.0.0
 
 # Note: If you only need specific file format support, you can install:
 # markitdown[pdf]       - PDF files

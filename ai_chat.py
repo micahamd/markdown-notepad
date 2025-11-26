@@ -34,6 +34,14 @@ except ImportError:
     ANTHROPIC_AVAILABLE = False
     print("Warning: anthropic not installed. Install with: pip install anthropic")
 
+# Try to import Google Gemini
+try:
+    from google import genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    print("Warning: google-genai not installed. Install with: pip install google-genai")
+
 
 # =============================================================================
 # Data Classes
@@ -71,19 +79,31 @@ class AISettings:
     
     # Default Anthropic models
     ANTHROPIC_MODELS = [
-        "claude-3-5-haiku-20241022",
         "claude-sonnet-4-20250514",
+        "claude-3-5-haiku-20241022",
         "claude-3-5-sonnet-20241022",
         "claude-3-opus-20240229",
+    ]
+    
+    # Default Gemini models
+    GEMINI_MODELS = [
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash",
     ]
     
     DEFAULT_SETTINGS = {
         'provider': 'anthropic',
         'api_key': '',
-        'model': 'claude-3-5-haiku-20241022',
+        'gemini_api_key': '',  # Separate API key for Gemini
+        'model': 'claude-sonnet-4-20250514',
         'system_prompt': 'You are a helpful AI assistant. You help users with their markdown documents, answer questions, and provide writing assistance.',
         'max_tokens': 4096,
         'temperature': 0.7,
+        'top_p': 1.0,  # Nucleus sampling: consider tokens with top_p cumulative probability
+        'top_k': 0,    # Consider only top_k tokens (0 = disabled/use default)
         'image_max_size': [512, 512],
     }
     
@@ -178,15 +198,49 @@ class AISettings:
     def image_max_size(self, value: tuple):
         self.settings['image_max_size'] = list(value)
     
+    @property
+    def top_p(self) -> float:
+        return self.settings.get('top_p', 1.0)
+    
+    @top_p.setter
+    def top_p(self, value: float):
+        self.settings['top_p'] = value
+    
+    @property
+    def top_k(self) -> int:
+        return self.settings.get('top_k', 0)
+    
+    @top_k.setter
+    def top_k(self, value: int):
+        self.settings['top_k'] = value
+    
+    @property
+    def gemini_api_key(self) -> str:
+        return self.settings.get('gemini_api_key', '')
+    
+    @gemini_api_key.setter
+    def gemini_api_key(self, value: str):
+        self.settings['gemini_api_key'] = value
+    
     def is_configured(self) -> bool:
-        """Check if API key is configured"""
+        """Check if API key is configured for current provider"""
+        if self.provider == 'gemini':
+            return bool(self.gemini_api_key)
         return bool(self.api_key)
     
     def get_available_models(self) -> List[str]:
         """Get available models for current provider"""
         if self.provider == 'anthropic':
             return self.ANTHROPIC_MODELS.copy()
+        elif self.provider == 'gemini':
+            return self.GEMINI_MODELS.copy()
         return []
+    
+    def get_current_api_key(self) -> str:
+        """Get API key for current provider"""
+        if self.provider == 'gemini':
+            return self.gemini_api_key
+        return self.api_key
 
 
 # =============================================================================
@@ -541,6 +595,8 @@ class AnthropicClient(LLMClient):
         system_prompt: str = "",
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        top_p: float = 1.0,
+        top_k: int = 0,
         images: Optional[List[str]] = None,
         model: Optional[str] = None
     ) -> Iterator[str]:
@@ -591,13 +647,24 @@ class AnthropicClient(LLMClient):
                     break
         
         try:
-            with self.client.messages.stream(
-                model=model_name,
-                messages=api_messages,
-                system=system_prompt if system_prompt else anthropic.NOT_GIVEN,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            ) as stream:
+            # Build kwargs for the API call
+            stream_kwargs = {
+                "model": model_name,
+                "messages": api_messages,
+                "system": system_prompt if system_prompt else anthropic.NOT_GIVEN,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            
+            # Add top_p if not default (Anthropic uses 'top_p')
+            if top_p < 1.0:
+                stream_kwargs["top_p"] = top_p
+            
+            # Add top_k if set (Anthropic uses 'top_k')
+            if top_k > 0:
+                stream_kwargs["top_k"] = top_k
+            
+            with self.client.messages.stream(**stream_kwargs) as stream:
                 for text in stream.text_stream:
                     yield text
         except anthropic.APIConnectionError:
@@ -658,24 +725,278 @@ class AnthropicClient(LLMClient):
 
 
 # =============================================================================
+# Google Gemini Client Implementation
+# =============================================================================
+
+class GeminiClient(LLMClient):
+    """Google Gemini API client"""
+    
+    DEFAULT_MODELS = [
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash",
+    ]
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.client = None
+        self._cached_models = None
+        if GEMINI_AVAILABLE and api_key:
+            self.client = genai.Client(api_key=api_key)
+    
+    def _convert_messages_to_api_format(self, messages: List[ChatMessage]) -> List[Dict]:
+        """Convert ChatMessage objects to Gemini API format"""
+        api_messages = []
+        
+        for msg in messages:
+            if msg.role == "system":
+                continue  # System messages handled separately
+            
+            # Gemini uses "user" and "model" roles
+            role = "model" if msg.role == "assistant" else "user"
+            
+            parts = []
+            if msg.content:
+                parts.append({"text": msg.content})
+            
+            # Add images if present
+            if msg.role == "user" and msg.images:
+                for img_data in msg.images:
+                    parts.append({
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": img_data
+                        }
+                    })
+            
+            api_messages.append({
+                "role": role,
+                "parts": parts
+            })
+        
+        return api_messages
+    
+    def send_message(
+        self,
+        messages: List[ChatMessage],
+        system_prompt: str = "",
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        on_chunk: Optional[Callable[[str], None]] = None
+    ) -> str:
+        """Send messages to Gemini and get response"""
+        if not self.client:
+            raise ValueError("Gemini client not initialized. Check API key.")
+        
+        api_messages = self._convert_messages_to_api_format(messages)
+        
+        # Build generation config
+        gen_config = {
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if top_p < 1.0:
+            gen_config["top_p"] = top_p
+        if top_k > 0:
+            gen_config["top_k"] = top_k
+        
+        try:
+            if on_chunk:
+                # Streaming response
+                full_response = ""
+                response = self.client.models.generate_content_stream(
+                    model="gemini-2.5-flash",  # Will be overridden
+                    contents=api_messages,
+                    config=genai.types.GenerateContentConfig(
+                        system_instruction=system_prompt if system_prompt else None,
+                        **gen_config
+                    )
+                )
+                for chunk in response:
+                    if chunk.text:
+                        full_response += chunk.text
+                        on_chunk(chunk.text)
+                return full_response
+            else:
+                # Non-streaming response
+                response = self.client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=api_messages,
+                    config=genai.types.GenerateContentConfig(
+                        system_instruction=system_prompt if system_prompt else None,
+                        **gen_config
+                    )
+                )
+                return response.text
+        except Exception as e:
+            raise RuntimeError(f"Gemini API error: {str(e)}")
+    
+    def get_available_models(self) -> List[str]:
+        """Get list of available Gemini models from API"""
+        if self._cached_models:
+            return self._cached_models.copy()
+        
+        if not self.client:
+            return self.DEFAULT_MODELS.copy()
+        
+        try:
+            # Fetch models from Gemini API
+            models = []
+            for m in self.client.models.list():
+                for action in m.supported_actions:
+                    if action == "generateContent":
+                        # Extract just the model name (remove 'models/' prefix if present)
+                        model_name = m.name
+                        if model_name.startswith("models/"):
+                            model_name = model_name[7:]
+                        models.append(model_name)
+                        break
+            
+            if models:
+                # Sort to put newer/preferred models first
+                models.sort(reverse=True)
+                self._cached_models = models
+                return models
+        except Exception as e:
+            print(f"Could not fetch models from Gemini API: {e}")
+        
+        return self.DEFAULT_MODELS.copy()
+    
+    def send_message_stream(
+        self,
+        messages: List[Dict],
+        system_prompt: str = "",
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        images: Optional[List[str]] = None,
+        model: Optional[str] = None
+    ) -> Iterator[str]:
+        """Send messages and stream the response"""
+        if not self.client:
+            # Reinitialize client if API key was updated
+            if GEMINI_AVAILABLE and self.api_key:
+                self.client = genai.Client(api_key=self.api_key)
+            else:
+                raise ValueError("Gemini client not initialized. Check API key.")
+        
+        # Use provided model or default
+        model_name = model or "gemini-2.5-flash"
+        
+        # Convert messages format
+        api_contents = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                role = "model" if msg.get('role') == 'assistant' else "user"
+                content = msg.get('content', '')
+                parts = [{"text": content}] if isinstance(content, str) else content
+                api_contents.append({"role": role, "parts": parts})
+            elif isinstance(msg, ChatMessage):
+                role = "model" if msg.role == "assistant" else "user"
+                api_contents.append({"role": role, "parts": [{"text": msg.content}]})
+        
+        # Add images to the last user message if provided
+        if images and api_contents:
+            for i in range(len(api_contents) - 1, -1, -1):
+                if api_contents[i].get('role') == 'user':
+                    for img_data in images:
+                        api_contents[i]['parts'].append({
+                            "inline_data": {
+                                "mime_type": "image/jpeg",
+                                "data": img_data
+                            }
+                        })
+                    break
+        
+        # Build generation config
+        gen_config = {
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if top_p < 1.0:
+            gen_config["top_p"] = top_p
+        if top_k > 0:
+            gen_config["top_k"] = top_k
+        
+        try:
+            response = self.client.models.generate_content_stream(
+                model=model_name,
+                contents=api_contents,
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_prompt if system_prompt else None,
+                    **gen_config
+                )
+            )
+            for chunk in response:
+                if chunk.text:
+                    yield chunk.text
+        except Exception as e:
+            raise RuntimeError(f"Gemini API error: {str(e)}")
+    
+    def encode_image_for_api(self, image, max_size: int = 512) -> Optional[str]:
+        """Encode a PIL Image for the API"""
+        if not PIL_AVAILABLE:
+            return None
+        
+        try:
+            from io import BytesIO
+            
+            # Ensure RGB mode
+            if image.mode in ('RGBA', 'P'):
+                image = image.convert('RGB')
+            
+            # Resize if needed
+            if image.size[0] > max_size or image.size[1] > max_size:
+                image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            
+            # Encode to base64
+            buffer = BytesIO()
+            image.save(buffer, format='JPEG', quality=85)
+            return base64.b64encode(buffer.getvalue()).decode('utf-8')
+        except Exception as e:
+            print(f"Error encoding image: {e}")
+            return None
+    
+    def test_connection(self) -> tuple[bool, str]:
+        """Test API connection with a simple request"""
+        if not GEMINI_AVAILABLE:
+            return False, "Google GenAI library not installed"
+        
+        if not self.api_key:
+            return False, "API key not configured"
+        
+        try:
+            response = self.client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents="Hi"
+            )
+            return True, "Connection successful!"
+        except Exception as e:
+            return False, f"Error: {str(e)}"
+
+
+# =============================================================================
 # LLM Client Factory
 # =============================================================================
 
 def get_llm_client(settings: AISettings) -> Optional[LLMClient]:
     """Factory function to get appropriate LLM client based on settings"""
     provider = settings.provider
-    api_key = settings.api_key
     
     if provider == 'anthropic':
         if not ANTHROPIC_AVAILABLE:
             return None
-        return AnthropicClient(api_key)
+        return AnthropicClient(settings.api_key)
     
-    # Future providers can be added here:
-    # elif provider == 'google':
-    #     return GoogleClient(api_key)
-    # elif provider == 'deepseek':
-    #     return DeepseekClient(api_key)
+    elif provider == 'gemini':
+        if not GEMINI_AVAILABLE:
+            return None
+        return GeminiClient(settings.gemini_api_key)
     
     return None
 
@@ -695,9 +1016,9 @@ class AISettingsDialog(tk.Toplevel):
         self.result = None
         
         self.title("AI Settings")
-        self.geometry("520x650")
+        self.geometry("560x780")
         self.resizable(True, True)
-        self.minsize(480, 600)
+        self.minsize(520, 720)
         self.transient(parent)
         self.grab_set()
         
@@ -709,6 +1030,29 @@ class AISettingsDialog(tk.Toplevel):
         x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
         y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{x}+{y}")
+    
+    def _create_tooltip(self, widget, text):
+        """Create a tooltip for a widget"""
+        def show_tooltip(event):
+            tooltip = tk.Toplevel(widget)
+            tooltip.wm_overrideredirect(True)
+            tooltip.wm_geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+            label = ttk.Label(tooltip, text=text, background="#ffffe0", 
+                             relief="solid", borderwidth=1, padding=5,
+                             wraplength=300)
+            label.pack()
+            widget._tooltip = tooltip
+            
+            def hide_tooltip(event=None):
+                if hasattr(widget, '_tooltip') and widget._tooltip:
+                    widget._tooltip.destroy()
+                    widget._tooltip = None
+            
+            widget.bind('<Leave>', hide_tooltip)
+            tooltip.bind('<Leave>', hide_tooltip)
+            widget.after(5000, hide_tooltip)  # Auto-hide after 5 seconds
+        
+        widget.bind('<Enter>', show_tooltip)
     
     def _setup_ui(self):
         """Setup the dialog UI"""
@@ -722,24 +1066,37 @@ class AISettingsDialog(tk.Toplevel):
         ttk.Label(provider_frame, text="AI Provider:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.provider_var = tk.StringVar(value="anthropic")
         provider_combo = ttk.Combobox(provider_frame, textvariable=self.provider_var, 
-                                       values=["anthropic"], state="readonly", width=30)
+                                       values=["anthropic", "gemini"], state="readonly", width=30)
         provider_combo.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
         provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
         
-        # API Key
-        api_frame = ttk.LabelFrame(main_frame, text="API Key", padding=10)
+        # API Keys Frame
+        api_frame = ttk.LabelFrame(main_frame, text="API Keys", padding=10)
         api_frame.pack(fill=tk.X, pady=(0, 10))
         
+        # Anthropic API Key
+        ttk.Label(api_frame, text="Anthropic:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.api_key_var = tk.StringVar()
-        self.api_key_entry = ttk.Entry(api_frame, textvariable=self.api_key_var, width=50, show="•")
-        self.api_key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.api_key_entry = ttk.Entry(api_frame, textvariable=self.api_key_var, width=40, show="•")
+        self.api_key_entry.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
         
         self.show_key_var = tk.BooleanVar(value=False)
-        self.show_key_btn = ttk.Checkbutton(api_frame, text="Show", variable=self.show_key_var,
-                                             command=self._toggle_key_visibility)
-        self.show_key_btn.pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Checkbutton(api_frame, text="Show", variable=self.show_key_var,
+                        command=self._toggle_key_visibility).grid(row=0, column=2, padx=(5, 0))
+        ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('anthropic'), 
+                   width=6).grid(row=0, column=3, padx=(5, 0))
         
-        ttk.Button(api_frame, text="Test", command=self._test_connection, width=8).pack(side=tk.LEFT, padx=(5, 0))
+        # Gemini API Key
+        ttk.Label(api_frame, text="Gemini:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.gemini_key_var = tk.StringVar()
+        self.gemini_key_entry = ttk.Entry(api_frame, textvariable=self.gemini_key_var, width=40, show="•")
+        self.gemini_key_entry.grid(row=1, column=1, sticky=tk.W, padx=(10, 0))
+        
+        self.show_gemini_key_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(api_frame, text="Show", variable=self.show_gemini_key_var,
+                        command=self._toggle_gemini_key_visibility).grid(row=1, column=2, padx=(5, 0))
+        ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('gemini'),
+                   width=6).grid(row=1, column=3, padx=(5, 0))
         
         # Model selection
         model_frame = ttk.LabelFrame(main_frame, text="Model", padding=10)
@@ -752,11 +1109,12 @@ class AISettingsDialog(tk.Toplevel):
         self.model_combo.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
         
         # Refresh models button
-        ttk.Button(model_frame, text="🔄", width=3, 
-                   command=self._refresh_models).grid(row=0, column=2, padx=(5, 0))
+        refresh_btn = ttk.Button(model_frame, text="🔄", width=3, command=self._refresh_models)
+        refresh_btn.grid(row=0, column=2, padx=(5, 0))
+        self._create_tooltip(refresh_btn, "Fetch available models from the API")
         
         # Parameters
-        params_frame = ttk.LabelFrame(main_frame, text="Parameters", padding=10)
+        params_frame = ttk.LabelFrame(main_frame, text="Generation Parameters", padding=10)
         params_frame.pack(fill=tk.X, pady=(0, 10))
         
         # Max tokens
@@ -765,32 +1123,68 @@ class AISettingsDialog(tk.Toplevel):
         max_tokens_spin = ttk.Spinbox(params_frame, from_=256, to=8192, 
                                        textvariable=self.max_tokens_var, width=10)
         max_tokens_spin.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
+        max_tokens_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
+        max_tokens_tip.grid(row=0, column=2, padx=(5, 0))
+        self._create_tooltip(max_tokens_tip, "Maximum number of tokens to generate in the response.")
         
         # Temperature
         ttk.Label(params_frame, text="Temperature:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.temp_var = tk.DoubleVar(value=0.7)
         temp_frame = ttk.Frame(params_frame)
         temp_frame.grid(row=1, column=1, sticky=tk.W, padx=(10, 0))
         
-        self.temp_scale = ttk.Scale(temp_frame, from_=0.0, to=1.0, variable=self.temp_var,
+        self.temp_var = tk.DoubleVar(value=0.7)
+        self.temp_scale = ttk.Scale(temp_frame, from_=0.0, to=2.0, variable=self.temp_var,
                                      orient=tk.HORIZONTAL, length=150, command=self._update_temp_label)
         self.temp_scale.pack(side=tk.LEFT)
-        self.temp_label = ttk.Label(temp_frame, text="0.7", width=5)
+        self.temp_label = ttk.Label(temp_frame, text="0.70", width=5)
         self.temp_label.pack(side=tk.LEFT, padx=(5, 0))
+        temp_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
+        temp_tip.grid(row=1, column=2, padx=(5, 0))
+        self._create_tooltip(temp_tip, "Controls randomness. Lower = more focused and deterministic. Higher = more creative and varied. Range: 0.0-2.0")
+        
+        # Top-p (nucleus sampling)
+        ttk.Label(params_frame, text="Top-p:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        top_p_frame = ttk.Frame(params_frame)
+        top_p_frame.grid(row=2, column=1, sticky=tk.W, padx=(10, 0))
+        
+        self.top_p_var = tk.DoubleVar(value=1.0)
+        self.top_p_scale = ttk.Scale(top_p_frame, from_=0.0, to=1.0, variable=self.top_p_var,
+                                      orient=tk.HORIZONTAL, length=150, command=self._update_top_p_label)
+        self.top_p_scale.pack(side=tk.LEFT)
+        self.top_p_label = ttk.Label(top_p_frame, text="1.00", width=5)
+        self.top_p_label.pack(side=tk.LEFT, padx=(5, 0))
+        top_p_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
+        top_p_tip.grid(row=2, column=2, padx=(5, 0))
+        self._create_tooltip(top_p_tip, "Nucleus sampling: only consider tokens whose cumulative probability exceeds this threshold. 1.0 = consider all tokens. Lower values = more focused output.")
+        
+        # Top-k
+        ttk.Label(params_frame, text="Top-k:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        self.top_k_var = tk.IntVar(value=0)
+        top_k_spin = ttk.Spinbox(params_frame, from_=0, to=100, 
+                                  textvariable=self.top_k_var, width=10)
+        top_k_spin.grid(row=3, column=1, sticky=tk.W, padx=(10, 0))
+        top_k_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
+        top_k_tip.grid(row=3, column=2, padx=(5, 0))
+        self._create_tooltip(top_k_tip, "Only consider the top-k most likely tokens. 0 = disabled (use model default). Lower values = more focused, higher = more diverse.")
         
         # Image size
-        ttk.Label(params_frame, text="Image Max Size:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        ttk.Label(params_frame, text="Image Max Size:").grid(row=4, column=0, sticky=tk.W, pady=5)
+        img_frame = ttk.Frame(params_frame)
+        img_frame.grid(row=4, column=1, sticky=tk.W, padx=(10, 0))
         self.img_size_var = tk.IntVar(value=512)
-        img_size_spin = ttk.Spinbox(params_frame, from_=256, to=1024, increment=128,
+        img_size_spin = ttk.Spinbox(img_frame, from_=256, to=1024, increment=128,
                                      textvariable=self.img_size_var, width=10)
-        img_size_spin.grid(row=2, column=1, sticky=tk.W, padx=(10, 0))
-        ttk.Label(params_frame, text="px").grid(row=2, column=2, sticky=tk.W)
+        img_size_spin.pack(side=tk.LEFT)
+        ttk.Label(img_frame, text="px").pack(side=tk.LEFT, padx=(5, 0))
+        img_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
+        img_tip.grid(row=4, column=2, padx=(5, 0))
+        self._create_tooltip(img_tip, "Maximum dimension for images sent to the AI. Larger = more detail but slower/costlier.")
         
         # System prompt
         prompt_frame = ttk.LabelFrame(main_frame, text="System Prompt", padding=10)
         prompt_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        self.system_prompt_text = tk.Text(prompt_frame, height=6, wrap=tk.WORD)
+        self.system_prompt_text = tk.Text(prompt_frame, height=5, wrap=tk.WORD)
         self.system_prompt_text.pack(fill=tk.BOTH, expand=True)
         
         # Buttons
@@ -804,27 +1198,45 @@ class AISettingsDialog(tk.Toplevel):
         """Load current settings into the dialog"""
         self.provider_var.set(self.settings.provider)
         self.api_key_var.set(self.settings.api_key)
+        self.gemini_key_var.set(self.settings.gemini_api_key)
         self.model_var.set(self.settings.model)
         self.max_tokens_var.set(self.settings.max_tokens)
         self.temp_var.set(self.settings.temperature)
+        self.top_p_var.set(self.settings.top_p)
+        self.top_k_var.set(self.settings.top_k)
         self.img_size_var.set(self.settings.image_max_size[0])
         self.system_prompt_text.insert(1.0, self.settings.system_prompt)
         self._update_temp_label()
+        self._update_top_p_label()
+        self._on_provider_change()  # Update model list for current provider
         
         # Hide API key if already set
         if self.settings.api_key:
             self.api_key_entry.config(show="•")
+        if self.settings.gemini_api_key:
+            self.gemini_key_entry.config(show="•")
     
     def _toggle_key_visibility(self):
-        """Toggle API key visibility"""
+        """Toggle Anthropic API key visibility"""
         if self.show_key_var.get():
             self.api_key_entry.config(show="")
         else:
             self.api_key_entry.config(show="•")
     
+    def _toggle_gemini_key_visibility(self):
+        """Toggle Gemini API key visibility"""
+        if self.show_gemini_key_var.get():
+            self.gemini_key_entry.config(show="")
+        else:
+            self.gemini_key_entry.config(show="•")
+    
     def _update_temp_label(self, *args):
         """Update temperature label"""
         self.temp_label.config(text=f"{self.temp_var.get():.2f}")
+    
+    def _update_top_p_label(self, *args):
+        """Update top-p label"""
+        self.top_p_label.config(text=f"{self.top_p_var.get():.2f}")
     
     def _on_provider_change(self, event=None):
         """Handle provider change"""
@@ -833,51 +1245,85 @@ class AISettingsDialog(tk.Toplevel):
             self.model_combo['values'] = AISettings.ANTHROPIC_MODELS
             if self.model_var.get() not in AISettings.ANTHROPIC_MODELS:
                 self.model_var.set(AISettings.ANTHROPIC_MODELS[0])
+        elif provider == 'gemini':
+            self.model_combo['values'] = AISettings.GEMINI_MODELS
+            if self.model_var.get() not in AISettings.GEMINI_MODELS:
+                self.model_var.set(AISettings.GEMINI_MODELS[0])
     
     def _refresh_models(self):
         """Fetch available models from the API"""
-        api_key = self.api_key_var.get()
-        if not api_key:
-            messagebox.showwarning("Warning", "Please enter an API key first.", parent=self)
-            return
-        
         provider = self.provider_var.get()
+        
         if provider == 'anthropic':
+            api_key = self.api_key_var.get()
+            if not api_key:
+                messagebox.showwarning("Warning", "Please enter an Anthropic API key first.", parent=self)
+                return
             try:
                 client = AnthropicClient(api_key)
                 models = client.get_available_models()
                 if models:
                     self.model_combo['values'] = models
-                    messagebox.showinfo("Success", f"Found {len(models)} models.", parent=self)
+                    messagebox.showinfo("Success", f"Found {len(models)} Anthropic models.", parent=self)
+                else:
+                    messagebox.showwarning("Warning", "No models found.", parent=self)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to fetch models: {str(e)}", parent=self)
+        
+        elif provider == 'gemini':
+            api_key = self.gemini_key_var.get()
+            if not api_key:
+                messagebox.showwarning("Warning", "Please enter a Gemini API key first.", parent=self)
+                return
+            try:
+                client = GeminiClient(api_key)
+                models = client.get_available_models()
+                if models:
+                    self.model_combo['values'] = models
+                    messagebox.showinfo("Success", f"Found {len(models)} Gemini models.", parent=self)
                 else:
                     messagebox.showwarning("Warning", "No models found.", parent=self)
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to fetch models: {str(e)}", parent=self)
     
-    def _test_connection(self):
-        """Test API connection"""
-        api_key = self.api_key_var.get()
-        if not api_key:
-            messagebox.showwarning("Warning", "Please enter an API key first.", parent=self)
-            return
+    def _test_connection(self, provider: str = None):
+        """Test API connection for specified provider"""
+        if provider is None:
+            provider = self.provider_var.get()
         
-        provider = self.provider_var.get()
         if provider == 'anthropic':
+            api_key = self.api_key_var.get()
+            if not api_key:
+                messagebox.showwarning("Warning", "Please enter an Anthropic API key first.", parent=self)
+                return
             client = AnthropicClient(api_key)
             success, message = client.test_connection()
-            
-            if success:
-                messagebox.showinfo("Success", message, parent=self)
-            else:
-                messagebox.showerror("Error", message, parent=self)
+        elif provider == 'gemini':
+            api_key = self.gemini_key_var.get()
+            if not api_key:
+                messagebox.showwarning("Warning", "Please enter a Gemini API key first.", parent=self)
+                return
+            client = GeminiClient(api_key)
+            success, message = client.test_connection()
+        else:
+            messagebox.showwarning("Warning", "Unknown provider.", parent=self)
+            return
+        
+        if success:
+            messagebox.showinfo("Success", message, parent=self)
+        else:
+            messagebox.showerror("Error", message, parent=self)
     
     def _save_settings(self):
         """Save settings and close dialog"""
         self.settings.provider = self.provider_var.get()
         self.settings.api_key = self.api_key_var.get()
+        self.settings.gemini_api_key = self.gemini_key_var.get()
         self.settings.model = self.model_var.get()
         self.settings.max_tokens = self.max_tokens_var.get()
         self.settings.temperature = self.temp_var.get()
+        self.settings.top_p = self.top_p_var.get()
+        self.settings.top_k = self.top_k_var.get()
         self.settings.image_max_size = (self.img_size_var.get(), self.img_size_var.get())
         self.settings.system_prompt = self.system_prompt_text.get(1.0, tk.END).strip()
         
@@ -1152,17 +1598,23 @@ class ChatSidebar(tk.Frame):
     def _generate_response(self, messages: List[Dict], images: List[str]):
         """Generate response in background thread"""
         try:
-            # Update client settings
-            self.llm_client.api_key = self.settings.api_key
+            # Update client settings based on provider
+            if self.settings.provider == 'gemini':
+                self.llm_client.api_key = self.settings.gemini_api_key
+            else:
+                self.llm_client.api_key = self.settings.api_key
             
-            # Stream response
+            # Stream response with all parameters
             response_text = ""
             for chunk in self.llm_client.send_message_stream(
                 messages,
                 system_prompt=self.settings.system_prompt,
                 max_tokens=self.settings.max_tokens,
                 temperature=self.settings.temperature,
-                images=images if images else None
+                top_p=self.settings.top_p,
+                top_k=self.settings.top_k,
+                images=images if images else None,
+                model=self.settings.model
             ):
                 response_text += chunk
                 self.response_queue.put(('chunk', chunk))
