@@ -55,6 +55,22 @@ try:
 except ImportError:
     MARKDOWN_AVAILABLE = False
 
+# Import session manager for document caching
+try:
+    from session_manager import get_session_manager, TabState
+    SESSION_MANAGER_AVAILABLE = True
+except ImportError:
+    SESSION_MANAGER_AVAILABLE = False
+    print("Warning: session_manager not found. Session persistence disabled.")
+
+# Import AI chat module
+try:
+    from ai_chat import ChatSidebar, AISettingsDialog
+    AI_CHAT_AVAILABLE = True
+except ImportError:
+    AI_CHAT_AVAILABLE = False
+    print("Warning: ai_chat module not found. AI chat disabled.")
+
 
 class ImageExtractor:
     """
@@ -1142,6 +1158,10 @@ class MarkdownNotepad(tk.Tk):
         self.word_wrap = True  # Word wrap toggle (global setting)
         self.extracted_images_dir = None  # Directory for extracted images
         
+        # Session manager for document caching
+        self.session_manager = get_session_manager() if SESSION_MANAGER_AVAILABLE else None
+        self._auto_save_job = None
+        
         # Theme settings
         self.theme = self.DEFAULT_THEME.copy()
         self._load_theme()
@@ -1155,9 +1175,12 @@ class MarkdownNotepad(tk.Tk):
         self._setup_ui()
         self._setup_bindings()
         
-        # Create initial empty tab
-        self.new_tab()
+        # Restore session or create initial empty tab
+        self._restore_session()
         self._update_title()
+        
+        # Start auto-save timer for session
+        self._start_auto_save()
     
     def _load_theme(self):
         """Load theme from settings file"""
@@ -1187,9 +1210,13 @@ class MarkdownNotepad(tk.Tk):
         # Toolbar
         self._create_toolbar()
         
-        # Main content area with notebook for tabs
-        self.content_frame = ttk.Frame(self)
-        self.content_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # Main content area with PanedWindow for editor and AI sidebar
+        self.main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        self.main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Left pane: Editor content with tabs
+        self.content_frame = ttk.Frame(self.main_paned)
+        self.main_paned.add(self.content_frame, weight=1)
         
         # Notebook widget for tabs
         self.notebook = ttk.Notebook(self.content_frame)
@@ -1200,6 +1227,11 @@ class MarkdownNotepad(tk.Tk):
         
         # Configure right-click menu for tabs
         self.notebook.bind("<Button-3>", self._show_tab_context_menu)
+        
+        # Right pane: AI Sidebar (initially hidden)
+        self.ai_sidebar = None
+        self.ai_sidebar_visible = False
+        self._setup_ai_sidebar()
         
         # Status bar
         self._create_status_bar()
@@ -1267,6 +1299,24 @@ class MarkdownNotepad(tk.Tk):
         view_menu.add_command(label="Zoom In", command=self.zoom_in, accelerator="Ctrl++")
         view_menu.add_command(label="Zoom Out", command=self.zoom_out, accelerator="Ctrl+-")
         view_menu.add_command(label="Reset Zoom", command=self.zoom_reset, accelerator="Ctrl+0")
+        
+        view_menu.add_separator()
+        
+        # Document caching toggle
+        self.cache_var = tk.BooleanVar(value=True)
+        if self.session_manager:
+            self.cache_var.set(self.session_manager.is_caching_enabled())
+        view_menu.add_checkbutton(
+            label="Cache Documents (restore on restart)", 
+            variable=self.cache_var,
+            command=self._toggle_caching
+        )
+        
+        view_menu.add_separator()
+        
+        # AI Sidebar
+        view_menu.add_command(label="AI Sidebar", command=self._toggle_ai_sidebar, accelerator="Ctrl+Shift+A")
+        view_menu.add_command(label="AI Settings...", command=self._open_ai_settings)
         
         # Format menu (for source mode)
         format_menu = tk.Menu(menubar, tearoff=0)
@@ -1344,6 +1394,10 @@ class MarkdownNotepad(tk.Tk):
         
         # Theme button
         ttk.Button(toolbar, text="🎨 Theme", command=self.open_theme_dialog, style="Toolbar.TButton").pack(side=tk.LEFT, padx=2)
+        
+        # AI sidebar toggle button (on the right side)
+        self.ai_sidebar_btn = ttk.Button(toolbar, text="💬 AI", command=self._toggle_ai_sidebar, style="Toolbar.TButton")
+        self.ai_sidebar_btn.pack(side=tk.RIGHT, padx=2)
     
     def _create_status_bar(self):
         """Create the status bar"""
@@ -1405,12 +1459,290 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-minus>", lambda e: self.zoom_out())
         self.bind("<Control-0>", lambda e: self.zoom_reset())
         
+        # AI sidebar toggle
+        self.bind("<Control-A>", lambda e: self._toggle_ai_sidebar())  # Ctrl+Shift+A
+        
         # Position update state
         self._position_update_pending = False
         
         # Handle window close
         self.protocol("WM_DELETE_WINDOW", self.quit_app)
     
+    # === Session Management Methods ===
+    
+    def _restore_session(self):
+        """Restore session from previous run, or create empty tab"""
+        restored = False
+        
+        if self.session_manager and self.session_manager.has_saved_session():
+            state = self.session_manager.load_session()
+            
+            if state.caching_enabled and state.tabs:
+                # Restore window geometry
+                if state.window_geometry:
+                    try:
+                        self.geometry(state.window_geometry)
+                    except:
+                        pass
+                
+                # Restore all tabs
+                for tab_state in state.tabs:
+                    tab = DocumentTab(
+                        self.notebook,
+                        theme=self.theme,
+                        on_modified_callback=lambda: self._on_tab_modified(),
+                        on_content_change=lambda c: self._on_visual_edit(c)
+                    )
+                    
+                    # Set tab properties
+                    tab.file_path = tab_state.file_path
+                    tab.set_content(tab_state.content)
+                    tab.is_modified = tab_state.is_modified
+                    tab.current_mode = tab_state.current_mode
+                    
+                    # Add to notebook
+                    tab_name = tab.get_display_name()
+                    if tab.is_modified:
+                        tab_name = f"*{tab_name}"
+                    self.notebook.add(tab, text=tab_name)
+                    self.tabs.append(tab)
+                    
+                    # Setup bindings
+                    self._setup_tab_bindings(tab)
+                    
+                    # Restore cursor position
+                    try:
+                        tab.source_editor.mark_set(tk.INSERT, tab_state.cursor_position)
+                        tab.source_editor.see(tab_state.cursor_position)
+                    except:
+                        pass
+                    
+                    # Restore scroll position
+                    try:
+                        tab.source_editor.yview_moveto(tab_state.scroll_position)
+                    except:
+                        pass
+                    
+                    # Update visual viewer base path
+                    if tab.file_path:
+                        tab.visual_viewer.set_base_path(os.path.dirname(tab.file_path))
+                    
+                    # Show correct mode
+                    if tab_state.current_mode == "visual":
+                        tab.visual_frame.pack(fill=tk.BOTH, expand=True)
+                        tab.source_frame.pack_forget()
+                    else:
+                        tab.source_frame.pack(fill=tk.BOTH, expand=True)
+                        tab.visual_frame.pack_forget()
+                
+                # Select the active tab
+                if state.active_tab_index < len(self.tabs):
+                    self.notebook.select(self.tabs[state.active_tab_index])
+                    self.current_tab = self.tabs[state.active_tab_index]
+                elif self.tabs:
+                    self.current_tab = self.tabs[0]
+                
+                # Update cache checkbox
+                self.cache_var.set(state.caching_enabled)
+                
+                restored = True
+                self._set_status(f"Restored {len(self.tabs)} tab(s) from previous session")
+        
+        # If no session restored, create empty tab
+        if not restored:
+            self.new_tab()
+    
+    def _save_session(self):
+        """Save current session state"""
+        if not self.session_manager:
+            return
+        
+        # Clear existing tabs in session
+        self.session_manager.state.tabs = []
+        
+        # Save each tab's state
+        for i, tab in enumerate(self.tabs):
+            tab_state = TabState(
+                file_path=tab.file_path,
+                content=tab.get_content(),
+                cursor_position=tab.source_editor.index(tk.INSERT),
+                scroll_position=tab.source_editor.yview()[0],
+                current_mode=tab.current_mode,
+                is_modified=tab.is_modified
+            )
+            self.session_manager.state.tabs.append(tab_state)
+        
+        # Save active tab index
+        if self.current_tab and self.current_tab in self.tabs:
+            self.session_manager.set_active_tab(self.tabs.index(self.current_tab))
+        
+        # Save window geometry
+        self.session_manager.set_window_geometry(self.geometry())
+        
+        # Save to file
+        self.session_manager.save_session()
+    
+    def _start_auto_save(self):
+        """Start periodic auto-save of session"""
+        def auto_save():
+            if self.session_manager and self.session_manager.is_caching_enabled():
+                self._save_session()
+            # Schedule next auto-save (every 30 seconds)
+            self._auto_save_job = self.after(30000, auto_save)
+        
+        # Start the auto-save cycle
+        self._auto_save_job = self.after(30000, auto_save)
+    
+    def _toggle_caching(self):
+        """Toggle document caching on/off"""
+        if self.session_manager:
+            enabled = self.cache_var.get()
+            self.session_manager.set_caching_enabled(enabled)
+            
+            if enabled:
+                self._save_session()
+                self._set_status("Document caching enabled - session will be restored on restart")
+            else:
+                self._set_status("Document caching disabled - documents will not be cached")
+    
+    # === AI Sidebar Methods ===
+    
+    def _setup_ai_sidebar(self):
+        """Setup the AI chat sidebar"""
+        if not AI_CHAT_AVAILABLE:
+            return
+        
+        # Create sidebar frame (will be added to paned window when shown)
+        self.ai_sidebar_frame = ttk.Frame(self.main_paned)
+        
+        # Create the chat sidebar widget
+        self.ai_sidebar = ChatSidebar(
+            self.ai_sidebar_frame,
+            get_document_content_callback=self._get_current_document_content,
+            get_document_images_callback=self._get_current_document_images
+        )
+        self.ai_sidebar.pack(fill=tk.BOTH, expand=True)
+    
+    def _toggle_ai_sidebar(self):
+        """Toggle AI sidebar visibility"""
+        if not AI_CHAT_AVAILABLE:
+            messagebox.showwarning("AI Chat Unavailable", 
+                "AI chat module not available.\nEnsure ai_chat.py is present and anthropic is installed.")
+            return
+        
+        if self.ai_sidebar_visible:
+            # Hide sidebar
+            self.main_paned.forget(self.ai_sidebar_frame)
+            self.ai_sidebar_visible = False
+            self.ai_sidebar_btn.config(text="💬 AI")
+            self._set_status("AI sidebar hidden")
+        else:
+            # Show sidebar
+            self.main_paned.add(self.ai_sidebar_frame, weight=0)
+            # Set initial width for sidebar (about 350 pixels)
+            self.update_idletasks()
+            total_width = self.main_paned.winfo_width()
+            if total_width > 400:
+                sash_pos = total_width - 380
+                try:
+                    self.main_paned.sashpos(0, sash_pos)
+                except:
+                    pass
+            self.ai_sidebar_visible = True
+            self.ai_sidebar_btn.config(text="💬 AI ✓")
+            self._set_status("AI sidebar shown - Configure API key in Settings")
+            
+            # Update sidebar with current document context
+            self._update_ai_sidebar_context()
+    
+    def _update_ai_sidebar_context(self):
+        """Update AI sidebar with current document context"""
+        if not self.ai_sidebar or not self.ai_sidebar_visible:
+            return
+        
+        # Get current document ID for chat history
+        doc_id = None
+        if self.current_tab and self.current_tab.file_path:
+            doc_id = self.current_tab.file_path
+        elif self.current_tab:
+            # Use a hash of content for unsaved documents
+            content = self.current_tab.get_content()
+            if content:
+                doc_id = f"unsaved_{hash(content[:100])}"
+        
+        self.ai_sidebar.set_document_id(doc_id)
+    
+    def _get_current_document_content(self):
+        """Get current document content for AI context"""
+        if not self.current_tab:
+            return ""
+        return self.current_tab.get_content()
+    
+    def _get_current_document_images(self):
+        """Get images from current document for AI context"""
+        images = []
+        if not self.current_tab or not PIL_AVAILABLE:
+            return images
+        
+        content = self.current_tab.get_content()
+        
+        # Extract base64 images
+        base64_pattern = r'!\[([^\]]*)\]\(data:image/([^;]+);base64,([^)]+)\)'
+        for match in re.finditer(base64_pattern, content):
+            alt_text = match.group(1)
+            img_type = match.group(2)
+            img_data = match.group(3)
+            try:
+                img_bytes = base64.b64decode(img_data)
+                img = Image.open(io.BytesIO(img_bytes))
+                images.append({'image': img, 'alt': alt_text, 'type': img_type})
+            except:
+                pass
+        
+        # Extract file path images
+        file_pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
+        base_path = ""
+        if self.current_tab.file_path:
+            base_path = os.path.dirname(self.current_tab.file_path)
+        
+        for match in re.finditer(file_pattern, content):
+            alt_text = match.group(1)
+            path = match.group(2)
+            
+            # Skip base64 images (already handled)
+            if path.startswith('data:'):
+                continue
+            
+            # Resolve relative paths
+            if base_path and not os.path.isabs(path):
+                path = os.path.join(base_path, path)
+            
+            if os.path.exists(path):
+                try:
+                    img = Image.open(path)
+                    ext = os.path.splitext(path)[1].lower()
+                    img_type = ext.lstrip('.') if ext else 'png'
+                    if img_type == 'jpg':
+                        img_type = 'jpeg'
+                    images.append({'image': img, 'alt': alt_text, 'type': img_type})
+                except:
+                    pass
+        
+        return images
+    
+    def _open_ai_settings(self):
+        """Open AI settings dialog"""
+        if not AI_CHAT_AVAILABLE:
+            messagebox.showwarning("AI Chat Unavailable", 
+                "AI chat module not available.\nEnsure ai_chat.py is present.")
+            return
+        
+        AISettingsDialog(self)
+        
+        # Reload settings in sidebar if it exists
+        if self.ai_sidebar:
+            self.ai_sidebar.reload_settings()
+
     # === Tab Management Methods ===
     
     def new_tab(self, file_path=None, content=""):
@@ -1506,6 +1838,8 @@ class MarkdownNotepad(tk.Tk):
                         self._update_title()
                         self._update_mode_display()
                         self._update_position()
+                        # Update AI sidebar context for new tab
+                        self._update_ai_sidebar_context()
                         break
         except:
             pass
@@ -2133,21 +2467,31 @@ class MarkdownNotepad(tk.Tk):
     
     def quit_app(self):
         """Exit the application"""
-        # Check all tabs for unsaved changes
-        for tab in self.tabs:
-            if tab.is_modified:
-                response = messagebox.askyesnocancel(
-                    "Unsaved Changes",
-                    f"'{tab.get_display_name()}' has unsaved changes.\n\nDo you want to save before exiting?",
-                    parent=self
-                )
-                if response is None:  # Cancel
-                    return
-                if response:  # Yes - save
-                    self.current_tab = tab
-                    self.notebook.select(tab)
-                    if not self.save_file():
-                        return  # Save was cancelled
+        # Save session state before checking for unsaved changes
+        self._save_session()
+        
+        # Check all tabs for unsaved changes (only if caching is disabled)
+        # If caching is enabled, documents will be restored on next launch
+        if not (self.session_manager and self.session_manager.is_caching_enabled()):
+            for tab in self.tabs:
+                if tab.is_modified:
+                    response = messagebox.askyesnocancel(
+                        "Unsaved Changes",
+                        f"'{tab.get_display_name()}' has unsaved changes.\n\nDo you want to save before exiting?",
+                        parent=self
+                    )
+                    if response is None:  # Cancel
+                        return
+                    if response:  # Yes - save
+                        self.current_tab = tab
+                        self.notebook.select(tab)
+                        if not self.save_file():
+                            return  # Save was cancelled
+        
+        # Stop auto-save timer
+        if self._auto_save_job:
+            self.after_cancel(self._auto_save_job)
+        
         self.destroy()
     
     def show_about(self):
