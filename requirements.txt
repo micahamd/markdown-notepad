@@ -6,6 +6,9 @@ markitdown[all]
 # Required for image display
 Pillow>=10.0.0
 
+# Optional: For Audio Processing
+ffmpeg
+
 # Optional: For enhanced visual markdown rendering
 tkhtmlview>=0.3.0
 markdown>=3.5.0
@@ -13,6 +16,7 @@ markdown>=3.5.0
 # Optional: For AI chat functionality
 anthropic>=0.30.0
 google-genai>=1.0.0
+ollama>=0.4.0
 
 # Note: If you only need specific file format support, you can install:
 # markitdown[pdf]       - PDF files

@@ -17,7 +17,7 @@ from typing import List, Dict, Any, Optional, Callable, Iterator
 from dataclasses import dataclass, field, asdict
 from abc import ABC, abstractmethod
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 
 # Try to import PIL for image handling
 try:
@@ -41,6 +41,21 @@ try:
 except ImportError:
     GEMINI_AVAILABLE = False
     print("Warning: google-genai not installed. Install with: pip install google-genai")
+
+# Try to import Ollama
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+    print("Warning: ollama not installed. Install with: pip install ollama")
+
+# Import requests for Ollama connectivity check
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
 
 
 # =============================================================================
@@ -94,10 +109,20 @@ class AISettings:
         "gemini-1.5-flash",
     ]
     
+    # Default Ollama models (populated dynamically)
+    OLLAMA_MODELS = [
+        "llama3.2",
+        "llama3.1",
+        "mistral",
+        "codellama",
+        "phi3",
+    ]
+    
     DEFAULT_SETTINGS = {
         'provider': 'anthropic',
         'api_key': '',
         'gemini_api_key': '',  # Separate API key for Gemini
+        'ollama_url': 'http://localhost:11434',  # Ollama server URL
         'model': 'claude-sonnet-4-20250514',
         'system_prompt': 'You are a helpful AI assistant. You help users with their markdown documents, answer questions, and provide writing assistance.',
         'max_tokens': 4096,
@@ -222,10 +247,20 @@ class AISettings:
     def gemini_api_key(self, value: str):
         self.settings['gemini_api_key'] = value
     
+    @property
+    def ollama_url(self) -> str:
+        return self.settings.get('ollama_url', 'http://localhost:11434')
+    
+    @ollama_url.setter
+    def ollama_url(self, value: str):
+        self.settings['ollama_url'] = value
+    
     def is_configured(self) -> bool:
         """Check if API key is configured for current provider"""
         if self.provider == 'gemini':
             return bool(self.gemini_api_key)
+        elif self.provider == 'ollama':
+            return bool(self.ollama_url)  # Ollama doesn't need API key
         return bool(self.api_key)
     
     def get_available_models(self) -> List[str]:
@@ -234,12 +269,16 @@ class AISettings:
             return self.ANTHROPIC_MODELS.copy()
         elif self.provider == 'gemini':
             return self.GEMINI_MODELS.copy()
+        elif self.provider == 'ollama':
+            return self.OLLAMA_MODELS.copy()
         return []
     
     def get_current_api_key(self) -> str:
         """Get API key for current provider"""
         if self.provider == 'gemini':
             return self.gemini_api_key
+        elif self.provider == 'ollama':
+            return ''  # Ollama doesn't use API keys
         return self.api_key
 
 
@@ -981,6 +1020,248 @@ class GeminiClient(LLMClient):
 
 
 # =============================================================================
+# Ollama Client Implementation
+# =============================================================================
+
+class OllamaClient(LLMClient):
+    """Ollama local LLM client"""
+    
+    DEFAULT_MODELS = [
+        "llama3.2",
+        "llama3.1",
+        "mistral",
+        "codellama",
+        "phi3",
+    ]
+    
+    def __init__(self, base_url: str = "http://localhost:11434"):
+        self.base_url = base_url.rstrip('/')
+        self.api_key = ""  # Not used but kept for interface compatibility
+        self._cached_models = None
+        
+        # Set the host for ollama library if available
+        if OLLAMA_AVAILABLE:
+            try:
+                # Set custom host if not default
+                if base_url != "http://localhost:11434":
+                    os.environ['OLLAMA_HOST'] = base_url
+            except:
+                pass
+    
+    def _convert_messages_to_api_format(self, messages: List[ChatMessage]) -> List[Dict]:
+        """Convert ChatMessage objects to Ollama API format"""
+        api_messages = []
+        
+        for msg in messages:
+            message_dict = {
+                "role": msg.role,
+                "content": msg.content
+            }
+            
+            # Add images if present (Ollama supports images for vision models)
+            if msg.role == "user" and msg.images:
+                message_dict["images"] = msg.images
+            
+            api_messages.append(message_dict)
+        
+        return api_messages
+    
+    def send_message(
+        self,
+        messages: List[ChatMessage],
+        system_prompt: str = "",
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        on_chunk: Optional[Callable[[str], None]] = None
+    ) -> str:
+        """Send messages to Ollama and get response"""
+        if not OLLAMA_AVAILABLE:
+            raise ValueError("Ollama library not installed. Install with: pip install ollama")
+        
+        api_messages = self._convert_messages_to_api_format(messages)
+        
+        # Add system message if provided
+        if system_prompt:
+            api_messages.insert(0, {"role": "system", "content": system_prompt})
+        
+        try:
+            if on_chunk:
+                # Streaming response
+                full_response = ""
+                stream = ollama.chat(
+                    model="llama3.2",
+                    messages=api_messages,
+                    stream=True,
+                    options={
+                        "temperature": temperature,
+                        "num_predict": max_tokens
+                    }
+                )
+                for chunk in stream:
+                    text = chunk.get('message', {}).get('content', '')
+                    if text:
+                        full_response += text
+                        on_chunk(text)
+                return full_response
+            else:
+                # Non-streaming response
+                response = ollama.chat(
+                    model="llama3.2",
+                    messages=api_messages,
+                    options={
+                        "temperature": temperature,
+                        "num_predict": max_tokens
+                    }
+                )
+                return response.get('message', {}).get('content', '')
+        except Exception as e:
+            raise RuntimeError(f"Ollama error: {str(e)}")
+    
+    def get_available_models(self) -> List[str]:
+        """Get list of available Ollama models from local server"""
+        if self._cached_models:
+            return self._cached_models.copy()
+        
+        if not OLLAMA_AVAILABLE:
+            return self.DEFAULT_MODELS.copy()
+        
+        try:
+            # Fetch models from local Ollama server
+            models_response = ollama.list()
+            models = []
+            
+            # Handle different response formats
+            if hasattr(models_response, 'models'):
+                for model in models_response.models:
+                    model_name = model.model if hasattr(model, 'model') else str(model)
+                    # Filter out embedding models
+                    if 'embed' not in model_name.lower():
+                        models.append(model_name)
+            elif isinstance(models_response, dict) and 'models' in models_response:
+                for model in models_response['models']:
+                    model_name = model.get('name', model.get('model', str(model)))
+                    if 'embed' not in model_name.lower():
+                        models.append(model_name)
+            
+            if models:
+                models.sort()
+                self._cached_models = models
+                return models
+        except Exception as e:
+            print(f"Could not fetch models from Ollama: {e}")
+        
+        return self.DEFAULT_MODELS.copy()
+    
+    def send_message_stream(
+        self,
+        messages: List[Dict],
+        system_prompt: str = "",
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        images: Optional[List[str]] = None,
+        model: Optional[str] = None
+    ) -> Iterator[str]:
+        """Send messages and stream the response"""
+        if not OLLAMA_AVAILABLE:
+            raise ValueError("Ollama library not installed. Install with: pip install ollama")
+        
+        # Use provided model or default
+        model_name = model or "llama3.2"
+        
+        # Convert messages format
+        api_messages = []
+        if system_prompt:
+            api_messages.append({"role": "system", "content": system_prompt})
+        
+        for msg in messages:
+            if isinstance(msg, dict):
+                api_messages.append(msg)
+            elif isinstance(msg, ChatMessage):
+                api_messages.append({"role": msg.role, "content": msg.content})
+        
+        # Add images to the last user message if provided
+        if images and api_messages:
+            for i in range(len(api_messages) - 1, -1, -1):
+                if api_messages[i].get('role') == 'user':
+                    api_messages[i]['images'] = images
+                    break
+        
+        # Build options
+        options = {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+        }
+        if top_p < 1.0:
+            options["top_p"] = top_p
+        if top_k > 0:
+            options["top_k"] = top_k
+        
+        try:
+            stream = ollama.chat(
+                model=model_name,
+                messages=api_messages,
+                stream=True,
+                options=options
+            )
+            for chunk in stream:
+                text = chunk.get('message', {}).get('content', '')
+                if text:
+                    yield text
+        except Exception as e:
+            raise RuntimeError(f"Ollama error: {str(e)}")
+    
+    def encode_image_for_api(self, image, max_size: int = 512) -> Optional[str]:
+        """Encode a PIL Image for the API"""
+        if not PIL_AVAILABLE:
+            return None
+        
+        try:
+            from io import BytesIO
+            
+            # Ensure RGB mode
+            if image.mode in ('RGBA', 'P'):
+                image = image.convert('RGB')
+            
+            # Resize if needed
+            if image.size[0] > max_size or image.size[1] > max_size:
+                image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            
+            # Encode to base64
+            buffer = BytesIO()
+            image.save(buffer, format='JPEG', quality=85)
+            return base64.b64encode(buffer.getvalue()).decode('utf-8')
+        except Exception as e:
+            print(f"Error encoding image: {e}")
+            return None
+    
+    def test_connection(self) -> tuple[bool, str]:
+        """Test connection to Ollama server"""
+        if not OLLAMA_AVAILABLE:
+            return False, "Ollama library not installed. Install with: pip install ollama"
+        
+        try:
+            # Try to list models as a connection test
+            models = ollama.list()
+            model_count = 0
+            if hasattr(models, 'models'):
+                model_count = len(models.models)
+            elif isinstance(models, dict) and 'models' in models:
+                model_count = len(models['models'])
+            
+            if model_count > 0:
+                return True, f"Connected! Found {model_count} model(s)."
+            else:
+                return True, "Connected, but no models installed. Run 'ollama pull <model>' to download models."
+        except Exception as e:
+            error_msg = str(e)
+            if "connection" in error_msg.lower() or "refused" in error_msg.lower():
+                return False, "Could not connect to Ollama. Is it running? Start with 'ollama serve'"
+            return False, f"Error: {error_msg}"
+
+
+# =============================================================================
 # LLM Client Factory
 # =============================================================================
 
@@ -997,6 +1278,11 @@ def get_llm_client(settings: AISettings) -> Optional[LLMClient]:
         if not GEMINI_AVAILABLE:
             return None
         return GeminiClient(settings.gemini_api_key)
+    
+    elif provider == 'ollama':
+        if not OLLAMA_AVAILABLE:
+            return None
+        return OllamaClient(settings.ollama_url)
     
     return None
 
@@ -1066,12 +1352,12 @@ class AISettingsDialog(tk.Toplevel):
         ttk.Label(provider_frame, text="AI Provider:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.provider_var = tk.StringVar(value="anthropic")
         provider_combo = ttk.Combobox(provider_frame, textvariable=self.provider_var, 
-                                       values=["anthropic", "gemini"], state="readonly", width=30)
+                                       values=["anthropic", "gemini", "ollama"], state="readonly", width=30)
         provider_combo.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
         provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
         
         # API Keys Frame
-        api_frame = ttk.LabelFrame(main_frame, text="API Keys", padding=10)
+        api_frame = ttk.LabelFrame(main_frame, text="API Keys / Connection", padding=10)
         api_frame.pack(fill=tk.X, pady=(0, 10))
         
         # Anthropic API Key
@@ -1098,6 +1384,14 @@ class AISettingsDialog(tk.Toplevel):
         ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('gemini'),
                    width=6).grid(row=1, column=3, padx=(5, 0))
         
+        # Ollama URL
+        ttk.Label(api_frame, text="Ollama URL:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.ollama_url_var = tk.StringVar(value="http://localhost:11434")
+        self.ollama_url_entry = ttk.Entry(api_frame, textvariable=self.ollama_url_var, width=40)
+        self.ollama_url_entry.grid(row=2, column=1, sticky=tk.W, padx=(10, 0))
+        ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('ollama'),
+                   width=6).grid(row=2, column=3, padx=(5, 0))
+        
         # Model selection
         model_frame = ttk.LabelFrame(main_frame, text="Model", padding=10)
         model_frame.pack(fill=tk.X, pady=(0, 10))
@@ -1111,7 +1405,7 @@ class AISettingsDialog(tk.Toplevel):
         # Refresh models button
         refresh_btn = ttk.Button(model_frame, text="🔄", width=3, command=self._refresh_models)
         refresh_btn.grid(row=0, column=2, padx=(5, 0))
-        self._create_tooltip(refresh_btn, "Fetch available models from the API")
+        self._create_tooltip(refresh_btn, "Refresh model list: Fetches the latest available models from the API. Use this if you have access to new models that aren't showing in the dropdown.")
         
         # Parameters
         params_frame = ttk.LabelFrame(main_frame, text="Generation Parameters", padding=10)
@@ -1125,7 +1419,7 @@ class AISettingsDialog(tk.Toplevel):
         max_tokens_spin.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
         max_tokens_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
         max_tokens_tip.grid(row=0, column=2, padx=(5, 0))
-        self._create_tooltip(max_tokens_tip, "Maximum number of tokens to generate in the response.")
+        self._create_tooltip(max_tokens_tip, "Maximum number of tokens to generate in the response. Higher values allow longer responses but may cost more. A typical page of text is ~500-800 tokens. Common values: 1024 (short), 2048 (medium), 4096 (long), 8192 (very long).")
         
         # Temperature
         ttk.Label(params_frame, text="Temperature:").grid(row=1, column=0, sticky=tk.W, pady=5)
@@ -1140,7 +1434,7 @@ class AISettingsDialog(tk.Toplevel):
         self.temp_label.pack(side=tk.LEFT, padx=(5, 0))
         temp_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
         temp_tip.grid(row=1, column=2, padx=(5, 0))
-        self._create_tooltip(temp_tip, "Controls randomness. Lower = more focused and deterministic. Higher = more creative and varied. Range: 0.0-2.0")
+        self._create_tooltip(temp_tip, "Controls randomness in responses. Lower = more focused, consistent, and deterministic. Higher = more creative, varied, and unpredictable. Range: 0.0-2.0. Recommended: 0.3-0.5 for factual tasks, 0.7-0.9 for creative writing, 1.0+ for brainstorming.")
         
         # Top-p (nucleus sampling)
         ttk.Label(params_frame, text="Top-p:").grid(row=2, column=0, sticky=tk.W, pady=5)
@@ -1155,7 +1449,7 @@ class AISettingsDialog(tk.Toplevel):
         self.top_p_label.pack(side=tk.LEFT, padx=(5, 0))
         top_p_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
         top_p_tip.grid(row=2, column=2, padx=(5, 0))
-        self._create_tooltip(top_p_tip, "Nucleus sampling: only consider tokens whose cumulative probability exceeds this threshold. 1.0 = consider all tokens. Lower values = more focused output.")
+        self._create_tooltip(top_p_tip, "Nucleus sampling: only considers tokens whose cumulative probability exceeds this threshold. 1.0 = consider all possible tokens. Lower values (e.g., 0.9) = more focused, coherent output by eliminating unlikely words. Often used together with temperature. Most users should leave at 1.0.")
         
         # Top-k
         ttk.Label(params_frame, text="Top-k:").grid(row=3, column=0, sticky=tk.W, pady=5)
@@ -1165,7 +1459,7 @@ class AISettingsDialog(tk.Toplevel):
         top_k_spin.grid(row=3, column=1, sticky=tk.W, padx=(10, 0))
         top_k_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
         top_k_tip.grid(row=3, column=2, padx=(5, 0))
-        self._create_tooltip(top_k_tip, "Only consider the top-k most likely tokens. 0 = disabled (use model default). Lower values = more focused, higher = more diverse.")
+        self._create_tooltip(top_k_tip, "Only considers the top-k most likely tokens at each step. 0 = disabled (use model's default behavior). Lower values (e.g., 10-20) = more focused and deterministic. Higher values (e.g., 40-50) = more diverse but potentially less coherent. Leave at 0 for most use cases.")
         
         # Image size
         ttk.Label(params_frame, text="Image Max Size:").grid(row=4, column=0, sticky=tk.W, pady=5)
@@ -1178,7 +1472,7 @@ class AISettingsDialog(tk.Toplevel):
         ttk.Label(img_frame, text="px").pack(side=tk.LEFT, padx=(5, 0))
         img_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
         img_tip.grid(row=4, column=2, padx=(5, 0))
-        self._create_tooltip(img_tip, "Maximum dimension for images sent to the AI. Larger = more detail but slower/costlier.")
+        self._create_tooltip(img_tip, "Maximum dimension (width or height) for images sent to the AI. Images are resized proportionally to fit within this size while maintaining aspect ratio. Larger sizes = more detail visible to AI but slower processing and higher API costs. Recommended: 512px (standard), 768px (detailed), 1024px (maximum detail).")
         
         # System prompt
         prompt_frame = ttk.LabelFrame(main_frame, text="System Prompt", padding=10)
@@ -1199,6 +1493,7 @@ class AISettingsDialog(tk.Toplevel):
         self.provider_var.set(self.settings.provider)
         self.api_key_var.set(self.settings.api_key)
         self.gemini_key_var.set(self.settings.gemini_api_key)
+        self.ollama_url_var.set(self.settings.ollama_url)
         self.model_var.set(self.settings.model)
         self.max_tokens_var.set(self.settings.max_tokens)
         self.temp_var.set(self.settings.temperature)
@@ -1249,6 +1544,10 @@ class AISettingsDialog(tk.Toplevel):
             self.model_combo['values'] = AISettings.GEMINI_MODELS
             if self.model_var.get() not in AISettings.GEMINI_MODELS:
                 self.model_var.set(AISettings.GEMINI_MODELS[0])
+        elif provider == 'ollama':
+            self.model_combo['values'] = AISettings.OLLAMA_MODELS
+            if self.model_var.get() not in AISettings.OLLAMA_MODELS:
+                self.model_var.set(AISettings.OLLAMA_MODELS[0] if AISettings.OLLAMA_MODELS else '')
     
     def _refresh_models(self):
         """Fetch available models from the API"""
@@ -1285,6 +1584,21 @@ class AISettingsDialog(tk.Toplevel):
                     messagebox.showwarning("Warning", "No models found.", parent=self)
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to fetch models: {str(e)}", parent=self)
+        
+        elif provider == 'ollama':
+            ollama_url = self.ollama_url_var.get()
+            try:
+                client = OllamaClient(ollama_url)
+                models = client.get_available_models()
+                if models:
+                    self.model_combo['values'] = models
+                    # Update default models list for future use
+                    AISettings.OLLAMA_MODELS = models
+                    messagebox.showinfo("Success", f"Found {len(models)} Ollama models.", parent=self)
+                else:
+                    messagebox.showwarning("Warning", "No models found. Run 'ollama pull <model>' to download models.", parent=self)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to fetch models: {str(e)}", parent=self)
     
     def _test_connection(self, provider: str = None):
         """Test API connection for specified provider"""
@@ -1305,6 +1619,10 @@ class AISettingsDialog(tk.Toplevel):
                 return
             client = GeminiClient(api_key)
             success, message = client.test_connection()
+        elif provider == 'ollama':
+            ollama_url = self.ollama_url_var.get()
+            client = OllamaClient(ollama_url)
+            success, message = client.test_connection()
         else:
             messagebox.showwarning("Warning", "Unknown provider.", parent=self)
             return
@@ -1319,6 +1637,7 @@ class AISettingsDialog(tk.Toplevel):
         self.settings.provider = self.provider_var.get()
         self.settings.api_key = self.api_key_var.get()
         self.settings.gemini_api_key = self.gemini_key_var.get()
+        self.settings.ollama_url = self.ollama_url_var.get()
         self.settings.model = self.model_var.get()
         self.settings.max_tokens = self.max_tokens_var.get()
         self.settings.temperature = self.temp_var.get()
@@ -1374,6 +1693,7 @@ class ChatSidebar(tk.Frame):
     - Option to include chat history
     - Clear history button
     - Settings access
+    - File attachment support
     """
     
     def __init__(self, parent, get_document_content_callback: Optional[Callable] = None,
@@ -1390,6 +1710,9 @@ class ChatSidebar(tk.Frame):
         self.llm_client: Optional[LLMClient] = None
         self.is_generating = False
         self.response_queue = queue.Queue()
+        
+        # Attached files storage: list of dicts with 'path', 'name', 'type', 'content'
+        self.attached_files: List[Dict[str, Any]] = []
         
         # Initialize LLM client
         self._init_llm_client()
@@ -1414,12 +1737,12 @@ class ChatSidebar(tk.Frame):
                  bg='#e0e0e0').pack(side=tk.LEFT, padx=5)
         
         # Settings button
-        settings_btn = ttk.Button(header_frame, text="⚙️", width=3, 
+        settings_btn = ttk.Button(header_frame, text="Config", width=6, 
                                    command=self._open_settings)
         settings_btn.pack(side=tk.RIGHT, padx=2)
         
         # Clear history button
-        clear_btn = ttk.Button(header_frame, text="🗑️", width=3,
+        clear_btn = ttk.Button(header_frame, text="Clear", width=6,
                                 command=self._clear_history)
         clear_btn.pack(side=tk.RIGHT, padx=2)
         
@@ -1467,9 +1790,28 @@ class ChatSidebar(tk.Frame):
         )
         self.include_history_cb.pack(side=tk.LEFT)
         
+        # Attachments frame (shows attached files)
+        self.attachments_frame = tk.Frame(self, bg='#f0f0f0')
+        self.attachments_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
+        
+        # Attachments label (hidden when no attachments)
+        self.attachments_label = tk.Label(
+            self.attachments_frame, 
+            text="", 
+            bg='#f0f0f0', 
+            fg='#666666',
+            font=('Segoe UI', 9),
+            anchor=tk.W
+        )
+        self.attachments_label.pack(fill=tk.X)
+        
         # Input area
         input_frame = tk.Frame(self, bg='#f0f0f0')
         input_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
+        
+        # Button frame for attach and send
+        btn_frame = tk.Frame(input_frame, bg='#f0f0f0')
+        btn_frame.pack(side=tk.RIGHT, fill=tk.Y)
         
         self.input_text = tk.Text(
             input_frame,
@@ -1481,9 +1823,13 @@ class ChatSidebar(tk.Frame):
         )
         self.input_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
+        # Attach button
+        self.attach_btn = ttk.Button(btn_frame, text="Attach", command=self._attach_file, width=6)
+        self.attach_btn.pack(side=tk.TOP, padx=(5, 0), pady=2)
+        
         # Send button
-        self.send_btn = ttk.Button(input_frame, text="Send", command=self._send_message)
-        self.send_btn.pack(side=tk.RIGHT, padx=(5, 0), pady=2)
+        self.send_btn = ttk.Button(btn_frame, text="Send", command=self._send_message, width=6)
+        self.send_btn.pack(side=tk.TOP, padx=(5, 0), pady=2)
         
         # Status label
         self.status_label = tk.Label(self, text="Ready", bg='#f0f0f0', fg='#666666',
@@ -1495,6 +1841,118 @@ class ChatSidebar(tk.Frame):
         # Enter to send (but Ctrl+Enter for newline)
         self.input_text.bind('<Return>', self._on_enter)
         self.input_text.bind('<Control-Return>', self._on_ctrl_enter)
+    
+    def _attach_file(self):
+        """Open file dialog to attach a file"""
+        filetypes = [
+            ("All supported", "*.png *.jpg *.jpeg *.gif *.bmp *.webp *.txt *.md *.py *.json *.xml *.csv *.html *.css *.js"),
+            ("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+            ("Text files", "*.txt *.md *.py *.json *.xml *.csv *.html *.css *.js"),
+            ("All files", "*.*")
+        ]
+        
+        file_path = filedialog.askopenfilename(
+            title="Attach File",
+            filetypes=filetypes,
+            parent=self.winfo_toplevel()
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            file_name = Path(file_path).name
+            file_ext = Path(file_path).suffix.lower()
+            
+            # Determine file type and read content
+            image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
+            
+            if file_ext in image_extensions:
+                # Handle image file
+                if not PIL_AVAILABLE:
+                    messagebox.showwarning("Warning", "PIL not available. Cannot attach images.", parent=self)
+                    return
+                
+                with Image.open(file_path) as img:
+                    # Convert and resize
+                    if img.mode in ('RGBA', 'P'):
+                        img = img.convert('RGB')
+                    
+                    max_size = self.settings.image_max_size
+                    if img.size[0] > max_size[0] or img.size[1] > max_size[1]:
+                        img.thumbnail(max_size, Image.Resampling.LANCZOS)
+                    
+                    # Encode to base64
+                    from io import BytesIO
+                    buffer = BytesIO()
+                    img.save(buffer, format='JPEG', quality=85)
+                    encoded = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                    
+                    self.attached_files.append({
+                        'path': file_path,
+                        'name': file_name,
+                        'type': 'image',
+                        'content': encoded
+                    })
+            else:
+                # Handle text file
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    # Limit text content size (max 50KB)
+                    if len(content) > 50000:
+                        content = content[:50000] + "\n... [truncated]"
+                    
+                    self.attached_files.append({
+                        'path': file_path,
+                        'name': file_name,
+                        'type': 'text',
+                        'content': content
+                    })
+                except UnicodeDecodeError:
+                    messagebox.showwarning("Warning", "Cannot read file. It may be binary or use an unsupported encoding.", parent=self)
+                    return
+            
+            # Update attachments display
+            self._update_attachments_display()
+            self.status_label.config(text=f"Attached: {file_name}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to attach file: {str(e)}", parent=self)
+    
+    def _update_attachments_display(self):
+        """Update the attachments label to show attached files"""
+        if not self.attached_files:
+            self.attachments_label.config(text="")
+            return
+        
+        # Build display text
+        names = [f['name'] for f in self.attached_files]
+        if len(names) == 1:
+            display_text = f"📎 {names[0]}"
+        else:
+            display_text = f"📎 {len(names)} files: {', '.join(names[:3])}"
+            if len(names) > 3:
+                display_text += f" (+{len(names) - 3} more)"
+        
+        # Add clear link
+        display_text += " [Clear]"
+        self.attachments_label.config(text=display_text)
+        
+        # Bind click to clear attachments
+        self.attachments_label.bind('<Button-1>', self._on_attachments_click)
+        self.attachments_label.config(cursor="hand2")
+    
+    def _on_attachments_click(self, event):
+        """Handle click on attachments label to clear"""
+        if self.attached_files:
+            if messagebox.askyesno("Clear Attachments", "Remove all attached files?", parent=self):
+                self.attached_files.clear()
+                self._update_attachments_display()
+                self.attachments_label.unbind('<Button-1>')
+                self.attachments_label.config(cursor="")
+                self.status_label.config(text="Attachments cleared")
     
     def _on_enter(self, event):
         """Handle Enter key - send message"""
@@ -1514,7 +1972,7 @@ class ChatSidebar(tk.Frame):
         
         # Get user message
         message = self.input_text.get(1.0, tk.END).strip()
-        if not message:
+        if not message and not self.attached_files:
             return
         
         # Check if client is available
@@ -1524,15 +1982,31 @@ class ChatSidebar(tk.Frame):
                 self._add_chat_message("system", "AI not configured. Please set up your API key in Settings.")
                 return
         
-        if not self.settings.api_key:
-            self._add_chat_message("system", "API key not configured. Please add your API key in Settings.")
-            return
+        # Check configuration based on provider
+        if self.settings.provider == 'ollama':
+            if not self.settings.ollama_url:
+                self._add_chat_message("system", "Ollama URL not configured. Please configure in Settings.")
+                return
+        elif self.settings.provider == 'gemini':
+            if not self.settings.gemini_api_key:
+                self._add_chat_message("system", "Gemini API key not configured. Please add in Settings.")
+                return
+        else:
+            if not self.settings.api_key:
+                self._add_chat_message("system", "API key not configured. Please add your API key in Settings.")
+                return
         
         # Clear input
         self.input_text.delete(1.0, tk.END)
         
+        # Build display message (include attachment info)
+        display_msg = message
+        if self.attached_files:
+            attachment_names = [f['name'] for f in self.attached_files]
+            display_msg = f"{message}\n📎 Attached: {', '.join(attachment_names)}" if message else f"📎 Attached: {', '.join(attachment_names)}"
+        
         # Add user message to display
-        self._add_chat_message("user", message)
+        self._add_chat_message("user", display_msg)
         
         # Prepare messages for API
         messages = []
@@ -1553,7 +2027,7 @@ class ChatSidebar(tk.Frame):
             if doc_content:
                 content_parts.append(f"[Current Document]\n{doc_content}\n[End Document]\n\n")
         
-        # Get images if available
+        # Get images from document if available
         if self.get_document_images and self.include_doc_var.get():
             doc_images = self.get_document_images()
             for img_data in doc_images[:3]:  # Limit to 3 images
@@ -1568,6 +2042,17 @@ class ChatSidebar(tk.Frame):
                             images.append(encoded)
                 except:
                     pass
+        
+        # Process attached files
+        for attachment in self.attached_files:
+            if attachment['type'] == 'image':
+                images.append(attachment['content'])
+            elif attachment['type'] == 'text':
+                content_parts.append(f"\n[Attached File: {attachment['name']}]\n{attachment['content']}\n[End File]\n")
+        
+        # Clear attachments after sending
+        self.attached_files.clear()
+        self._update_attachments_display()
         
         content_parts.append(message)
         full_content = "".join(content_parts)
@@ -1601,8 +2086,9 @@ class ChatSidebar(tk.Frame):
             # Update client settings based on provider
             if self.settings.provider == 'gemini':
                 self.llm_client.api_key = self.settings.gemini_api_key
-            else:
+            elif self.settings.provider == 'anthropic':
                 self.llm_client.api_key = self.settings.api_key
+            # Ollama doesn't need API key update
             
             # Stream response with all parameters
             response_text = ""
