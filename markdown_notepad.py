@@ -1162,6 +1162,15 @@ class MarkdownNotepad(tk.Tk):
         self.session_manager = get_session_manager() if SESSION_MANAGER_AVAILABLE else None
         self._auto_save_job = None
         
+        # Focus mode state
+        self.focus_mode_active = False
+        self.focus_overlay = None
+        self.pre_focus_geometry = None
+        self.pre_focus_state = None
+        self.focus_widget = None
+        self.focus_original_parent = None
+        self.focus_escape_binding = None
+        
         # Theme settings
         self.theme = self.DEFAULT_THEME.copy()
         self._load_theme()
@@ -1243,8 +1252,9 @@ class MarkdownNotepad(tk.Tk):
     
     def _create_menu(self):
         """Create the menu bar"""
-        menubar = tk.Menu(self)
-        self.config(menu=menubar)
+        self.menubar = tk.Menu(self)
+        self.config(menu=self.menubar)
+        menubar = self.menubar  # Keep local reference for compatibility
         
         # File menu
         file_menu = tk.Menu(menubar, tearoff=0)
@@ -1314,6 +1324,11 @@ class MarkdownNotepad(tk.Tk):
         
         view_menu.add_separator()
         
+        # Focus Mode
+        view_menu.add_command(label="Focus Mode", command=self._toggle_focus_mode, accelerator="F11")
+        
+        view_menu.add_separator()
+        
         # AI Sidebar
         view_menu.add_command(label="AI Sidebar", command=self._toggle_ai_sidebar, accelerator="Ctrl+Shift+A")
         view_menu.add_command(label="AI Settings...", command=self._open_ai_settings)
@@ -1348,8 +1363,9 @@ class MarkdownNotepad(tk.Tk):
     
     def _create_toolbar(self):
         """Create the toolbar"""
-        toolbar = ttk.Frame(self)
-        toolbar.pack(fill=tk.X, padx=5, pady=2)
+        self.toolbar_frame = ttk.Frame(self)
+        self.toolbar_frame.pack(fill=tk.X, padx=5, pady=2)
+        toolbar = self.toolbar_frame  # Keep local reference for compatibility
         
         # Style for buttons
         style = ttk.Style()
@@ -1461,6 +1477,9 @@ class MarkdownNotepad(tk.Tk):
         
         # AI sidebar toggle
         self.bind("<Control-A>", lambda e: self._toggle_ai_sidebar())  # Ctrl+Shift+A
+        
+        # Focus mode toggle
+        self.bind("<F11>", lambda e: self._toggle_focus_mode())
         
         # Position update state
         self._position_update_pending = False
@@ -2077,8 +2096,173 @@ class MarkdownNotepad(tk.Tk):
         else:
             self._show_source_mode()
     
-    # === File Operations ===
+    # === Focus Mode ===
     
+    def _toggle_focus_mode(self):
+        """Toggle focus mode on/off"""
+        if self.focus_mode_active:
+            self._exit_focus_mode()
+        else:
+            self._enter_focus_mode()
+    
+    def _enter_focus_mode(self):
+        """Enter distraction-free focus mode"""
+        if not self.current_tab:
+            return
+        
+        # Store state for restoration
+        self.focus_mode_active = True
+        self.pre_focus_geometry = self.geometry()
+        self.pre_focus_state = self.state()
+        self.focus_mode_type = self.current_tab.current_mode  # "source" or "visual"
+        
+        # Get current content and cursor position
+        if self.focus_mode_type == "source":
+            self.focus_original_content = self.current_tab.source_editor.get(1.0, tk.END)
+            try:
+                self.focus_cursor_pos = self.current_tab.source_editor.index(tk.INSERT)
+            except:
+                self.focus_cursor_pos = "1.0"
+        else:
+            self.focus_original_content = self.current_tab.visual_viewer.get_content()
+        
+        # Hide all UI elements
+        self.toolbar_frame.pack_forget()
+        self.status_bar.pack_forget()
+        self.main_paned.pack_forget()
+        self.config(menu="")  # Hide menu bar
+        
+        # Configure root window background to black
+        self.configure(bg="black")
+        
+        # Create the focus overlay
+        self.focus_overlay = tk.Frame(self, bg="black")
+        self.focus_overlay.pack(fill=tk.BOTH, expand=True)
+        
+        # Calculate side widths (each side is 1/6 of screen = total 1/3 for margins)
+        screen_width = self.winfo_screenwidth()
+        side_width = screen_width // 6
+        
+        # Left spacer (black)
+        left_spacer = tk.Frame(self.focus_overlay, bg="black", width=side_width)
+        left_spacer.pack(side=tk.LEFT, fill=tk.Y)
+        left_spacer.pack_propagate(False)
+        
+        # Center content frame
+        self.focus_center = tk.Frame(self.focus_overlay, bg="black")
+        self.focus_center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Right spacer (black)
+        right_spacer = tk.Frame(self.focus_overlay, bg="black", width=side_width)
+        right_spacer.pack(side=tk.RIGHT, fill=tk.Y)
+        right_spacer.pack_propagate(False)
+        
+        # Create a new editor widget for focus mode
+        if self.focus_mode_type == "source":
+            self.focus_editor = scrolledtext.ScrolledText(
+                self.focus_center,
+                wrap=tk.WORD,
+                font=(self.theme['source_font'], self.current_font_size),
+                undo=True,
+                padx=20,
+                pady=15,
+                bg=self.theme['source_bg'],
+                fg=self.theme['source_fg'],
+                insertbackground=self.theme['source_fg'],
+                selectbackground="#b3d9ff",
+                selectforeground="#000000",
+                relief=tk.FLAT,
+                borderwidth=0,
+            )
+            self.focus_editor.pack(fill=tk.BOTH, expand=True)
+            self.focus_editor.insert(1.0, self.focus_original_content.rstrip('\n'))
+            self.focus_editor.mark_set(tk.INSERT, self.focus_cursor_pos)
+            self.focus_editor.see(self.focus_cursor_pos)
+            self.focus_editor.focus_set()
+        else:
+            # Visual mode - create a visual viewer
+            self.focus_editor = MarkdownVisualWidget(
+                self.focus_center,
+                base_path=os.path.dirname(self.current_tab.file_path) if self.current_tab.file_path else os.getcwd(),
+                on_content_change=None
+            )
+            self.focus_editor.pack(fill=tk.BOTH, expand=True)
+            self.focus_editor.apply_theme(self.theme)
+            self.focus_editor.set_content(self.focus_original_content)
+        
+        # Go fullscreen
+        self.attributes('-fullscreen', True)
+        
+        # Bind Escape to exit focus mode
+        self.focus_escape_binding = self.bind("<Escape>", lambda e: self._exit_focus_mode())
+    
+    def _exit_focus_mode(self):
+        """Exit focus mode and restore normal view"""
+        if not self.focus_mode_active:
+            return
+        
+        # Get content from focus editor and sync back
+        if self.focus_mode_type == "source":
+            new_content = self.focus_editor.get(1.0, tk.END).rstrip('\n')
+            cursor_pos = self.focus_editor.index(tk.INSERT)
+            
+            # Update the original editor
+            self.current_tab.source_editor.delete(1.0, tk.END)
+            self.current_tab.source_editor.insert(1.0, new_content)
+            self.current_tab.source_editor.mark_set(tk.INSERT, cursor_pos)
+            self.current_tab.source_editor.see(cursor_pos)
+            
+            # Check if content changed
+            if new_content != self.focus_original_content.rstrip('\n'):
+                self.current_tab.is_modified = True
+                self._update_tab_title(self.current_tab)
+        else:
+            # Visual mode - get content and update
+            new_content = self.focus_editor.get_content()
+            if new_content != self.focus_original_content:
+                self.current_tab.source_editor.delete(1.0, tk.END)
+                self.current_tab.source_editor.insert(1.0, new_content)
+                self.current_tab.visual_viewer.set_content(new_content)
+                self.current_tab.is_modified = True
+                self._update_tab_title(self.current_tab)
+        
+        # Unbind Escape
+        if self.focus_escape_binding:
+            self.unbind("<Escape>", self.focus_escape_binding)
+            self.focus_escape_binding = None
+        
+        # Exit fullscreen
+        self.attributes('-fullscreen', False)
+        
+        # Destroy the overlay and focus editor
+        if self.focus_overlay:
+            self.focus_overlay.destroy()
+            self.focus_overlay = None
+            self.focus_editor = None
+        
+        # Restore root window background
+        self.configure(bg="#f5f5f5")
+        
+        # Restore UI elements in correct order
+        self.config(menu=self.menubar)
+        self.toolbar_frame.pack(fill=tk.X, padx=5, pady=2)
+        self.main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        
+        # Restore window state/geometry
+        if self.pre_focus_state == 'zoomed':
+            self.state('zoomed')
+        else:
+            self.geometry(self.pre_focus_geometry)
+        
+        # Clear state
+        self.focus_mode_active = False
+        self.focus_center = None
+        
+        self._set_status("Ready")
+    
+    # === File Operations ===
+
     def new_file(self):
         """Create a new file - now creates a new tab"""
         self.new_tab()
