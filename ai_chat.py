@@ -58,6 +58,57 @@ except ImportError:
     REQUESTS_AVAILABLE = False
 
 
+class ToolTip:
+    """Simple tooltip widget for tkinter"""
+    
+    def __init__(self, widget, text, delay=500):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.tooltip_window = None
+        self.scheduled_id = None
+        
+        widget.bind('<Enter>', self._on_enter)
+        widget.bind('<Leave>', self._on_leave)
+        widget.bind('<Button>', self._on_leave)
+    
+    def _on_enter(self, event=None):
+        self._cancel_scheduled()
+        self.scheduled_id = self.widget.after(self.delay, self._show_tooltip)
+    
+    def _on_leave(self, event=None):
+        self._cancel_scheduled()
+        self._hide_tooltip()
+    
+    def _cancel_scheduled(self):
+        if self.scheduled_id:
+            self.widget.after_cancel(self.scheduled_id)
+            self.scheduled_id = None
+    
+    def _show_tooltip(self):
+        if self.tooltip_window:
+            return
+        
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
+        
+        self.tooltip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        
+        label = tk.Label(
+            tw, text=self.text, justify=tk.LEFT,
+            background="#ffffcc", foreground="#000000",
+            relief=tk.SOLID, borderwidth=1,
+            font=("Segoe UI", 9), padx=6, pady=3
+        )
+        label.pack()
+    
+    def _hide_tooltip(self):
+        if self.tooltip_window:
+            self.tooltip_window.destroy()
+            self.tooltip_window = None
+
 # =============================================================================
 # Data Classes
 # =============================================================================
@@ -130,6 +181,10 @@ class AISettings:
         'top_p': 1.0,  # Nucleus sampling: consider tokens with top_p cumulative probability
         'top_k': 0,    # Consider only top_k tokens (0 = disabled/use default)
         'image_max_size': [512, 512],
+        # Cached model lists (populated when Test/Refresh is successful)
+        'cached_anthropic_models': [],
+        'cached_gemini_models': [],
+        'cached_ollama_models': [],
     }
     
     def __init__(self):
@@ -963,8 +1018,14 @@ class GeminiClient(LLMClient):
             gen_config["top_k"] = top_k
         
         try:
+            # Ensure model name has correct format
+            if not model_name.startswith("models/"):
+                full_model_name = f"models/{model_name}"
+            else:
+                full_model_name = model_name
+            
             response = self.client.models.generate_content_stream(
-                model=model_name,
+                model=full_model_name,
                 contents=api_contents,
                 config=genai.types.GenerateContentConfig(
                     system_instruction=system_prompt if system_prompt else None,
@@ -972,8 +1033,12 @@ class GeminiClient(LLMClient):
                 )
             )
             for chunk in response:
-                if chunk.text:
+                if hasattr(chunk, 'text') and chunk.text:
                     yield chunk.text
+                elif hasattr(chunk, 'parts'):
+                    for part in chunk.parts:
+                        if hasattr(part, 'text') and part.text:
+                            yield part.text
         except Exception as e:
             raise RuntimeError(f"Gemini API error: {str(e)}")
     
@@ -1534,23 +1599,33 @@ class AISettingsDialog(tk.Toplevel):
         self.top_p_label.config(text=f"{self.top_p_var.get():.2f}")
     
     def _on_provider_change(self, event=None):
-        """Handle provider change"""
+        """Handle provider change - use cached models if available"""
         provider = self.provider_var.get()
+        current_model = self.model_var.get()
+        
         if provider == 'anthropic':
-            self.model_combo['values'] = AISettings.ANTHROPIC_MODELS
-            if self.model_var.get() not in AISettings.ANTHROPIC_MODELS:
-                self.model_var.set(AISettings.ANTHROPIC_MODELS[0])
+            # Use cached models if available, otherwise defaults
+            cached = self.settings.get('cached_anthropic_models', [])
+            models = cached if cached else AISettings.ANTHROPIC_MODELS
+            self.model_combo['values'] = models
+            # Only change model if current isn't in the list
+            if current_model not in models:
+                self.model_var.set(models[0] if models else '')
         elif provider == 'gemini':
-            self.model_combo['values'] = AISettings.GEMINI_MODELS
-            if self.model_var.get() not in AISettings.GEMINI_MODELS:
-                self.model_var.set(AISettings.GEMINI_MODELS[0])
+            cached = self.settings.get('cached_gemini_models', [])
+            models = cached if cached else AISettings.GEMINI_MODELS
+            self.model_combo['values'] = models
+            if current_model not in models:
+                self.model_var.set(models[0] if models else '')
         elif provider == 'ollama':
-            self.model_combo['values'] = AISettings.OLLAMA_MODELS
-            if self.model_var.get() not in AISettings.OLLAMA_MODELS:
-                self.model_var.set(AISettings.OLLAMA_MODELS[0] if AISettings.OLLAMA_MODELS else '')
+            cached = self.settings.get('cached_ollama_models', [])
+            models = cached if cached else AISettings.OLLAMA_MODELS
+            self.model_combo['values'] = models
+            if current_model not in models:
+                self.model_var.set(models[0] if models else '')
     
     def _refresh_models(self):
-        """Fetch available models from the API"""
+        """Fetch available models from the API and cache them"""
         provider = self.provider_var.get()
         
         if provider == 'anthropic':
@@ -1563,7 +1638,10 @@ class AISettingsDialog(tk.Toplevel):
                 models = client.get_available_models()
                 if models:
                     self.model_combo['values'] = models
-                    messagebox.showinfo("Success", f"Found {len(models)} Anthropic models.", parent=self)
+                    # Cache the models to settings
+                    self.settings.set('cached_anthropic_models', models)
+                    self.settings.save()
+                    messagebox.showinfo("Success", f"Found {len(models)} Anthropic models (cached).", parent=self)
                 else:
                     messagebox.showwarning("Warning", "No models found.", parent=self)
             except Exception as e:
@@ -1579,7 +1657,10 @@ class AISettingsDialog(tk.Toplevel):
                 models = client.get_available_models()
                 if models:
                     self.model_combo['values'] = models
-                    messagebox.showinfo("Success", f"Found {len(models)} Gemini models.", parent=self)
+                    # Cache the models to settings
+                    self.settings.set('cached_gemini_models', models)
+                    self.settings.save()
+                    messagebox.showinfo("Success", f"Found {len(models)} Gemini models (cached).", parent=self)
                 else:
                     messagebox.showwarning("Warning", "No models found.", parent=self)
             except Exception as e:
@@ -1592,19 +1673,21 @@ class AISettingsDialog(tk.Toplevel):
                 models = client.get_available_models()
                 if models:
                     self.model_combo['values'] = models
-                    # Update default models list for future use
-                    AISettings.OLLAMA_MODELS = models
-                    messagebox.showinfo("Success", f"Found {len(models)} Ollama models.", parent=self)
+                    # Cache the models to settings
+                    self.settings.set('cached_ollama_models', models)
+                    self.settings.save()
+                    messagebox.showinfo("Success", f"Found {len(models)} Ollama models (cached).", parent=self)
                 else:
                     messagebox.showwarning("Warning", "No models found. Run 'ollama pull <model>' to download models.", parent=self)
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to fetch models: {str(e)}", parent=self)
     
     def _test_connection(self, provider: str = None):
-        """Test API connection for specified provider"""
+        """Test API connection for specified provider and cache models on success"""
         if provider is None:
             provider = self.provider_var.get()
         
+        client = None
         if provider == 'anthropic':
             api_key = self.api_key_var.get()
             if not api_key:
@@ -1628,6 +1711,23 @@ class AISettingsDialog(tk.Toplevel):
             return
         
         if success:
+            # Also fetch and cache models on successful connection
+            try:
+                models = client.get_available_models()
+                if models:
+                    self.model_combo['values'] = models
+                    # Cache models based on provider
+                    if provider == 'anthropic':
+                        self.settings.set('cached_anthropic_models', models)
+                    elif provider == 'gemini':
+                        self.settings.set('cached_gemini_models', models)
+                    elif provider == 'ollama':
+                        self.settings.set('cached_ollama_models', models)
+                    self.settings.save()
+                    message += f"\nLoaded {len(models)} models."
+            except Exception as e:
+                message += f"\n(Could not fetch models: {e})"
+            
             messagebox.showinfo("Success", message, parent=self)
         else:
             messagebox.showerror("Error", message, parent=self)
@@ -1733,18 +1833,20 @@ class ChatSidebar(tk.Frame):
         header_frame = tk.Frame(self, bg='#e0e0e0')
         header_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        tk.Label(header_frame, text="💬 AI Assistant", font=('Segoe UI', 11, 'bold'),
+        tk.Label(header_frame, text="AI Assistant", font=('Segoe UI', 11, 'bold'),
                  bg='#e0e0e0').pack(side=tk.LEFT, padx=5)
         
         # Settings button
         settings_btn = ttk.Button(header_frame, text="Config", width=6, 
                                    command=self._open_settings)
         settings_btn.pack(side=tk.RIGHT, padx=2)
+        ToolTip(settings_btn, "Configure AI provider, API keys, and model settings")
         
         # Clear history button
         clear_btn = ttk.Button(header_frame, text="Clear", width=6,
                                 command=self._clear_history)
         clear_btn.pack(side=tk.RIGHT, padx=2)
+        ToolTip(clear_btn, "Clear chat history for this document")
         
         # Chat display area
         chat_frame = tk.Frame(self, bg='#f0f0f0')
@@ -1780,6 +1882,7 @@ class ChatSidebar(tk.Frame):
             variable=self.include_doc_var
         )
         self.include_doc_cb.pack(side=tk.LEFT, padx=(0, 10))
+        ToolTip(self.include_doc_cb, "Send current document content with your message")
         
         # Include history checkbox
         self.include_history_var = tk.BooleanVar(value=True)
@@ -1789,6 +1892,7 @@ class ChatSidebar(tk.Frame):
             variable=self.include_history_var
         )
         self.include_history_cb.pack(side=tk.LEFT)
+        ToolTip(self.include_history_cb, "Include previous messages for context")
         
         # Attachments frame (shows attached files)
         self.attachments_frame = tk.Frame(self, bg='#f0f0f0')
@@ -1826,10 +1930,12 @@ class ChatSidebar(tk.Frame):
         # Attach button
         self.attach_btn = ttk.Button(btn_frame, text="Attach", command=self._attach_file, width=6)
         self.attach_btn.pack(side=tk.TOP, padx=(5, 0), pady=2)
+        ToolTip(self.attach_btn, "Attach image or text file")
         
         # Send button
         self.send_btn = ttk.Button(btn_frame, text="Send", command=self._send_message, width=6)
         self.send_btn.pack(side=tk.TOP, padx=(5, 0), pady=2)
+        ToolTip(self.send_btn, "Send message (Shift+Enter)")
         
         # Status label
         self.status_label = tk.Label(self, text="Ready", bg='#f0f0f0', fg='#666666',
@@ -1838,9 +1944,10 @@ class ChatSidebar(tk.Frame):
     
     def _setup_bindings(self):
         """Setup keyboard bindings"""
-        # Enter to send (but Ctrl+Enter for newline)
-        self.input_text.bind('<Return>', self._on_enter)
-        self.input_text.bind('<Control-Return>', self._on_ctrl_enter)
+        # Shift+Enter to send, regular Enter for newline
+        self.input_text.bind('<Shift-Return>', self._on_shift_enter)
+        # Ctrl+Enter also sends for convenience
+        self.input_text.bind('<Control-Return>', self._on_shift_enter)
     
     def _attach_file(self):
         """Open file dialog to attach a file"""
@@ -1954,16 +2061,11 @@ class ChatSidebar(tk.Frame):
                 self.attachments_label.config(cursor="")
                 self.status_label.config(text="Attachments cleared")
     
-    def _on_enter(self, event):
-        """Handle Enter key - send message"""
+    def _on_shift_enter(self, event):
+        """Handle Shift+Enter - send message"""
         if not self.is_generating:
             self._send_message()
         return 'break'  # Prevent default newline
-    
-    def _on_ctrl_enter(self, event):
-        """Handle Ctrl+Enter - insert newline"""
-        self.input_text.insert(tk.INSERT, '\n')
-        return 'break'
     
     def _send_message(self):
         """Send message to AI"""
@@ -2062,7 +2164,7 @@ class ChatSidebar(tk.Frame):
         # Save user message to history
         user_msg = ChatMessage(role="user", content=message)
         if self.current_document_id:
-            self.history_manager.add_message(self.current_document_id, user_msg)
+            self.history_manager.add_message(user_msg, self.current_document_id)
         
         # Start async generation
         self.is_generating = True
@@ -2108,7 +2210,7 @@ class ChatSidebar(tk.Frame):
             # Save assistant message to history
             assistant_msg = ChatMessage(role="assistant", content=response_text)
             if self.current_document_id:
-                self.history_manager.add_message(self.current_document_id, assistant_msg)
+                self.history_manager.add_message(assistant_msg, self.current_document_id)
             
             self.response_queue.put(('done', None))
             
@@ -2202,6 +2304,10 @@ class ChatSidebar(tk.Frame):
     
     def set_document_id(self, doc_id: Optional[str]):
         """Set current document ID and load its chat history"""
+        # Only reload if document changed
+        if doc_id == self.current_document_id:
+            return  # Same document, keep current chat display
+        
         self.current_document_id = doc_id
         self._clear_display()
         

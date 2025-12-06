@@ -72,6 +72,58 @@ except ImportError:
     print("Warning: ai_chat module not found. AI chat disabled.")
 
 
+class ToolTip:
+    """Simple tooltip widget for tkinter"""
+    
+    def __init__(self, widget, text, delay=500):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.tooltip_window = None
+        self.scheduled_id = None
+        
+        widget.bind('<Enter>', self._on_enter)
+        widget.bind('<Leave>', self._on_leave)
+        widget.bind('<Button>', self._on_leave)
+    
+    def _on_enter(self, event=None):
+        self._cancel_scheduled()
+        self.scheduled_id = self.widget.after(self.delay, self._show_tooltip)
+    
+    def _on_leave(self, event=None):
+        self._cancel_scheduled()
+        self._hide_tooltip()
+    
+    def _cancel_scheduled(self):
+        if self.scheduled_id:
+            self.widget.after_cancel(self.scheduled_id)
+            self.scheduled_id = None
+    
+    def _show_tooltip(self):
+        if self.tooltip_window:
+            return
+        
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
+        
+        self.tooltip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        
+        label = tk.Label(
+            tw, text=self.text, justify=tk.LEFT,
+            background="#ffffcc", foreground="#000000",
+            relief=tk.SOLID, borderwidth=1,
+            font=("Segoe UI", 9), padx=6, pady=3
+        )
+        label.pack()
+    
+    def _hide_tooltip(self):
+        if self.tooltip_window:
+            self.tooltip_window.destroy()
+            self.tooltip_window = None
+
+
 class ImageExtractor:
     """
     Extracts images from documents alongside MarkItDown conversion.
@@ -1171,6 +1223,11 @@ class MarkdownNotepad(tk.Tk):
         self.focus_original_parent = None
         self.focus_escape_binding = None
         
+        # Recent files
+        self.recent_files = []
+        self.max_recent_files = 10
+        self._load_recent_files()
+        
         # Theme settings
         self.theme = self.DEFAULT_THEME.copy()
         self._load_theme()
@@ -1210,6 +1267,105 @@ class MarkdownNotepad(tk.Tk):
                 json.dump(self.theme, f, indent=2)
         except:
             pass
+    
+    def _load_recent_files(self):
+        """Load recent files list from settings"""
+        recent_path = Path.home() / '.markitdown_recent_files.json'
+        if recent_path.exists():
+            try:
+                with open(recent_path, 'r') as f:
+                    self.recent_files = json.load(f)
+            except:
+                self.recent_files = []
+    
+    def _save_recent_files(self):
+        """Save recent files list to settings"""
+        recent_path = Path.home() / '.markitdown_recent_files.json'
+        try:
+            with open(recent_path, 'w') as f:
+                json.dump(self.recent_files, f, indent=2)
+        except:
+            pass
+    
+    def _add_to_recent_files(self, filepath):
+        """Add a file to the recent files list"""
+        # Normalize path
+        filepath = os.path.normpath(filepath)
+        
+        # Remove if already exists (will re-add at top)
+        if filepath in self.recent_files:
+            self.recent_files.remove(filepath)
+        
+        # Add to beginning
+        self.recent_files.insert(0, filepath)
+        
+        # Trim to max
+        self.recent_files = self.recent_files[:self.max_recent_files]
+        
+        # Save and update menu
+        self._save_recent_files()
+        self._update_recent_files_menu()
+    
+    def _update_recent_files_menu(self):
+        """Update the recent files submenu"""
+        # Clear existing items
+        self.recent_menu.delete(0, tk.END)
+        
+        if self.recent_files:
+            for filepath in self.recent_files:
+                # Show just filename with full path in a truncated form
+                display_name = os.path.basename(filepath)
+                # Use lambda with default arg to capture filepath correctly
+                self.recent_menu.add_command(
+                    label=display_name,
+                    command=lambda f=filepath: self._open_recent_file(f)
+                )
+            
+            self.recent_menu.add_separator()
+            self.recent_menu.add_command(label="Clear Recent Files", command=self._clear_recent_files)
+        else:
+            self.recent_menu.add_command(label="(No recent files)", state=tk.DISABLED)
+    
+    def _open_recent_file(self, filepath):
+        """Open a file from the recent files list"""
+        if not os.path.exists(filepath):
+            if messagebox.askyesno("File Not Found", 
+                                   f"File no longer exists:\n{filepath}\n\nRemove from recent files?"):
+                if filepath in self.recent_files:
+                    self.recent_files.remove(filepath)
+                    self._save_recent_files()
+                    self._update_recent_files_menu()
+            return
+        
+        # Check if already open
+        for tab in self.tabs:
+            if tab.file_path == filepath:
+                self.notebook.select(tab)
+                self._set_status(f"File already open: {os.path.basename(filepath)}")
+                return
+        
+        # Open the file
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            tab = self.new_tab(file_path=filepath, content=content)
+            tab.is_modified = False
+            self._update_tab_title(tab)
+            self._set_status(f"Opened: {filepath}")
+            tab.visual_viewer.set_base_path(os.path.dirname(filepath))
+            
+            # Move to top of recent files
+            self._add_to_recent_files(filepath)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open file:\n{e}")
+    
+    def _clear_recent_files(self):
+        """Clear the recent files list"""
+        self.recent_files = []
+        self._save_recent_files()
+        self._update_recent_files_menu()
+        self._set_status("Recent files cleared")
     
     def _setup_ui(self):
         """Setup the user interface"""
@@ -1262,6 +1418,12 @@ class MarkdownNotepad(tk.Tk):
         file_menu.add_command(label="New Tab", command=self.new_tab, accelerator="Ctrl+N")
         file_menu.add_command(label="Open...", command=self.open_file, accelerator="Ctrl+O")
         file_menu.add_command(label="Open with MarkItDown...", command=self.open_with_markitdown, accelerator="Ctrl+Shift+O")
+        
+        # Recent files submenu
+        self.recent_menu = tk.Menu(file_menu, tearoff=0)
+        file_menu.add_cascade(label="Open Recent", menu=self.recent_menu)
+        self._update_recent_files_menu()
+        
         file_menu.add_separator()
         file_menu.add_command(label="Close Tab", command=self.close_tab, accelerator="Ctrl+W")
         file_menu.add_separator()
@@ -1371,11 +1533,22 @@ class MarkdownNotepad(tk.Tk):
         style = ttk.Style()
         style.configure("Toolbar.TButton", padding=5)
         
-        # File operations
-        ttk.Button(toolbar, text="📄 New", command=self.new_tab, style="Toolbar.TButton").pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="📂 Open", command=self.open_file, style="Toolbar.TButton").pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="🔄 MarkItDown", command=self.open_with_markitdown, style="Toolbar.TButton").pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="💾 Save", command=self.save_file, style="Toolbar.TButton").pack(side=tk.LEFT, padx=2)
+        # File operations with tooltips
+        new_btn = ttk.Button(toolbar, text="New", command=self.new_tab, style="Toolbar.TButton")
+        new_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(new_btn, "New Tab (Ctrl+N)")
+        
+        open_btn = ttk.Button(toolbar, text="Open", command=self.open_file, style="Toolbar.TButton")
+        open_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(open_btn, "Open File (Ctrl+O)")
+        
+        convert_btn = ttk.Button(toolbar, text="Convert", command=self.open_with_markitdown, style="Toolbar.TButton")
+        convert_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(convert_btn, "Open with MarkItDown - Convert PDF, DOCX, etc. (Ctrl+Shift+O)")
+        
+        save_btn = ttk.Button(toolbar, text="Save", command=self.save_file, style="Toolbar.TButton")
+        save_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(save_btn, "Save File (Ctrl+S)")
         
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
         # Mode toggle
@@ -1390,30 +1563,49 @@ class MarkdownNotepad(tk.Tk):
             value="source", command=self._show_source_mode
         )
         self.source_btn.pack(side=tk.LEFT)
+        ToolTip(self.source_btn, "Edit raw markdown (Ctrl+1)")
         
         self.visual_btn = ttk.Radiobutton(
             mode_frame, text="Visual", variable=self.mode_var,
             value="visual", command=self._show_visual_mode
         )
         self.visual_btn.pack(side=tk.LEFT)
+        ToolTip(self.visual_btn, "Visual rendered view (Ctrl+2)")
         
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
         
-        # Format buttons (for source mode)
-        ttk.Button(toolbar, text="B", command=lambda: self._insert_format("**", "**"), width=3).pack(side=tk.LEFT, padx=1)
-        ttk.Button(toolbar, text="I", command=lambda: self._insert_format("*", "*"), width=3).pack(side=tk.LEFT, padx=1)
-        ttk.Button(toolbar, text="</>" , command=lambda: self._insert_format("`", "`"), width=3).pack(side=tk.LEFT, padx=1)
-        ttk.Button(toolbar, text="🔗", command=lambda: self._insert_format("[", "](url)"), width=3).pack(side=tk.LEFT, padx=1)
-        ttk.Button(toolbar, text="🖼️", command=self.insert_image, width=3).pack(side=tk.LEFT, padx=1)
+        # Format buttons (for source mode) with tooltips
+        bold_btn = ttk.Button(toolbar, text="B", command=lambda: self._insert_format("**", "**"), width=3)
+        bold_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(bold_btn, "Bold (Ctrl+B)")
+        
+        italic_btn = ttk.Button(toolbar, text="I", command=lambda: self._insert_format("*", "*"), width=3)
+        italic_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(italic_btn, "Italic (Ctrl+I)")
+        
+        code_btn = ttk.Button(toolbar, text="</>", command=lambda: self._insert_format("`", "`"), width=3)
+        code_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(code_btn, "Inline Code (Ctrl+`)")
+        
+        link_btn = ttk.Button(toolbar, text="Link", command=lambda: self._insert_format("[", "](url)"), width=4)
+        link_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(link_btn, "Insert Link")
+        
+        img_btn = ttk.Button(toolbar, text="Image", command=self.insert_image, width=5)
+        img_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(img_btn, "Insert Image (Ctrl+Shift+I)")
         
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
         
         # Theme button
-        ttk.Button(toolbar, text="🎨 Theme", command=self.open_theme_dialog, style="Toolbar.TButton").pack(side=tk.LEFT, padx=2)
+        theme_btn = ttk.Button(toolbar, text="Theme", command=self.open_theme_dialog, style="Toolbar.TButton")
+        theme_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(theme_btn, "Change color theme")
         
         # AI sidebar toggle button (on the right side)
-        self.ai_sidebar_btn = ttk.Button(toolbar, text="💬 AI", command=self._toggle_ai_sidebar, style="Toolbar.TButton")
+        self.ai_sidebar_btn = ttk.Button(toolbar, text="AI Chat", command=self._toggle_ai_sidebar, style="Toolbar.TButton")
         self.ai_sidebar_btn.pack(side=tk.RIGHT, padx=2)
+        ToolTip(self.ai_sidebar_btn, "Toggle AI Assistant Sidebar (Ctrl+Shift+A)")
     
     def _create_status_bar(self):
         """Create the status bar"""
@@ -1425,6 +1617,10 @@ class MarkdownNotepad(tk.Tk):
         
         self.position_label = ttk.Label(self.status_bar, text="Line 1, Col 1")
         self.position_label.pack(side=tk.RIGHT, padx=10)
+        
+        # Word and character count
+        self.word_count_label = ttk.Label(self.status_bar, text="Words: 0 | Chars: 0")
+        self.word_count_label.pack(side=tk.RIGHT, padx=10)
         
         # Zoom indicator
         self.zoom_label = ttk.Label(self.status_bar, text="100%")
@@ -1653,7 +1849,7 @@ class MarkdownNotepad(tk.Tk):
             # Hide sidebar
             self.main_paned.forget(self.ai_sidebar_frame)
             self.ai_sidebar_visible = False
-            self.ai_sidebar_btn.config(text="💬 AI")
+            self.ai_sidebar_btn.config(text="AI Chat")
             self._set_status("AI sidebar hidden")
         else:
             # Show sidebar
@@ -1668,7 +1864,7 @@ class MarkdownNotepad(tk.Tk):
                 except:
                     pass
             self.ai_sidebar_visible = True
-            self.ai_sidebar_btn.config(text="💬 AI ✓")
+            self.ai_sidebar_btn.config(text="AI Chat [ON]")
             self._set_status("AI sidebar shown - Configure API key in Settings")
             
             # Update sidebar with current document context
@@ -1857,6 +2053,7 @@ class MarkdownNotepad(tk.Tk):
                         self._update_title()
                         self._update_mode_display()
                         self._update_position()
+                        self._update_word_count()
                         # Update AI sidebar context for new tab
                         self._update_ai_sidebar_context()
                         break
@@ -1928,6 +2125,7 @@ class MarkdownNotepad(tk.Tk):
         """Actually update position after debounce"""
         self._position_update_pending = False
         self._update_position()
+        self._update_word_count()
     
     def _on_modified(self, event=None):
         """Handle text modification - called by tab's source editor"""
@@ -1944,6 +2142,21 @@ class MarkdownNotepad(tk.Tk):
                 pos = self.current_tab.source_editor.index(tk.INSERT)
                 line, col = pos.split('.')
                 self.position_label.config(text=f"Line {line}, Col {int(col)+1}")
+        except:
+            pass
+    
+    def _update_word_count(self):
+        """Update word and character count in status bar"""
+        try:
+            if self.current_tab:
+                content = self.current_tab.get_content()
+                char_count = len(content)
+                # Count words (split on whitespace)
+                words = content.split()
+                word_count = len(words)
+                self.word_count_label.config(text=f"Words: {word_count} | Chars: {char_count}")
+            else:
+                self.word_count_label.config(text="Words: 0 | Chars: 0")
         except:
             pass
     
@@ -2298,6 +2511,9 @@ class MarkdownNotepad(tk.Tk):
                 
                 # Update visual viewer base path for relative image resolution
                 tab.visual_viewer.set_base_path(os.path.dirname(filepath))
+                
+                # Add to recent files
+                self._add_to_recent_files(filepath)
             except Exception as e:
                 messagebox.showerror("Error", f"Could not open file:\n{e}")
     
@@ -2444,6 +2660,9 @@ class MarkdownNotepad(tk.Tk):
                 
                 # Update visual viewer base path
                 self.current_tab.visual_viewer.set_base_path(os.path.dirname(filepath))
+                
+                # Add to recent files
+                self._add_to_recent_files(filepath)
                 return True
             except Exception as e:
                 messagebox.showerror("Error", f"Could not save file:\n{e}")
