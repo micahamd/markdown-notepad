@@ -80,6 +80,9 @@ def get_available_fonts():
 def select_best_font(preferred_fonts, fallback="TkDefaultFont"):
     """Select the first available font from a list of preferences"""
     available = get_available_fonts()
+    if not available:  # If no fonts available, return fallback
+        return fallback
+    
     available_lower = [f.lower() for f in available]
     
     for font_name in preferred_fonts:
@@ -93,7 +96,8 @@ def select_best_font(preferred_fonts, fallback="TkDefaultFont"):
 SANS_SERIF_FONTS = ["Segoe UI", "SF Pro Display", "Ubuntu", "DejaVu Sans", "Arial", "Helvetica"]
 MONOSPACE_FONTS = ["Consolas", "SF Mono", "Monaco", "Ubuntu Mono", "DejaVu Sans Mono", "Courier New"]
 
-# Select best available fonts at startup
+# Font selection deferred until Tkinter root window exists
+# Will use fallbacks if fonts can't be detected yet
 SANS_FONT = select_best_font(SANS_SERIF_FONTS, "TkDefaultFont")
 MONO_FONT = select_best_font(MONOSPACE_FONTS, "TkFixedFont")
 
@@ -351,6 +355,14 @@ class AISettings:
         self.settings['gemini_api_key'] = value
     
     @property
+    def deepseek_api_key(self) -> str:
+        return self.settings.get('deepseek_api_key', '')
+    
+    @deepseek_api_key.setter
+    def deepseek_api_key(self, value: str):
+        self.settings['deepseek_api_key'] = value
+    
+    @property
     def ollama_url(self) -> str:
         return self.settings.get('ollama_url', 'http://localhost:11434')
     
@@ -362,6 +374,8 @@ class AISettings:
         """Check if API key is configured for current provider"""
         if self.provider == 'gemini':
             return bool(self.gemini_api_key)
+        elif self.provider == 'deepseek':
+            return bool(self.deepseek_api_key)
         elif self.provider == 'ollama':
             return bool(self.ollama_url)  # Ollama doesn't need API key
         return bool(self.api_key)
@@ -372,6 +386,8 @@ class AISettings:
             return self.ANTHROPIC_MODELS.copy()
         elif self.provider == 'gemini':
             return self.GEMINI_MODELS.copy()
+        elif self.provider == 'deepseek':
+            return self.DEEPSEEK_MODELS.copy()
         elif self.provider == 'ollama':
             return self.OLLAMA_MODELS.copy()
         return []
@@ -380,6 +396,8 @@ class AISettings:
         """Get API key for current provider"""
         if self.provider == 'gemini':
             return self.gemini_api_key
+        elif self.provider == 'deepseek':
+            return self.deepseek_api_key
         elif self.provider == 'ollama':
             return ''  # Ollama doesn't use API keys
         return self.api_key

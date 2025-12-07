@@ -81,7 +81,7 @@ def get_available_fonts():
     try:
         return sorted(font.families())
     except Exception as e:
-        print(f"Error getting system fonts: {e}")
+        # This can fail if called before Tkinter root window exists
         return []
 
 def select_best_font(preferred_fonts, fallback="TkDefaultFont"):
@@ -96,6 +96,9 @@ def select_best_font(preferred_fonts, fallback="TkDefaultFont"):
         Name of the first available font, or fallback
     """
     available = get_available_fonts()
+    if not available:  # If no fonts available, return fallback
+        return fallback
+    
     available_lower = [f.lower() for f in available]
     
     for font_name in preferred_fonts:
@@ -110,9 +113,9 @@ def select_best_font(preferred_fonts, fallback="TkDefaultFont"):
 SANS_SERIF_FONTS = ["Segoe UI", "SF Pro Display", "Ubuntu", "DejaVu Sans", "Arial", "Helvetica"]
 MONOSPACE_FONTS = ["Consolas", "SF Mono", "Monaco", "Ubuntu Mono", "DejaVu Sans Mono", "Courier New"]
 
-# Select best available fonts at startup
-SANS_FONT = select_best_font(SANS_SERIF_FONTS, "TkDefaultFont")
-MONO_FONT = select_best_font(MONOSPACE_FONTS, "TkFixedFont")
+# Font selection will be done after Tkinter root window is created
+SANS_FONT = None
+MONO_FONT = None
 
 
 # =============================================================================
@@ -1246,6 +1249,13 @@ class MarkdownNotepad(tk.Tk):
     
     def __init__(self):
         super().__init__()
+        
+        # Initialize fonts now that Tkinter root exists
+        global SANS_FONT, MONO_FONT
+        if SANS_FONT is None:
+            SANS_FONT = select_best_font(SANS_SERIF_FONTS, "TkDefaultFont")
+        if MONO_FONT is None:
+            MONO_FONT = select_best_font(MONOSPACE_FONTS, "TkFixedFont")
         
         self.title("MarkItDown Notepad")
         self.geometry("1000x700")
