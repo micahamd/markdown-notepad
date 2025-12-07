@@ -72,6 +72,53 @@ except ImportError:
     print("Warning: ai_chat module not found. AI chat disabled.")
 
 
+# =============================================================================
+# Font Detection Utilities
+# =============================================================================
+
+def get_available_fonts():
+    """Get list of available system fonts for tkinter"""
+    try:
+        return sorted(font.families())
+    except Exception as e:
+        print(f"Error getting system fonts: {e}")
+        return []
+
+def select_best_font(preferred_fonts, fallback="TkDefaultFont"):
+    """
+    Select the first available font from a list of preferences.
+    
+    Args:
+        preferred_fonts: List of font names in order of preference
+        fallback: Default font to use if none are available
+    
+    Returns:
+        Name of the first available font, or fallback
+    """
+    available = get_available_fonts()
+    available_lower = [f.lower() for f in available]
+    
+    for font_name in preferred_fonts:
+        if font_name.lower() in available_lower:
+            # Return the properly cased version from the system
+            idx = available_lower.index(font_name.lower())
+            return available[idx]
+    
+    return fallback
+
+# Define cross-platform font preferences
+SANS_SERIF_FONTS = ["Segoe UI", "SF Pro Display", "Ubuntu", "DejaVu Sans", "Arial", "Helvetica"]
+MONOSPACE_FONTS = ["Consolas", "SF Mono", "Monaco", "Ubuntu Mono", "DejaVu Sans Mono", "Courier New"]
+
+# Select best available fonts at startup
+SANS_FONT = select_best_font(SANS_SERIF_FONTS, "TkDefaultFont")
+MONO_FONT = select_best_font(MONOSPACE_FONTS, "TkFixedFont")
+
+
+# =============================================================================
+# UI Components
+# =============================================================================
+
 class ToolTip:
     """Simple tooltip widget for tkinter"""
     
@@ -114,7 +161,7 @@ class ToolTip:
             tw, text=self.text, justify=tk.LEFT,
             background="#ffffcc", foreground="#000000",
             relief=tk.SOLID, borderwidth=1,
-            font=("Segoe UI", 9), padx=6, pady=3
+            font=(SANS_FONT, 9), padx=6, pady=3
         )
         label.pack()
     
@@ -1026,43 +1073,43 @@ class MarkdownVisualWidget(tk.Frame):
         tw = self.text_widget
         
         # Heading styles - improved spacing for document flow
-        tw.tag_configure("h1", font=("Segoe UI", 26, "bold"), spacing1=20, spacing3=12, foreground="#1a1a2e")
-        tw.tag_configure("h2", font=("Segoe UI", 22, "bold"), spacing1=18, spacing3=10, foreground="#16213e")
-        tw.tag_configure("h3", font=("Segoe UI", 18, "bold"), spacing1=14, spacing3=8, foreground="#1f4068")
-        tw.tag_configure("h4", font=("Segoe UI", 15, "bold"), spacing1=10, spacing3=6, foreground="#1b1b2f")
-        tw.tag_configure("h5", font=("Segoe UI", 13, "bold"), spacing1=8, spacing3=4, foreground="#1b1b2f")
-        tw.tag_configure("h6", font=("Segoe UI", 12, "bold"), spacing1=6, spacing3=3, foreground="#1b1b2f")
+        tw.tag_configure("h1", font=(SANS_FONT, 26, "bold"), spacing1=20, spacing3=12, foreground="#1a1a2e")
+        tw.tag_configure("h2", font=(SANS_FONT, 22, "bold"), spacing1=18, spacing3=10, foreground="#16213e")
+        tw.tag_configure("h3", font=(SANS_FONT, 18, "bold"), spacing1=14, spacing3=8, foreground="#1f4068")
+        tw.tag_configure("h4", font=(SANS_FONT, 15, "bold"), spacing1=10, spacing3=6, foreground="#1b1b2f")
+        tw.tag_configure("h5", font=(SANS_FONT, 13, "bold"), spacing1=8, spacing3=4, foreground="#1b1b2f")
+        tw.tag_configure("h6", font=(SANS_FONT, 12, "bold"), spacing1=6, spacing3=3, foreground="#1b1b2f")
         
         # Inline styles
-        tw.tag_configure("bold", font=("Segoe UI", 11, "bold"))
-        tw.tag_configure("italic", font=("Segoe UI", 11, "italic"))
-        tw.tag_configure("code", font=("Consolas", 10), background="#f5f2f0", foreground="#c7254e",
+        tw.tag_configure("bold", font=(SANS_FONT, 11, "bold"))
+        tw.tag_configure("italic", font=(SANS_FONT, 11, "italic"))
+        tw.tag_configure("code", font=(MONO_FONT, 10), background="#f5f2f0", foreground="#c7254e",
                         relief=tk.FLAT)
-        tw.tag_configure("code_block", font=("Consolas", 10), background="#282c34", foreground="#abb2bf", 
+        tw.tag_configure("code_block", font=(MONO_FONT, 10), background="#282c34", foreground="#abb2bf", 
                         spacing1=10, spacing3=10, lmargin1=25, lmargin2=25, rmargin=25)
         
         # Block styles
-        tw.tag_configure("blockquote", font=("Segoe UI", 11, "italic"), foreground="#6c757d", 
+        tw.tag_configure("blockquote", font=(SANS_FONT, 11, "italic"), foreground="#6c757d", 
                         lmargin1=40, lmargin2=40, spacing1=5, spacing3=5,
                         background="#f8f9fa")
         tw.tag_configure("list_item", lmargin1=25, lmargin2=45, spacing1=2, spacing3=2)
         tw.tag_configure("link", foreground="#0066cc", underline=True)
-        tw.tag_configure("hr", font=("Segoe UI", 2), foreground="#dee2e6", spacing1=15, spacing3=15)
+        tw.tag_configure("hr", font=(SANS_FONT, 2), foreground="#dee2e6", spacing1=15, spacing3=15)
         
         # Table styles
-        tw.tag_configure("table", font=("Consolas", 10), background="#f8f9fa", lmargin1=15, 
+        tw.tag_configure("table", font=(MONO_FONT, 10), background="#f8f9fa", lmargin1=15, 
                         spacing1=5, spacing3=5)
-        tw.tag_configure("table_border", font=("Consolas", 10), foreground="#6c757d", 
+        tw.tag_configure("table_border", font=(MONO_FONT, 10), foreground="#6c757d", 
                         lmargin1=20, lmargin2=20)
-        tw.tag_configure("table_header", font=("Consolas", 10, "bold"), background="#e9ecef",
+        tw.tag_configure("table_header", font=(MONO_FONT, 10, "bold"), background="#e9ecef",
                         lmargin1=20, lmargin2=20)
-        tw.tag_configure("table_cell", font=("Consolas", 10), background="#f8f9fa",
+        tw.tag_configure("table_cell", font=(MONO_FONT, 10), background="#f8f9fa",
                         lmargin1=20, lmargin2=20)
         
         # Image styles
-        tw.tag_configure("image_caption", font=("Segoe UI", 9, "italic"), foreground="#6c757d",
+        tw.tag_configure("image_caption", font=(SANS_FONT, 9, "italic"), foreground="#6c757d",
                         spacing1=3, spacing3=8, justify="center")
-        tw.tag_configure("image_placeholder", font=("Segoe UI", 10), foreground="#868e96", 
+        tw.tag_configure("image_placeholder", font=(SANS_FONT, 10), foreground="#868e96", 
                         background="#f1f3f5", lmargin1=25, spacing1=5, spacing3=5)
         
         # Paragraph spacing (normal text)
@@ -1185,15 +1232,15 @@ class DocumentTab(ttk.Frame):
 class MarkdownNotepad(tk.Tk):
     """Main application window"""
     
-    # Default theme settings
+    # Default theme settings (using detected system fonts)
     DEFAULT_THEME = {
         'source_bg': '#fefefe',
         'source_fg': '#1a1a1a',
-        'source_font': 'Consolas',
+        'source_font': MONO_FONT,
         'source_font_size': 11,
         'visual_bg': '#ffffff',
         'visual_fg': '#1a1a1a',
-        'visual_font': 'Segoe UI',
+        'visual_font': SANS_FONT,
         'visual_font_size': 11,
     }
     

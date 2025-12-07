@@ -2,7 +2,7 @@
 AI Chat Module for MarkItDown Notepad
 
 Provides AI chatbot functionality with support for multiple LLM providers.
-Currently implements Anthropic Claude, with architecture ready for Google, Deepseek, etc.
+Currently implements Anthropic Claude, Google Gemini, DeepSeek, and Ollama.
 """
 
 import json
@@ -17,7 +17,7 @@ from typing import List, Dict, Any, Optional, Callable, Iterator
 from dataclasses import dataclass, field, asdict
 from abc import ABC, abstractmethod
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext, filedialog
+from tkinter import ttk, messagebox, scrolledtext, filedialog, font
 
 # Try to import PIL for image handling
 try:
@@ -50,12 +50,52 @@ except ImportError:
     OLLAMA_AVAILABLE = False
     print("Warning: ollama not installed. Install with: pip install ollama")
 
+# Try to import OpenAI (for DeepSeek)
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    print("Warning: openai not installed. Install with: pip install openai")
+
 # Import requests for Ollama connectivity check
 try:
     import requests
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
+
+
+# =============================================================================
+# Font Detection Utilities
+# =============================================================================
+
+def get_available_fonts():
+    """Get list of available system fonts for tkinter"""
+    try:
+        return sorted(font.families())
+    except Exception:
+        return []
+
+def select_best_font(preferred_fonts, fallback="TkDefaultFont"):
+    """Select the first available font from a list of preferences"""
+    available = get_available_fonts()
+    available_lower = [f.lower() for f in available]
+    
+    for font_name in preferred_fonts:
+        if font_name.lower() in available_lower:
+            idx = available_lower.index(font_name.lower())
+            return available[idx]
+    
+    return fallback
+
+# Define cross-platform font preferences
+SANS_SERIF_FONTS = ["Segoe UI", "SF Pro Display", "Ubuntu", "DejaVu Sans", "Arial", "Helvetica"]
+MONOSPACE_FONTS = ["Consolas", "SF Mono", "Monaco", "Ubuntu Mono", "DejaVu Sans Mono", "Courier New"]
+
+# Select best available fonts at startup
+SANS_FONT = select_best_font(SANS_SERIF_FONTS, "TkDefaultFont")
+MONO_FONT = select_best_font(MONOSPACE_FONTS, "TkFixedFont")
 
 
 class ToolTip:
@@ -100,7 +140,7 @@ class ToolTip:
             tw, text=self.text, justify=tk.LEFT,
             background="#ffffcc", foreground="#000000",
             relief=tk.SOLID, borderwidth=1,
-            font=("Segoe UI", 9), padx=6, pady=3
+            font=(SANS_FONT, 9), padx=6, pady=3
         )
         label.pack()
     
@@ -169,10 +209,17 @@ class AISettings:
         "phi3",
     ]
     
+    # Default DeepSeek models
+    DEEPSEEK_MODELS = [
+        "deepseek-chat",
+        "deepseek-reasoner",
+    ]
+    
     DEFAULT_SETTINGS = {
         'provider': 'anthropic',
         'api_key': '',
         'gemini_api_key': '',  # Separate API key for Gemini
+        'deepseek_api_key': '',  # Separate API key for DeepSeek
         'ollama_url': 'http://localhost:11434',  # Ollama server URL
         'model': 'claude-sonnet-4-20250514',
         'system_prompt': 'You are a helpful AI assistant. You help users with their markdown documents, answer questions, and provide writing assistance.',
@@ -185,6 +232,7 @@ class AISettings:
         'cached_anthropic_models': [],
         'cached_gemini_models': [],
         'cached_ollama_models': [],
+        'cached_deepseek_models': [],
     }
     
     def __init__(self):
@@ -1327,6 +1375,207 @@ class OllamaClient(LLMClient):
 
 
 # =============================================================================
+# DeepSeek Client
+# =============================================================================
+
+class DeepSeekClient(LLMClient):
+    """Client for DeepSeek API (using OpenAI-compatible interface)"""
+    
+    DEFAULT_MODELS = [
+        "deepseek-chat",
+        "deepseek-reasoner",
+    ]
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.client = None
+        self._cached_models = []
+        
+        if OPENAI_AVAILABLE and api_key:
+            try:
+                self.client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+            except Exception as e:
+                print(f"Error initializing DeepSeek client: {e}")
+    
+    def _convert_messages_to_api_format(self, messages: List[ChatMessage]) -> List[Dict]:
+        """Convert ChatMessage objects to DeepSeek API format"""
+        api_messages = []
+        for msg in messages:
+            content = []
+            
+            # Add text content
+            if msg.content:
+                content.append({
+                    "type": "text",
+                    "text": msg.content
+                })
+            
+            # Add images if present (DeepSeek supports vision)
+            if msg.images:
+                for img_b64 in msg.images:
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img_b64}"
+                        }
+                    })
+            
+            api_messages.append({
+                "role": msg.role,
+                "content": content if len(content) > 1 else msg.content
+            })
+        
+        return api_messages
+    
+    def send_message(
+        self,
+        messages: List[ChatMessage],
+        system_prompt: str = "",
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        on_chunk: Optional[Callable[[str], None]] = None
+    ) -> str:
+        """Send a message and get a response"""
+        if not self.client:
+            raise ValueError("DeepSeek client not initialized. Check API key.")
+        
+        api_messages = self._convert_messages_to_api_format(messages)
+        
+        # Add system prompt as first message if provided
+        if system_prompt:
+            api_messages.insert(0, {"role": "system", "content": system_prompt})
+        
+        try:
+            if on_chunk:
+                # Streaming response
+                full_response = ""
+                stream = self.client.chat.completions.create(
+                    model=self.settings.model if hasattr(self, 'settings') else "deepseek-chat",
+                    messages=api_messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stream=True
+                )
+                for chunk in stream:
+                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                        text = chunk.choices[0].delta.content
+                        full_response += text
+                        on_chunk(text)
+                return full_response
+            else:
+                # Non-streaming response
+                response = self.client.chat.completions.create(
+                    model=self.settings.model if hasattr(self, 'settings') else "deepseek-chat",
+                    messages=api_messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature
+                )
+                return response.choices[0].message.content
+        except Exception as e:
+            error_msg = str(e)
+            if "authentication" in error_msg.lower() or "api_key" in error_msg.lower():
+                raise ValueError("Invalid API key. Please check your DeepSeek API key.")
+            elif "rate_limit" in error_msg.lower():
+                raise RuntimeError("Rate limit exceeded. Please wait before sending more messages.")
+            else:
+                raise RuntimeError(f"DeepSeek API error: {error_msg}")
+    
+    def get_available_models(self) -> List[str]:
+        """Get list of available DeepSeek models"""
+        # DeepSeek doesn't provide a models endpoint, return static list
+        return self.DEFAULT_MODELS.copy()
+    
+    def send_message_stream(
+        self,
+        messages: List[Dict],
+        system_prompt: str = "",
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        images: Optional[List[str]] = None,
+        model: Optional[str] = None
+    ) -> Iterator[str]:
+        """Send messages and stream the response"""
+        if not self.client:
+            # Reinitialize client if API key was updated
+            if OPENAI_AVAILABLE and self.api_key:
+                self.client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+            else:
+                raise ValueError("DeepSeek client not initialized.")
+        
+        model_name = model or "deepseek-chat"
+        
+        # Build messages
+        api_messages = []
+        if system_prompt:
+            api_messages.append({"role": "system", "content": system_prompt})
+        
+        for msg in messages:
+            content = []
+            
+            # Add text
+            if msg.get('content'):
+                content.append({
+                    "type": "text",
+                    "text": msg['content']
+                })
+            
+            # Add images
+            if images:
+                for img_b64 in images:
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img_b64}"
+                        }
+                    })
+            
+            api_messages.append({
+                "role": msg.get('role', 'user'),
+                "content": content if len(content) > 1 else msg.get('content', '')
+            })
+        
+        try:
+            stream = self.client.chat.completions.create(
+                model=model_name,
+                messages=api_messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stream=True
+            )
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+        except Exception as e:
+            raise RuntimeError(f"DeepSeek error: {str(e)}")
+    
+    def test_connection(self) -> tuple[bool, str]:
+        """Test connection to DeepSeek API"""
+        if not OPENAI_AVAILABLE:
+            return False, "OpenAI library not installed. Install with: pip install openai"
+        
+        if not self.api_key:
+            return False, "No API key provided."
+        
+        try:
+            # Make a minimal test request
+            response = self.client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": "test"}],
+                max_tokens=5
+            )
+            return True, "Connected successfully!"
+        except Exception as e:
+            error_msg = str(e)
+            if "authentication" in error_msg.lower() or "api_key" in error_msg.lower():
+                return False, "Invalid API key."
+            else:
+                return False, f"Error: {error_msg}"
+
+
+# =============================================================================
 # LLM Client Factory
 # =============================================================================
 
@@ -1348,6 +1597,11 @@ def get_llm_client(settings: AISettings) -> Optional[LLMClient]:
         if not OLLAMA_AVAILABLE:
             return None
         return OllamaClient(settings.ollama_url)
+    
+    elif provider == 'deepseek':
+        if not OPENAI_AVAILABLE:
+            return None
+        return DeepSeekClient(settings.deepseek_api_key)
     
     return None
 
@@ -1417,7 +1671,7 @@ class AISettingsDialog(tk.Toplevel):
         ttk.Label(provider_frame, text="AI Provider:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.provider_var = tk.StringVar(value="anthropic")
         provider_combo = ttk.Combobox(provider_frame, textvariable=self.provider_var, 
-                                       values=["anthropic", "gemini", "ollama"], state="readonly", width=30)
+                                       values=["anthropic", "gemini", "deepseek", "ollama"], state="readonly", width=30)
         provider_combo.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
         provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
         
@@ -1449,13 +1703,25 @@ class AISettingsDialog(tk.Toplevel):
         ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('gemini'),
                    width=6).grid(row=1, column=3, padx=(5, 0))
         
+        # DeepSeek API Key
+        ttk.Label(api_frame, text="DeepSeek:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.deepseek_key_var = tk.StringVar()
+        self.deepseek_key_entry = ttk.Entry(api_frame, textvariable=self.deepseek_key_var, width=40, show="•")
+        self.deepseek_key_entry.grid(row=2, column=1, sticky=tk.W, padx=(10, 0))
+        
+        self.show_deepseek_key_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(api_frame, text="Show", variable=self.show_deepseek_key_var,
+                        command=self._toggle_deepseek_key_visibility).grid(row=2, column=2, padx=(5, 0))
+        ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('deepseek'),
+                   width=6).grid(row=2, column=3, padx=(5, 0))
+        
         # Ollama URL
-        ttk.Label(api_frame, text="Ollama URL:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        ttk.Label(api_frame, text="Ollama URL:").grid(row=3, column=0, sticky=tk.W, pady=5)
         self.ollama_url_var = tk.StringVar(value="http://localhost:11434")
         self.ollama_url_entry = ttk.Entry(api_frame, textvariable=self.ollama_url_var, width=40)
-        self.ollama_url_entry.grid(row=2, column=1, sticky=tk.W, padx=(10, 0))
+        self.ollama_url_entry.grid(row=3, column=1, sticky=tk.W, padx=(10, 0))
         ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('ollama'),
-                   width=6).grid(row=2, column=3, padx=(5, 0))
+                   width=6).grid(row=3, column=3, padx=(5, 0))
         
         # Model selection
         model_frame = ttk.LabelFrame(main_frame, text="Model", padding=10)
@@ -1558,6 +1824,7 @@ class AISettingsDialog(tk.Toplevel):
         self.provider_var.set(self.settings.provider)
         self.api_key_var.set(self.settings.api_key)
         self.gemini_key_var.set(self.settings.gemini_api_key)
+        self.deepseek_key_var.set(self.settings.deepseek_api_key)
         self.ollama_url_var.set(self.settings.ollama_url)
         self.model_var.set(self.settings.model)
         self.max_tokens_var.set(self.settings.max_tokens)
@@ -1575,6 +1842,8 @@ class AISettingsDialog(tk.Toplevel):
             self.api_key_entry.config(show="•")
         if self.settings.gemini_api_key:
             self.gemini_key_entry.config(show="•")
+        if self.settings.deepseek_api_key:
+            self.deepseek_key_entry.config(show="•")
     
     def _toggle_key_visibility(self):
         """Toggle Anthropic API key visibility"""
@@ -1589,6 +1858,13 @@ class AISettingsDialog(tk.Toplevel):
             self.gemini_key_entry.config(show="")
         else:
             self.gemini_key_entry.config(show="•")
+    
+    def _toggle_deepseek_key_visibility(self):
+        """Toggle DeepSeek API key visibility"""
+        if self.show_deepseek_key_var.get():
+            self.deepseek_key_entry.config(show="")
+        else:
+            self.deepseek_key_entry.config(show="•")
     
     def _update_temp_label(self, *args):
         """Update temperature label"""
@@ -1614,6 +1890,12 @@ class AISettingsDialog(tk.Toplevel):
         elif provider == 'gemini':
             cached = self.settings.get('cached_gemini_models', [])
             models = cached if cached else AISettings.GEMINI_MODELS
+            self.model_combo['values'] = models
+            if current_model not in models:
+                self.model_var.set(models[0] if models else '')
+        elif provider == 'deepseek':
+            cached = self.settings.get('cached_deepseek_models', [])
+            models = cached if cached else AISettings.DEEPSEEK_MODELS
             self.model_combo['values'] = models
             if current_model not in models:
                 self.model_var.set(models[0] if models else '')
@@ -1666,6 +1948,25 @@ class AISettingsDialog(tk.Toplevel):
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to fetch models: {str(e)}", parent=self)
         
+        elif provider == 'deepseek':
+            api_key = self.deepseek_key_var.get()
+            if not api_key:
+                messagebox.showwarning("Warning", "Please enter a DeepSeek API key first.", parent=self)
+                return
+            try:
+                client = DeepSeekClient(api_key)
+                models = client.get_available_models()
+                if models:
+                    self.model_combo['values'] = models
+                    # Cache the models to settings
+                    self.settings.set('cached_deepseek_models', models)
+                    self.settings.save()
+                    messagebox.showinfo("Success", f"Found {len(models)} DeepSeek models (cached).", parent=self)
+                else:
+                    messagebox.showwarning("Warning", "No models found.", parent=self)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to fetch models: {str(e)}", parent=self)
+        
         elif provider == 'ollama':
             ollama_url = self.ollama_url_var.get()
             try:
@@ -1702,6 +2003,13 @@ class AISettingsDialog(tk.Toplevel):
                 return
             client = GeminiClient(api_key)
             success, message = client.test_connection()
+        elif provider == 'deepseek':
+            api_key = self.deepseek_key_var.get()
+            if not api_key:
+                messagebox.showwarning("Warning", "Please enter a DeepSeek API key first.", parent=self)
+                return
+            client = DeepSeekClient(api_key)
+            success, message = client.test_connection()
         elif provider == 'ollama':
             ollama_url = self.ollama_url_var.get()
             client = OllamaClient(ollama_url)
@@ -1737,6 +2045,7 @@ class AISettingsDialog(tk.Toplevel):
         self.settings.provider = self.provider_var.get()
         self.settings.api_key = self.api_key_var.get()
         self.settings.gemini_api_key = self.gemini_key_var.get()
+        self.settings.deepseek_api_key = self.deepseek_key_var.get()
         self.settings.ollama_url = self.ollama_url_var.get()
         self.settings.model = self.model_var.get()
         self.settings.max_tokens = self.max_tokens_var.get()
@@ -1833,7 +2142,7 @@ class ChatSidebar(tk.Frame):
         header_frame = tk.Frame(self, bg='#e0e0e0')
         header_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        tk.Label(header_frame, text="AI Assistant", font=('Segoe UI', 11, 'bold'),
+        tk.Label(header_frame, text="AI Assistant", font=(SANS_FONT, 11, 'bold'),
                  bg='#e0e0e0').pack(side=tk.LEFT, padx=5)
         
         # Settings button
@@ -1855,7 +2164,7 @@ class ChatSidebar(tk.Frame):
         self.chat_display = scrolledtext.ScrolledText(
             chat_frame,
             wrap=tk.WORD,
-            font=('Segoe UI', 10),
+            font=(SANS_FONT, 10),
             bg='#ffffff',
             fg='#1a1a1a',
             state=tk.DISABLED,
@@ -1864,11 +2173,11 @@ class ChatSidebar(tk.Frame):
         self.chat_display.pack(fill=tk.BOTH, expand=True)
         
         # Configure tags for styling
-        self.chat_display.tag_configure('user', foreground='#0066cc', font=('Segoe UI', 10, 'bold'))
-        self.chat_display.tag_configure('assistant', foreground='#006600', font=('Segoe UI', 10, 'bold'))
-        self.chat_display.tag_configure('system', foreground='#666666', font=('Segoe UI', 9, 'italic'))
+        self.chat_display.tag_configure('user', foreground='#0066cc', font=(SANS_FONT, 10, 'bold'))
+        self.chat_display.tag_configure('assistant', foreground='#006600', font=(SANS_FONT, 10, 'bold'))
+        self.chat_display.tag_configure('system', foreground='#666666', font=(SANS_FONT, 9, 'italic'))
         self.chat_display.tag_configure('error', foreground='#cc0000')
-        self.chat_display.tag_configure('message', font=('Segoe UI', 10))
+        self.chat_display.tag_configure('message', font=(SANS_FONT, 10))
         
         # Options frame
         options_frame = tk.Frame(self, bg='#f0f0f0')
