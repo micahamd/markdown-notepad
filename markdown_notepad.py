@@ -3058,8 +3058,9 @@ class ThemeDialog(tk.Toplevel):
         self.on_apply = on_apply
         
         self.title("Theme Settings")
-        self.geometry("450x480")
-        self.resizable(False, False)
+        self.geometry("500x580")
+        self.resizable(True, True)
+        self.minsize(450, 550)  # Set minimum size to prevent UI elements from overlapping
         self.transient(parent)
         
         self._setup_ui()
@@ -3113,10 +3114,10 @@ class ThemeDialog(tk.Toplevel):
         font_frame.pack(fill=tk.X, pady=2)
         ttk.Label(font_frame, text="Font:", width=12).pack(side=tk.LEFT)
         self.source_font_var = tk.StringVar(value=self.theme['source_font'])
-        font_combo = ttk.Combobox(font_frame, textvariable=self.source_font_var, width=15,
+        self.source_font_combo = ttk.Combobox(font_frame, textvariable=self.source_font_var, width=15,
                                   values=['Consolas', 'Courier New', 'Cascadia Code', 'Fira Code', 
                                          'Source Code Pro', 'Monaco', 'Menlo'])
-        font_combo.pack(side=tk.LEFT, padx=2)
+        self.source_font_combo.pack(side=tk.LEFT, padx=2)
         
         # Font size
         ttk.Label(font_frame, text="Size:").pack(side=tk.LEFT, padx=(10, 2))
@@ -3153,16 +3154,25 @@ class ThemeDialog(tk.Toplevel):
         vfont_frame.pack(fill=tk.X, pady=2)
         ttk.Label(vfont_frame, text="Font:", width=12).pack(side=tk.LEFT)
         self.visual_font_var = tk.StringVar(value=self.theme['visual_font'])
-        vfont_combo = ttk.Combobox(vfont_frame, textvariable=self.visual_font_var, width=15,
+        self.visual_font_combo = ttk.Combobox(vfont_frame, textvariable=self.visual_font_var, width=15,
                                    values=['Segoe UI', 'Arial', 'Calibri', 'Georgia', 'Times New Roman',
                                           'Verdana', 'Trebuchet MS'])
-        vfont_combo.pack(side=tk.LEFT, padx=2)
+        self.visual_font_combo.pack(side=tk.LEFT, padx=2)
         
         # Visual Font size
         ttk.Label(vfont_frame, text="Size:").pack(side=tk.LEFT, padx=(10, 2))
         self.visual_size_var = tk.IntVar(value=self.theme['visual_font_size'])
         vsize_spin = ttk.Spinbox(vfont_frame, from_=8, to=24, width=5, textvariable=self.visual_size_var)
         vsize_spin.pack(side=tk.LEFT, padx=2)
+        
+        # Font Detection Section
+        detect_frame = ttk.Frame(main_frame)
+        detect_frame.pack(fill=tk.X, pady=(10, 0))
+        detect_btn = ttk.Button(detect_frame, text="🔍 Detect System Fonts", 
+                                command=self._detect_fonts)
+        detect_btn.pack(anchor=tk.CENTER)
+        ttk.Label(detect_frame, text="Populates font lists with all available system fonts",
+                 font=(SANS_FONT, 8), foreground="#666666").pack(anchor=tk.CENTER, pady=(2, 0))
         
         # Buttons
         btn_frame = ttk.Frame(main_frame)
@@ -3171,6 +3181,39 @@ class ThemeDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="Apply", command=self._apply, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Reset to Default", command=self._reset).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=self.destroy, width=10).pack(side=tk.RIGHT, padx=5)
+    
+    def _detect_fonts(self):
+        """Detect all available system fonts and populate the comboboxes"""
+        fonts = get_available_fonts()
+        
+        if not fonts:
+            messagebox.showwarning(
+                "Font Detection",
+                "Could not detect system fonts. Using default font lists.",
+                parent=self
+            )
+            return
+        
+        # Get current selections
+        current_source = self.source_font_var.get()
+        current_visual = self.visual_font_var.get()
+        
+        # Update combobox values with detected fonts
+        self.source_font_combo['values'] = fonts
+        self.visual_font_combo['values'] = fonts
+        
+        # Restore selections if they exist in the new list
+        if current_source in fonts:
+            self.source_font_var.set(current_source)
+        if current_visual in fonts:
+            self.visual_font_var.set(current_visual)
+        
+        messagebox.showinfo(
+            "Font Detection",
+            f"Successfully detected {len(fonts)} system fonts!\n\n"
+            f"Font lists have been updated. You can now select any installed font.",
+            parent=self
+        )
     
     def _choose_color(self, key):
         """Open color chooser for the specified key"""
