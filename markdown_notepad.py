@@ -65,11 +65,34 @@ except ImportError:
 
 # Import AI chat module
 try:
-    from ai_chat import ChatSidebar, AISettingsDialog
+    from ai_chat import ChatSidebar, AISettingsDialog, get_ai_settings
     AI_CHAT_AVAILABLE = True
 except ImportError:
     AI_CHAT_AVAILABLE = False
     print("Warning: ai_chat module not found. AI chat disabled.")
+
+# Import diff panel
+try:
+    from diff_panel import DiffPanel
+    DIFF_PANEL_AVAILABLE = True
+except ImportError:
+    DIFF_PANEL_AVAILABLE = False
+    print("Warning: diff_panel module not found. Diff panel disabled.")
+
+# Import export manager
+try:
+    from export_manager import (
+        export_to_pdf, export_to_html, export_to_docx,
+        get_available_export_formats, WEASYPRINT_AVAILABLE, DOCX_AVAILABLE,
+        MARKDOWN_AVAILABLE as EXPORT_MARKDOWN_AVAILABLE
+    )
+    EXPORT_AVAILABLE = True
+except ImportError:
+    EXPORT_AVAILABLE = False
+    WEASYPRINT_AVAILABLE = False
+    DOCX_AVAILABLE = False
+    EXPORT_MARKDOWN_AVAILABLE = False
+    print("Warning: export_manager module not found. Export disabled.")
 
 
 # =============================================================================
@@ -1487,6 +1510,24 @@ class MarkdownNotepad(tk.Tk):
         file_menu.add_command(label="Save", command=self.save_file, accelerator="Ctrl+S")
         file_menu.add_command(label="Save As...", command=self.save_file_as, accelerator="Ctrl+Shift+S")
         file_menu.add_separator()
+        
+        # Export submenu
+        export_menu = tk.Menu(file_menu, tearoff=0)
+        file_menu.add_cascade(label="Export As", menu=export_menu)
+        if EXPORT_AVAILABLE and WEASYPRINT_AVAILABLE:
+            export_menu.add_command(label="PDF...", command=self._export_pdf, accelerator="Ctrl+Shift+E")
+        else:
+            export_menu.add_command(label="PDF... (install weasyprint)", state=tk.DISABLED)
+        if EXPORT_AVAILABLE and EXPORT_MARKDOWN_AVAILABLE:
+            export_menu.add_command(label="HTML...", command=self._export_html)
+        else:
+            export_menu.add_command(label="HTML... (install markdown)", state=tk.DISABLED)
+        if EXPORT_AVAILABLE and DOCX_AVAILABLE:
+            export_menu.add_command(label="DOCX (Word)...", command=self._export_docx)
+        else:
+            export_menu.add_command(label="DOCX... (install python-docx)", state=tk.DISABLED)
+        
+        file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.quit_app, accelerator="Alt+F4")
         
         # Edit menu
@@ -1731,6 +1772,9 @@ class MarkdownNotepad(tk.Tk):
         # AI sidebar toggle
         self.bind("<Control-A>", lambda e: self._toggle_ai_sidebar())  # Ctrl+Shift+A
         
+        # Export shortcut
+        self.bind("<Control-E>", lambda e: self._export_pdf())  # Ctrl+Shift+E
+        
         # Focus mode toggle
         self.bind("<F11>", lambda e: self._toggle_focus_mode())
         
@@ -1891,7 +1935,8 @@ class MarkdownNotepad(tk.Tk):
         self.ai_sidebar = ChatSidebar(
             self.ai_sidebar_frame,
             get_document_content_callback=self._get_current_document_content,
-            get_document_images_callback=self._get_current_document_images
+            get_document_images_callback=self._get_current_document_images,
+            apply_edit_callback=self._on_apply_edit_from_chat
         )
         self.ai_sidebar.pack(fill=tk.BOTH, expand=True)
     
@@ -2015,6 +2060,278 @@ class MarkdownNotepad(tk.Tk):
         if self.ai_sidebar:
             self.ai_sidebar.reload_settings()
 
+    # === Right-Click Context Menu ===
+
+    def _show_editor_context_menu(self, event):
+        """Show context menu on right-click in the editor"""
+        menu = tk.Menu(self, tearoff=0)
+        
+        # Determine which widget was clicked
+        widget = event.widget
+        
+        # Standard editing actions
+        menu.add_command(label="Cut", command=self.cut, accelerator="Ctrl+X")
+        menu.add_command(label="Copy", command=self.copy, accelerator="Ctrl+C")
+        menu.add_command(label="Paste", command=self.paste, accelerator="Ctrl+V")
+        menu.add_separator()
+        menu.add_command(label="Select All", command=self.select_all, accelerator="Ctrl+A")
+        
+        # Check if there's a text selection
+        has_selection = False
+        selected_text = ""
+        try:
+            selected_text = widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+            has_selection = bool(selected_text.strip())
+        except tk.TclError:
+            pass
+        
+        # AI-powered actions (only when text is selected and AI is available)
+        if has_selection and AI_CHAT_AVAILABLE:
+            menu.add_separator()
+            
+            # Get enabled context actions from settings
+            ai_settings = get_ai_settings()
+            actions = ai_settings.get_enabled_context_actions()
+            
+            for action in actions:
+                name = action.get('name', '')
+                prompt = action.get('prompt', '')
+                
+                if name == 'Transfer to Chat':
+                    menu.add_command(
+                        label=f"\U0001f4ac {name}",
+                        command=lambda w=widget: self._transfer_to_chat(w)
+                    )
+                elif prompt:
+                    menu.add_command(
+                        label=f"\U0001f916 {name}",
+                        command=lambda w=widget, n=name, p=prompt: self._run_context_action(w, n, p)
+                    )
+        
+        # Show the menu
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _get_selection_info(self, widget):
+        """Get the selected text and its indices from a text widget"""
+        try:
+            start = widget.index(tk.SEL_FIRST)
+            end = widget.index(tk.SEL_LAST)
+            text = widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+            return text, start, end
+        except tk.TclError:
+            return None, None, None
+
+    def _transfer_to_chat(self, widget):
+        """Transfer selected text to the AI chat sidebar"""
+        text, start, end = self._get_selection_info(widget)
+        if not text:
+            return
+        
+        # Open sidebar if not visible
+        if not self.ai_sidebar_visible:
+            self._toggle_ai_sidebar()
+        
+        # Set pending selection in the sidebar
+        if self.ai_sidebar:
+            self.ai_sidebar.set_pending_selection(text, start, end)
+            self._set_status(f"Selection transferred to chat ({len(text)} chars)")
+
+    def _run_context_action(self, widget, action_name: str, prompt_template: str):
+        """Run an AI context menu action on selected text"""
+        text, start, end = self._get_selection_info(widget)
+        if not text:
+            return
+        
+        if not AI_CHAT_AVAILABLE:
+            messagebox.showwarning("AI Unavailable", "AI chat module is not available.")
+            return
+        
+        ai_settings = get_ai_settings()
+        if not ai_settings.is_configured():
+            messagebox.showwarning("AI Not Configured",
+                "Please configure your AI provider and API key in AI Settings first.")
+            return
+        
+        # Build the prompt
+        prompt = prompt_template.replace('{selection}', text)
+        
+        # Get or create LLM client
+        from ai_chat import get_llm_client
+        llm_client = get_llm_client(ai_settings)
+        if not llm_client:
+            messagebox.showerror("Error", "Could not initialize AI client.")
+            return
+        
+        # Build messages
+        messages = [{"role": "user", "content": prompt}]
+        
+        # Open the diff panel
+        if DIFF_PANEL_AVAILABLE:
+            DiffPanel(
+                self,
+                original_text=text,
+                start_index=start,
+                end_index=end,
+                action_name=action_name,
+                on_accept=self._apply_diff,
+                llm_client=llm_client,
+                settings=ai_settings,
+                messages=messages,
+            )
+        else:
+            messagebox.showwarning("Unavailable", "Diff panel module not found.")
+
+    def _apply_diff(self, replacement_text, start_index, end_index, original_text):
+        """Apply a diff replacement to the current document"""
+        if not self.current_tab:
+            return
+        
+        editor = self.current_tab.source_editor
+        
+        # Verify the original text is still there (stale check)
+        try:
+            current_text = editor.get(start_index, end_index)
+        except tk.TclError:
+            messagebox.showwarning("Warning", "Could not locate the original text position.")
+            return
+        
+        if current_text != original_text:
+            if not messagebox.askyesno("Text Changed",
+                "The original text has been modified since the suggestion was generated.\n\n"
+                "Apply the replacement anyway?"):
+                return
+        
+        # Apply the replacement
+        editor.delete(start_index, end_index)
+        editor.insert(start_index, replacement_text)
+        
+        # Mark as modified
+        self.current_tab.is_modified = True
+        self._update_tab_title(self.current_tab)
+        
+        # Update visual viewer if in visual mode
+        if self.current_tab.current_mode == "visual":
+            content = self.current_tab.source_editor.get('1.0', tk.END).rstrip()
+            self.current_tab.visual_viewer.set_content(content)
+        
+        self._set_status(f"Applied edit ({len(replacement_text)} chars)")
+
+    def _on_apply_edit_from_chat(self, original_text, replacement_text, start_index, end_index):
+        """Callback from ChatSidebar 'Apply to Document' — opens the diff panel"""
+        if not DIFF_PANEL_AVAILABLE:
+            # Fallback: apply directly
+            self._apply_diff(replacement_text, start_index, end_index, original_text)
+            return
+        
+        panel = DiffPanel(
+            self,
+            original_text=original_text,
+            start_index=start_index,
+            end_index=end_index,
+            action_name="Apply from Chat",
+            on_accept=self._apply_diff,
+        )
+        panel.set_suggestion(replacement_text)
+
+    # === Export Methods ===
+
+    def _export_pdf(self):
+        """Export current document to PDF"""
+        if not self.current_tab:
+            return
+        if not EXPORT_AVAILABLE or not WEASYPRINT_AVAILABLE:
+            messagebox.showwarning("Unavailable",
+                "PDF export requires 'weasyprint' and 'markdown'.\n"
+                "Install with: pip install weasyprint markdown")
+            return
+        
+        default_name = "document.pdf"
+        if self.current_tab.file_path:
+            default_name = os.path.splitext(os.path.basename(self.current_tab.file_path))[0] + ".pdf"
+        
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf")],
+            initialfile=default_name
+        )
+        if not filepath:
+            return
+        
+        self._set_status("Exporting to PDF...")
+        self.update_idletasks()
+        
+        try:
+            content = self.current_tab.get_content()
+            base_path = os.path.dirname(self.current_tab.file_path) if self.current_tab.file_path else os.getcwd()
+            export_to_pdf(content, filepath, theme=self.theme, base_path=base_path)
+            self._set_status(f"Exported to: {filepath}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export PDF:\n{e}")
+            self._set_status("Export failed")
+
+    def _export_html(self):
+        """Export current document to HTML"""
+        if not self.current_tab:
+            return
+        if not EXPORT_AVAILABLE or not EXPORT_MARKDOWN_AVAILABLE:
+            messagebox.showwarning("Unavailable",
+                "HTML export requires 'markdown'.\nInstall with: pip install markdown")
+            return
+        
+        default_name = "document.html"
+        if self.current_tab.file_path:
+            default_name = os.path.splitext(os.path.basename(self.current_tab.file_path))[0] + ".html"
+        
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".html",
+            filetypes=[("HTML files", "*.html *.htm")],
+            initialfile=default_name
+        )
+        if not filepath:
+            return
+        
+        try:
+            content = self.current_tab.get_content()
+            base_path = os.path.dirname(self.current_tab.file_path) if self.current_tab.file_path else os.getcwd()
+            export_to_html(content, filepath, theme=self.theme, base_path=base_path)
+            self._set_status(f"Exported to: {filepath}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export HTML:\n{e}")
+            self._set_status("Export failed")
+
+    def _export_docx(self):
+        """Export current document to DOCX"""
+        if not self.current_tab:
+            return
+        if not EXPORT_AVAILABLE or not DOCX_AVAILABLE:
+            messagebox.showwarning("Unavailable",
+                "DOCX export requires 'python-docx'.\nInstall with: pip install python-docx")
+            return
+        
+        default_name = "document.docx"
+        if self.current_tab.file_path:
+            default_name = os.path.splitext(os.path.basename(self.current_tab.file_path))[0] + ".docx"
+        
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".docx",
+            filetypes=[("Word documents", "*.docx")],
+            initialfile=default_name
+        )
+        if not filepath:
+            return
+        
+        try:
+            content = self.current_tab.get_content()
+            base_path = os.path.dirname(self.current_tab.file_path) if self.current_tab.file_path else os.getcwd()
+            export_to_docx(content, filepath, theme=self.theme, base_path=base_path)
+            self._set_status(f"Exported to: {filepath}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export DOCX:\n{e}")
+            self._set_status("Export failed")
+
     # === Tab Management Methods ===
     
     def new_tab(self, file_path=None, content=""):
@@ -2058,6 +2375,10 @@ class MarkdownNotepad(tk.Tk):
         # Position tracking
         tab.source_editor.bind("<KeyRelease>", self._schedule_position_update)
         tab.source_editor.bind("<ButtonRelease>", self._update_position)
+        
+        # Right-click context menu on editor
+        tab.source_editor.bind("<Button-3>", self._show_editor_context_menu)
+        tab.visual_viewer.text_widget.bind("<Button-3>", self._show_editor_context_menu)
     
     def close_tab(self, tab=None):
         """Close a tab"""

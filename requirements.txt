@@ -19,6 +19,10 @@ google-genai>=1.0.0
 ollama>=0.4.0
 openai>=1.0.0
 
+# Optional: For document export
+weasyprint>=60.0
+python-docx>=1.0.0
+
 # Note: If you only need specific file format support, you can install:
 # markitdown[pdf]       - PDF files
 # markitdown[docx]      - Word documents

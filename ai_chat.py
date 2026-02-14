@@ -237,6 +237,15 @@ class AISettings:
         'cached_gemini_models': [],
         'cached_ollama_models': [],
         'cached_deepseek_models': [],
+        # Context menu AI actions (right-click on selected text)
+        'context_menu_actions': [
+            {'name': 'Transfer to Chat', 'prompt': '', 'enabled': True},
+            {'name': 'Rewrite', 'prompt': 'Rewrite the following, improving clarity and flow while preserving meaning. Return ONLY the rewritten text with no commentary:\n\n{selection}', 'enabled': True},
+            {'name': 'Proofread', 'prompt': 'Proofread the following text. Return ONLY the corrected text with no commentary:\n\n{selection}', 'enabled': True},
+            {'name': 'Spellcheck', 'prompt': 'Fix any spelling errors in the following text. Return ONLY the corrected text with no other output:\n\n{selection}', 'enabled': True},
+            {'name': 'Summarize', 'prompt': 'Summarize the following text concisely:\n\n{selection}', 'enabled': True},
+            {'name': 'Expand', 'prompt': 'Expand the following text with more detail while maintaining the same tone. Return ONLY the expanded text:\n\n{selection}', 'enabled': True},
+        ],
     }
     
     def __init__(self):
@@ -401,6 +410,19 @@ class AISettings:
         elif self.provider == 'ollama':
             return ''  # Ollama doesn't use API keys
         return self.api_key
+
+    @property
+    def context_menu_actions(self) -> list:
+        """Get context menu AI actions"""
+        return self.settings.get('context_menu_actions', self.DEFAULT_SETTINGS['context_menu_actions'])
+
+    @context_menu_actions.setter
+    def context_menu_actions(self, value: list):
+        self.settings['context_menu_actions'] = value
+
+    def get_enabled_context_actions(self) -> list:
+        """Get only enabled context menu actions"""
+        return [a for a in self.context_menu_actions if a.get('enabled', True)]
 
 
 # =============================================================================
@@ -1639,9 +1661,9 @@ class AISettingsDialog(tk.Toplevel):
         self.result = None
         
         self.title("AI Settings")
-        self.geometry("560x780")
+        self.geometry("560x900")
         self.resizable(True, True)
-        self.minsize(520, 720)
+        self.minsize(520, 780)
         self.transient(parent)
         self.grab_set()
         
@@ -1830,6 +1852,32 @@ class AISettingsDialog(tk.Toplevel):
         self.system_prompt_text = tk.Text(prompt_frame, height=5, wrap=tk.WORD)
         self.system_prompt_text.pack(fill=tk.BOTH, expand=True)
         
+        # Context menu actions configuration
+        ctx_frame = ttk.LabelFrame(main_frame, text="Context Menu AI Actions", padding=10)
+        ctx_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        ctx_top = ttk.Frame(ctx_frame)
+        ctx_top.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(ctx_top, text="Right-click actions for selected text. Use {selection} as placeholder.",
+                  font=('Segoe UI', 8), foreground='#666666').pack(side=tk.LEFT)
+        ttk.Button(ctx_top, text="+ Add", width=6, command=self._add_context_action).pack(side=tk.RIGHT)
+        
+        # Scrollable list of actions
+        self.ctx_list_frame = ttk.Frame(ctx_frame)
+        self.ctx_list_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.ctx_canvas = tk.Canvas(self.ctx_list_frame, height=120, bg='#ffffff', highlightthickness=0)
+        ctx_scrollbar = ttk.Scrollbar(self.ctx_list_frame, orient=tk.VERTICAL, command=self.ctx_canvas.yview)
+        self.ctx_inner = ttk.Frame(self.ctx_canvas)
+        self.ctx_inner.bind('<Configure>', lambda e: self.ctx_canvas.configure(scrollregion=self.ctx_canvas.bbox('all')))
+        self.ctx_canvas.create_window((0, 0), window=self.ctx_inner, anchor='nw')
+        self.ctx_canvas.configure(yscrollcommand=ctx_scrollbar.set)
+        self.ctx_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ctx_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Store action widgets for reading back
+        self.ctx_action_widgets = []
+        
         # Buttons
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X)
@@ -1862,6 +1910,65 @@ class AISettingsDialog(tk.Toplevel):
             self.gemini_key_entry.config(show="•")
         if self.settings.deepseek_api_key:
             self.deepseek_key_entry.config(show="•")
+        
+        # Load context menu actions
+        self._load_context_actions()
+
+    def _load_context_actions(self):
+        """Populate context menu actions list from settings"""
+        # Clear existing
+        for w in self.ctx_action_widgets:
+            w['frame'].destroy()
+        self.ctx_action_widgets.clear()
+        
+        actions = self.settings.context_menu_actions
+        for action in actions:
+            self._add_context_action_row(action.get('name', ''), action.get('prompt', ''),
+                                          action.get('enabled', True))
+
+    def _add_context_action(self):
+        """Add a new empty context menu action row"""
+        self._add_context_action_row('New Action', 'Instruction for AI about {selection}', True)
+
+    def _add_context_action_row(self, name: str, prompt: str, enabled: bool):
+        """Add a single context action row to the config UI"""
+        row_frame = ttk.Frame(self.ctx_inner)
+        row_frame.pack(fill=tk.X, pady=2, padx=2)
+        
+        enabled_var = tk.BooleanVar(value=enabled)
+        ttk.Checkbutton(row_frame, variable=enabled_var).pack(side=tk.LEFT, padx=(0, 3))
+        
+        name_var = tk.StringVar(value=name)
+        name_entry = ttk.Entry(row_frame, textvariable=name_var, width=14)
+        name_entry.pack(side=tk.LEFT, padx=(0, 3))
+        
+        prompt_var = tk.StringVar(value=prompt)
+        prompt_entry = ttk.Entry(row_frame, textvariable=prompt_var, width=35)
+        prompt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+        
+        # Special handling: "Transfer to Chat" has no prompt field
+        is_transfer = (name == 'Transfer to Chat')
+        if is_transfer:
+            prompt_entry.config(state=tk.DISABLED)
+        
+        remove_btn = ttk.Button(row_frame, text="\u2212", width=2,
+                                 command=lambda: self._remove_context_action(row_frame))
+        remove_btn.pack(side=tk.RIGHT)
+        
+        self.ctx_action_widgets.append({
+            'frame': row_frame,
+            'enabled_var': enabled_var,
+            'name_var': name_var,
+            'prompt_var': prompt_var,
+        })
+
+    def _remove_context_action(self, frame):
+        """Remove a context action row"""
+        for w in self.ctx_action_widgets:
+            if w['frame'] is frame:
+                self.ctx_action_widgets.remove(w)
+                break
+        frame.destroy()
     
     def _toggle_key_visibility(self):
         """Toggle Anthropic API key visibility"""
@@ -2073,6 +2180,16 @@ class AISettingsDialog(tk.Toplevel):
         self.settings.image_max_size = (self.img_size_var.get(), self.img_size_var.get())
         self.settings.system_prompt = self.system_prompt_text.get(1.0, tk.END).strip()
         
+        # Save context menu actions
+        actions = []
+        for w in self.ctx_action_widgets:
+            actions.append({
+                'name': w['name_var'].get().strip(),
+                'prompt': w['prompt_var'].get().strip(),
+                'enabled': w['enabled_var'].get(),
+            })
+        self.settings.context_menu_actions = actions
+        
         if self.settings.save():
             self.result = True
             if self.on_save:
@@ -2124,11 +2241,13 @@ class ChatSidebar(tk.Frame):
     """
     
     def __init__(self, parent, get_document_content_callback: Optional[Callable] = None,
-                 get_document_images_callback: Optional[Callable] = None):
+                 get_document_images_callback: Optional[Callable] = None,
+                 apply_edit_callback: Optional[Callable] = None):
         super().__init__(parent, bg='#f0f0f0')
         
         self.get_document_content = get_document_content_callback
         self.get_document_images = get_document_images_callback
+        self.apply_edit_callback = apply_edit_callback  # Callable(original, replacement, start_idx, end_idx)
         
         # Settings and state
         self.settings = get_ai_settings()
@@ -2137,6 +2256,10 @@ class ChatSidebar(tk.Frame):
         self.llm_client: Optional[LLMClient] = None
         self.is_generating = False
         self.response_queue = queue.Queue()
+        
+        # Pending selection for "Transfer to Chat" — stores selection context
+        # Dict with keys: 'text', 'start_index', 'end_index' or None
+        self.pending_selection: Optional[Dict[str, str]] = None
         
         # Attached files storage: list of dicts with 'path', 'name', 'type', 'content'
         self.attached_files: List[Dict[str, Any]] = []
@@ -2264,6 +2387,20 @@ class ChatSidebar(tk.Frame):
         self.send_btn.pack(side=tk.TOP, padx=(5, 0), pady=2)
         ToolTip(self.send_btn, "Send message (Shift+Enter)")
         
+        # Selection indicator (shown when text is transferred from editor)
+        self.selection_indicator_frame = tk.Frame(self, bg='#e8f0fe')
+        # Not packed until needed
+        self.selection_indicator_label = tk.Label(
+            self.selection_indicator_frame, text="", bg='#e8f0fe', fg='#1a73e8',
+            font=(SANS_FONT, 9), anchor=tk.W, cursor='hand2'
+        )
+        self.selection_indicator_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=2)
+        self.selection_clear_btn = ttk.Button(
+            self.selection_indicator_frame, text="\u2715", width=2,
+            command=self._clear_pending_selection
+        )
+        self.selection_clear_btn.pack(side=tk.RIGHT, padx=(0, 5), pady=2)
+
         # Status label
         self.status_label = tk.Label(self, text="Ready", bg='#f0f0f0', fg='#666666',
                                       font=('Segoe UI', 9))
@@ -2556,6 +2693,9 @@ class ChatSidebar(tk.Frame):
                     self.is_generating = False
                     self.send_btn.config(state=tk.NORMAL)
                     self.status_label.config(text="Ready")
+                    # If we have a pending selection, show Apply to Document button
+                    if self.pending_selection:
+                        self._show_apply_button()
                 elif msg_type == 'error':
                     self._add_chat_message("system", f"Error: {content}")
                     self.is_generating = False
@@ -2648,3 +2788,94 @@ class ChatSidebar(tk.Frame):
         """Reload settings (e.g., after settings dialog)"""
         self.settings = get_ai_settings()
         self._init_llm_client()
+
+    # === Transfer to Chat / Selection Methods ===
+
+    def set_pending_selection(self, text: str, start_index: str, end_index: str):
+        """Set a pending selection from the editor for 'Transfer to Chat'"""
+        self.pending_selection = {
+            'text': text,
+            'start_index': start_index,
+            'end_index': end_index,
+        }
+        # Show indicator
+        try:
+            start_line = start_index.split('.')[0]
+            end_line = end_index.split('.')[0]
+            if start_line == end_line:
+                loc = f"line {start_line}"
+            else:
+                loc = f"lines {start_line}\u2013{end_line}"
+        except Exception:
+            loc = "selection"
+        preview = text[:60].replace('\n', ' ')
+        if len(text) > 60:
+            preview += '\u2026'
+        self.selection_indicator_label.config(text=f"\U0001f4cc Selection ({loc}): {preview}")
+        self.selection_indicator_frame.pack(fill=tk.X, padx=5, pady=(0, 3), before=self.status_label)
+        # Pre-fill input with quoted selection
+        self.input_text.delete('1.0', tk.END)
+        quoted = '\n'.join(f'> {l}' for l in text.split('\n'))
+        self.input_text.insert('1.0', quoted + '\n\n')
+        self.input_text.mark_set(tk.INSERT, tk.END)
+        self.input_text.focus_set()
+
+    def _clear_pending_selection(self):
+        """Clear pending selection state"""
+        self.pending_selection = None
+        self.selection_indicator_frame.pack_forget()
+        # Remove any Apply to Document buttons
+        self._remove_apply_buttons()
+
+    def _show_apply_button(self):
+        """Show an 'Apply to Document' button below the last AI message in the chat"""
+        if not self.pending_selection or not self.apply_edit_callback:
+            return
+
+        # Get the AI response text (last assistant message)
+        # We parse from the chat display
+        full_text = self.chat_display.get('1.0', tk.END)
+        # Find the last "AI: " marker
+        last_ai_idx = full_text.rfind('AI: ')
+        if last_ai_idx < 0:
+            return
+        response_text = full_text[last_ai_idx + 4:].strip()
+
+        sel = self.pending_selection
+
+        # Create an inline button in the chat display
+        self.chat_display.config(state=tk.NORMAL)
+        self.chat_display.insert(tk.END, '\n')
+
+        apply_btn = ttk.Button(
+            self.chat_display, text="\u2714 Apply to Document",
+            command=lambda: self._apply_response_to_document(response_text, sel)
+        )
+        self.chat_display.window_create(tk.END, window=apply_btn)
+        self.chat_display.insert(tk.END, '  ')
+
+        discard_btn = ttk.Button(
+            self.chat_display, text="\u2718 Discard",
+            command=self._clear_pending_selection
+        )
+        self.chat_display.window_create(tk.END, window=discard_btn)
+
+        self.chat_display.config(state=tk.DISABLED)
+        self.chat_display.see(tk.END)
+
+    def _apply_response_to_document(self, response_text: str, selection: Dict):
+        """Open the diff panel to apply AI response to document"""
+        if self.apply_edit_callback:
+            self.apply_edit_callback(
+                selection['text'],
+                response_text,
+                selection['start_index'],
+                selection['end_index']
+            )
+        self._clear_pending_selection()
+
+    def _remove_apply_buttons(self):
+        """Remove any embedded Apply/Discard buttons from chat display"""
+        # The buttons are embedded windows; clearing pending selection is enough
+        # since the buttons reference the old selection
+        pass
