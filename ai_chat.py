@@ -7,6 +7,7 @@ Currently implements Anthropic Claude, Google Gemini, DeepSeek, and Ollama.
 
 import json
 import os
+import re
 import base64
 import hashlib
 import threading
@@ -2227,6 +2228,31 @@ def get_chat_history_manager() -> ChatHistoryManager:
 # Chat Sidebar Widget
 # =============================================================================
 
+def _insert_inline(widget, text: str):
+    """Insert one line of text into widget with bold/italic/code tags applied."""
+    pattern = re.compile(
+        r'(`[^`]+`)'
+        r'|(\*\*[^*]+\*\*)'
+        r'|(__[^_]+__)'
+        r'|(\*[^*]+\*)'
+        r'|(_[^_]+_)'
+    )
+    pos = 0
+    for m in pattern.finditer(text):
+        if m.start() > pos:
+            widget.insert(tk.END, text[pos:m.start()])
+        raw = m.group(0)
+        if raw.startswith('`'):
+            widget.insert(tk.END, raw[1:-1], 'md_code_inline')
+        elif raw.startswith('**') or raw.startswith('__'):
+            widget.insert(tk.END, raw[2:-2], 'md_bold')
+        else:
+            widget.insert(tk.END, raw[1:-1], 'md_italic')
+        pos = m.end()
+    if pos < len(text):
+        widget.insert(tk.END, text[pos:])
+
+
 class ChatSidebar(tk.Frame):
     """
     Collapsible AI chat sidebar widget.
@@ -2263,6 +2289,13 @@ class ChatSidebar(tk.Frame):
         
         # Attached files storage: list of dicts with 'path', 'name', 'type', 'content'
         self.attached_files: List[Dict[str, Any]] = []
+        
+        # Streaming / markdown rendering state
+        self._streaming_buffer: str = ''
+        self._streaming_start_index: str = ''
+        
+        # Copy-button message store
+        self._message_texts: list = []
         
         # Initialize LLM client
         self._init_llm_client()
@@ -2319,6 +2352,25 @@ class ChatSidebar(tk.Frame):
         self.chat_display.tag_configure('system', foreground='#666666', font=(SANS_FONT, 9, 'italic'))
         self.chat_display.tag_configure('error', foreground='#cc0000')
         self.chat_display.tag_configure('message', font=(SANS_FONT, 10))
+        self.chat_display.tag_configure('md_bold',
+            font=(SANS_FONT, 10, 'bold'), foreground='#1a1a1a')
+        self.chat_display.tag_configure('md_italic',
+            font=(SANS_FONT, 10, 'italic'), foreground='#1a1a1a')
+        self.chat_display.tag_configure('md_code_inline',
+            font=(MONO_FONT, 9), background='#f0f0f0', foreground='#c7254e')
+        self.chat_display.tag_configure('md_code_block',
+            font=(MONO_FONT, 9), background='#282c34', foreground='#abb2bf',
+            lmargin1=10, lmargin2=10, spacing1=4, spacing3=4)
+        self.chat_display.tag_configure('md_h1',
+            font=(SANS_FONT, 14, 'bold'), foreground='#1a1a2e', spacing1=8)
+        self.chat_display.tag_configure('md_h2',
+            font=(SANS_FONT, 12, 'bold'), foreground='#16213e', spacing1=6)
+        self.chat_display.tag_configure('md_h3',
+            font=(SANS_FONT, 11, 'bold'), foreground='#1f4068', spacing1=4)
+        self.chat_display.tag_configure('md_list_item', lmargin1=15, lmargin2=25)
+        self.chat_display.tag_configure('md_blockquote',
+            foreground='#6c757d', font=(SANS_FONT, 10, 'italic'),
+            lmargin1=20, background='#f8f9fa')
         
         # Options frame
         options_frame = tk.Frame(self, bg='#f0f0f0')
@@ -2669,6 +2721,7 @@ class ChatSidebar(tk.Frame):
                 model=self.settings.model
             ):
                 response_text += chunk
+                self._streaming_buffer += chunk
                 self.response_queue.put(('chunk', chunk))
             
             # Save assistant message to history
@@ -2693,6 +2746,39 @@ class ChatSidebar(tk.Frame):
                     self.is_generating = False
                     self.send_btn.config(state=tk.NORMAL)
                     self.status_label.config(text="Ready")
+                    # Re-render last assistant message with markdown formatting
+                    if self._streaming_buffer:
+                        self.chat_display.config(state=tk.NORMAL)
+                        self.chat_display.delete(self._streaming_start_index, tk.END)
+                        self._insert_markdown_text(self._streaming_buffer)
+                        self.chat_display.config(state=tk.DISABLED)
+                        self.chat_display.see(tk.END)
+                    # Copy button for streaming message
+                    if self._streaming_buffer:
+                        streamed_text = self._streaming_buffer
+
+                        def _make_copy_streamed(text):
+                            def _do():
+                                self.clipboard_clear()
+                                self.clipboard_append(text)
+                                self.status_label.config(text='Copied!')
+                                self.after(1500, lambda: self.status_label.config(text='Ready'))
+                            return _do
+
+                        self.chat_display.config(state=tk.NORMAL)
+                        btn = tk.Button(
+                            self.chat_display,
+                            text='⧉', font=(SANS_FONT, 8),
+                            relief=tk.FLAT, bd=0,
+                            bg=self.chat_display.cget('bg'), fg='#888888',
+                            activeforeground='#0066cc',
+                            cursor='hand2', padx=2, pady=0,
+                            command=_make_copy_streamed(streamed_text)
+                        )
+                        self.chat_display.window_create(tk.END, window=btn, padx=2)
+                        self.chat_display.insert(tk.END, '\n')
+                        self.chat_display.config(state=tk.DISABLED)
+                        self._streaming_buffer = ''
                     # If we have a pending selection, show Apply to Document button
                     if self.pending_selection:
                         self._show_apply_button()
@@ -2731,6 +2817,33 @@ class ChatSidebar(tk.Frame):
             else:
                 self.chat_display.insert(tk.END, content, 'message')
         
+        if role == 'assistant' and streaming:
+            self._streaming_start_index = self.chat_display.index(tk.END)
+            self._streaming_buffer = ''
+        
+        if not streaming and role in ('user', 'assistant'):
+            self._message_texts.append(content)
+
+            def _make_copy(text):
+                def _do():
+                    self.clipboard_clear()
+                    self.clipboard_append(text)
+                    self.status_label.config(text='Copied!')
+                    self.after(1500, lambda: self.status_label.config(text='Ready'))
+                return _do
+
+            btn = tk.Button(
+                self.chat_display,
+                text='⧉', font=(SANS_FONT, 8),
+                relief=tk.FLAT, bd=0,
+                bg=self.chat_display.cget('bg'), fg='#888888',
+                activeforeground='#0066cc',
+                cursor='hand2', padx=2, pady=0,
+                command=_make_copy(content)
+            )
+            self.chat_display.window_create(tk.END, window=btn, padx=2)
+            self.chat_display.insert(tk.END, '\n')
+        
         self.chat_display.config(state=tk.DISABLED)
         self.chat_display.see(tk.END)
     
@@ -2753,11 +2866,59 @@ class ChatSidebar(tk.Frame):
         else:
             self._clear_display()
     
+    def _insert_markdown_text(self, text: str):
+        """Insert markdown-formatted assistant response into chat_display."""
+        widget  = self.chat_display
+        lines   = text.split('\n')
+        in_code = False
+        code_buf = []
+
+        def flush_code():
+            if code_buf:
+                widget.insert(tk.END, '\n'.join(code_buf) + '\n', 'md_code_block')
+                code_buf.clear()
+
+        for line in lines:
+            if line.strip().startswith('```'):
+                if in_code:
+                    flush_code()
+                    in_code = False
+                else:
+                    in_code = True
+                continue
+
+            if in_code:
+                code_buf.append(line)
+                continue
+
+            hm = re.match(r'^(#{1,3})\s+(.*)', line)
+            if hm:
+                widget.insert(tk.END, hm.group(2) + '\n', f'md_h{len(hm.group(1))}')
+                continue
+
+            if line.startswith('> '):
+                widget.insert(tk.END, line[2:] + '\n', 'md_blockquote')
+                continue
+
+            lm = re.match(r'^(\s*)([-*+]|\d+\.)\s(.*)', line)
+            if lm:
+                prefix = '  • ' if not lm.group(2)[0].isdigit() else f'  {lm.group(2)} '
+                widget.insert(tk.END, prefix, 'md_list_item')
+                _insert_inline(widget, lm.group(3))
+                widget.insert(tk.END, '\n')
+                continue
+
+            _insert_inline(widget, line)
+            widget.insert(tk.END, '\n')
+
+        flush_code()
+
     def _clear_display(self):
         """Clear the chat display"""
         self.chat_display.config(state=tk.NORMAL)
         self.chat_display.delete(1.0, tk.END)
         self.chat_display.config(state=tk.DISABLED)
+        self._message_texts.clear()
     
     def _open_settings(self):
         """Open settings dialog"""

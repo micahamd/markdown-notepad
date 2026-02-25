@@ -732,6 +732,9 @@ class MarkdownVisualWidget(tk.Frame):
         self.embedded_images = {}  # Track embedded images by text index
         self._render_job = None  # For cancelling pending renders
         self.on_content_change = on_content_change  # Callback for content changes
+        self.live_render_enabled = True
+        self._live_render_job    = None
+        self._last_rendered_hash = ''
         self._setup_widget()
     
     def _setup_widget(self):
@@ -787,11 +790,47 @@ class MarkdownVisualWidget(tk.Frame):
     
     def _on_edit(self, event=None):
         """Handle text edits - notify parent of changes"""
+        content = self.text_widget.get('1.0', tk.END).rstrip('\n')
+        self.content = content
         if self.on_content_change:
-            # Get current text content (raw, without images)
-            content = self.text_widget.get("1.0", tk.END).rstrip()
-            self.content = content
             self.on_content_change(content)
+
+        if self.live_render_enabled:
+            if self._live_render_job:
+                self.after_cancel(self._live_render_job)
+            import hashlib as _hl
+            h = _hl.md5(content.encode()).hexdigest()
+            if h != self._last_rendered_hash:
+                self._live_render_job = self.after(450, lambda: self._do_live_render(content, h))
+
+    def _do_live_render(self, content: str, expected_hash: str):
+        self._live_render_job = None
+        current = self.text_widget.get('1.0', tk.END).rstrip('\n')
+        import hashlib as _hl
+        if _hl.md5(current.encode()).hexdigest() != expected_hash:
+            return
+
+        char_offset = None
+        try:
+            cursor_idx  = self.text_widget.index(tk.INSERT)
+            pre_text    = self.text_widget.get('1.0', cursor_idx)
+            char_offset = len(pre_text)
+        except Exception:
+            pass
+
+        self._last_rendered_hash = expected_hash
+        self.set_content(content)
+
+        if char_offset is not None:
+            try:
+                full  = self.text_widget.get('1.0', tk.END)
+                pre   = full[:char_offset]
+                row   = pre.count('\n') + 1
+                col   = len(pre) - (pre.rfind('\n') + 1)
+                self.text_widget.mark_set(tk.INSERT, f'{row}.{col}')
+                self.text_widget.see(tk.INSERT)
+            except Exception:
+                pass
     
     def set_base_path(self, path):
         """Set the base path for resolving relative image paths"""
@@ -845,6 +884,44 @@ class MarkdownVisualWidget(tk.Frame):
         else:
             self._render_job = None
     
+    # Inline markdown pattern: captures bold, italic, code, links in order
+    _INLINE_RE = re.compile(
+        r'(\*\*|__)(?P<bold>.+?)\1'        # **bold** or __bold__
+        r'|(?<!\*)\*(?!\*)(?P<italic>.+?)(?<!\*)\*(?!\*)'  # *italic*
+        r'|(?<!_)_(?!_)(?P<italic2>.+?)(?<!_)_(?!_)'       # _italic_
+        r'|`(?P<code>[^`]+)`'              # `code`
+        r'|\[(?P<link_label>[^\]]+)\]\([^\)]+\)'            # [label](url)
+    )
+
+    def _insert_inline(self, text, base_tags=()):
+        """Parse inline markdown in *text* and insert it into the text widget with tags.
+
+        Markers are stripped; the plain content is inserted with the appropriate
+        inline tag plus any *base_tags* passed in (e.g. a block-level tag like
+        "blockquote" or "list_item").
+        """
+        tw = self.text_widget
+        pos = 0
+        for m in self._INLINE_RE.finditer(text):
+            # Insert any plain text before this match
+            if m.start() > pos:
+                tw.insert(tk.END, text[pos:m.start()], base_tags if base_tags else '')
+            # Determine matched group and inline tag
+            if m.group('bold') is not None:
+                tw.insert(tk.END, m.group('bold'), base_tags + ('bold',) if base_tags else 'bold')
+            elif m.group('italic') is not None:
+                tw.insert(tk.END, m.group('italic'), base_tags + ('italic',) if base_tags else 'italic')
+            elif m.group('italic2') is not None:
+                tw.insert(tk.END, m.group('italic2'), base_tags + ('italic',) if base_tags else 'italic')
+            elif m.group('code') is not None:
+                tw.insert(tk.END, m.group('code'), base_tags + ('code',) if base_tags else 'code')
+            elif m.group('link_label') is not None:
+                tw.insert(tk.END, m.group('link_label'), base_tags + ('link',) if base_tags else 'link')
+            pos = m.end()
+        # Insert any remaining plain text
+        if pos < len(text):
+            tw.insert(tk.END, text[pos:], base_tags if base_tags else '')
+
     def _render_content(self, markdown_text, images, is_chunk=False):
         """Render markdown content efficiently into the single text widget"""
         # Build a map of image positions
@@ -904,22 +981,29 @@ class MarkdownVisualWidget(tk.Frame):
                         break
                 else:
                     # No matching image found, render as text
-                    self.text_widget.insert(tk.END, line + '\n')
+                    self._insert_inline(line)
+                    self.text_widget.insert(tk.END, '\n')
                 continue
             
             # Headers
             if line.startswith('######'):
-                self.text_widget.insert(tk.END, line[6:].strip() + '\n', "h6")
+                self._insert_inline(line[6:].strip(), ('h6',))
+                self.text_widget.insert(tk.END, '\n', 'h6')
             elif line.startswith('#####'):
-                self.text_widget.insert(tk.END, line[5:].strip() + '\n', "h5")
+                self._insert_inline(line[5:].strip(), ('h5',))
+                self.text_widget.insert(tk.END, '\n', 'h5')
             elif line.startswith('####'):
-                self.text_widget.insert(tk.END, line[4:].strip() + '\n', "h4")
+                self._insert_inline(line[4:].strip(), ('h4',))
+                self.text_widget.insert(tk.END, '\n', 'h4')
             elif line.startswith('###'):
-                self.text_widget.insert(tk.END, line[3:].strip() + '\n', "h3")
+                self._insert_inline(line[3:].strip(), ('h3',))
+                self.text_widget.insert(tk.END, '\n', 'h3')
             elif line.startswith('##'):
-                self.text_widget.insert(tk.END, line[2:].strip() + '\n', "h2")
+                self._insert_inline(line[2:].strip(), ('h2',))
+                self.text_widget.insert(tk.END, '\n', 'h2')
             elif line.startswith('#'):
-                self.text_widget.insert(tk.END, line[1:].strip() + '\n', "h1")
+                self._insert_inline(line[1:].strip(), ('h1',))
+                self.text_widget.insert(tk.END, '\n', 'h1')
             
             # Horizontal rule
             elif line.strip() in ['---', '***', '___']:
@@ -927,17 +1011,25 @@ class MarkdownVisualWidget(tk.Frame):
             
             # Blockquote
             elif line.startswith('>'):
-                self.text_widget.insert(tk.END, '  │ ' + line[1:].strip() + '\n', "blockquote")
+                self.text_widget.insert(tk.END, '  │ ', 'blockquote')
+                self._insert_inline(line[1:].strip(), ('blockquote',))
+                self.text_widget.insert(tk.END, '\n', 'blockquote')
             
             # List items
             elif re.match(r'^[\*\-\+]\s', line.strip()):
-                self.text_widget.insert(tk.END, '  • ' + line.strip()[2:] + '\n', "list_item")
+                self.text_widget.insert(tk.END, '  • ', 'list_item')
+                self._insert_inline(line.strip()[2:], ('list_item',))
+                self.text_widget.insert(tk.END, '\n', 'list_item')
             elif re.match(r'^\d+\.\s', line.strip()):
-                self.text_widget.insert(tk.END, '  ' + line.strip() + '\n', "list_item")
+                m_li = re.match(r'^(\d+\.\s)', line.strip())
+                self.text_widget.insert(tk.END, '  ' + m_li.group(1), 'list_item')
+                self._insert_inline(line.strip()[m_li.end():], ('list_item',))
+                self.text_widget.insert(tk.END, '\n', 'list_item')
             
             # Normal text
             else:
-                self.text_widget.insert(tk.END, line + '\n')
+                self._insert_inline(line)
+                self.text_widget.insert(tk.END, '\n')
         
         # Flush any remaining table at end of content
         if in_table and table_rows:
@@ -1193,6 +1285,7 @@ class DocumentTab(ttk.Frame):
             spacing3=1,
         )
         self.source_editor.pack(fill=tk.BOTH, expand=True)
+        self._setup_syntax_tags()
         self.source_frame.pack(fill=tk.BOTH, expand=True)
         
         # Visual mode viewer
@@ -1253,6 +1346,180 @@ class DocumentTab(ttk.Frame):
             font=(theme['source_font'], theme['source_font_size'])
         )
         self.visual_viewer.apply_theme(theme)
+
+    def _setup_syntax_tags(self):
+        """Configure colour/font tags for source-mode syntax highlighting."""
+        sz = self.theme.get('source_font_size', 12)
+        editor = self.source_editor
+        # Headers
+        editor.tag_configure('syn_h1', font=(MONO_FONT, sz + 8, 'bold'), foreground='#1a1a2e')
+        editor.tag_configure('syn_h2', font=(MONO_FONT, sz + 5, 'bold'), foreground='#16213e')
+        editor.tag_configure('syn_h3', font=(MONO_FONT, sz + 3, 'bold'), foreground='#1f4068')
+        editor.tag_configure('syn_h4', font=(MONO_FONT, sz + 1, 'bold'), foreground='#1b1b2f')
+        # Inline
+        editor.tag_configure('syn_bold',        foreground='#d73a49')
+        editor.tag_configure('syn_italic',      foreground='#6f42c1')
+        editor.tag_configure('syn_code_inline', font=(MONO_FONT, sz), background='#f0f0f0', foreground='#c7254e')
+        editor.tag_configure('syn_code_block',  font=(MONO_FONT, sz), background='#282c34', foreground='#abb2bf', lmargin1=20)
+        editor.tag_configure('syn_link',        foreground='#0066cc', underline=True)
+        editor.tag_configure('syn_blockquote',  font=(MONO_FONT, sz, 'italic'), foreground='#6c757d', lmargin1=30)
+        editor.tag_configure('syn_list_marker', font=(MONO_FONT, sz, 'bold'), foreground='#0066cc')
+        editor.tag_configure('syn_hr',          foreground='#aaaaaa')
+
+    def _apply_syntax_highlighting(self):
+        """Apply markdown syntax highlighting tags to the source editor."""
+        editor = self.source_editor
+        for tag in ('syn_h1', 'syn_h2', 'syn_h3', 'syn_h4', 'syn_bold', 'syn_italic',
+                    'syn_code_inline', 'syn_code_block', 'syn_link',
+                    'syn_blockquote', 'syn_list_marker', 'syn_hr'):
+            editor.tag_remove(tag, '1.0', tk.END)
+
+        content = editor.get('1.0', tk.END)
+        lines = content.split('\n')
+        in_code_block = False
+
+        for lineno, line in enumerate(lines, start=1):
+            line_start = f'{lineno}.0'
+            line_end   = f'{lineno}.end'
+
+            if line.strip().startswith('```'):
+                in_code_block = not in_code_block
+                editor.tag_add('syn_code_block', line_start, line_end)
+                continue
+
+            if in_code_block:
+                editor.tag_add('syn_code_block', line_start, line_end)
+                continue
+
+            if   re.match(r'^# [^#]',    line): editor.tag_add('syn_h1', line_start, line_end)
+            elif re.match(r'^## [^#]',   line): editor.tag_add('syn_h2', line_start, line_end)
+            elif re.match(r'^### [^#]',  line): editor.tag_add('syn_h3', line_start, line_end)
+            elif re.match(r'^#{4,6} ',   line): editor.tag_add('syn_h4', line_start, line_end)
+            elif line.strip() in ('---', '***', '___'):
+                editor.tag_add('syn_hr', line_start, line_end)
+            elif line.startswith('> '):
+                editor.tag_add('syn_blockquote', line_start, line_end)
+            else:
+                m = re.match(r'^(\s*)([-*+]|\d+\.)\s', line)
+                if m:
+                    editor.tag_add('syn_list_marker', line_start, f'{lineno}.{m.end()}')
+
+            for m in re.finditer(r'(\*\*|__)(.+?)\1', line):
+                editor.tag_add('syn_bold',    f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', line):
+                editor.tag_add('syn_italic',  f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'`([^`]+)`', line):
+                editor.tag_add('syn_code_inline', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'\[([^\]]+)\]\([^\)]+\)', line):
+                editor.tag_add('syn_link',    f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+
+
+class OutlinePanel(ttk.Frame):
+    """Collapsible document outline — heading tree with click-to-navigate."""
+
+    LEVEL_FG = {
+        1: '#1a1a2e', 2: '#16213e', 3: '#1f4068',
+        4: '#555555', 5: '#777777', 6: '#999999',
+    }
+
+    def __init__(self, parent, on_heading_click=None, **kwargs):
+        super().__init__(parent, **kwargs)
+        self._on_heading_click = on_heading_click
+        self._linenos = []
+        self._update_job = None
+        self._setup_ui()
+
+    def _setup_ui(self):
+        header = ttk.Frame(self)
+        header.pack(fill=tk.X)
+        ttk.Label(header, text='Outline', font=(SANS_FONT, 10, 'bold')).pack(
+            side=tk.LEFT, padx=8, pady=(6, 4))
+
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree = ttk.Treeview(tree_frame, show='tree',
+                                  selectmode='browse', yscrollcommand=vsb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.config(command=self.tree.yview)
+
+        for lvl in range(1, 7):
+            self.tree.tag_configure(
+                f'h{lvl}',
+                foreground=self.LEVEL_FG.get(lvl, '#999999'),
+                font=(SANS_FONT, max(11 - lvl + 1, 9),
+                      'bold' if lvl <= 3 else 'normal')
+            )
+        self.tree.tag_configure('empty', foreground='#aaaaaa',
+                                 font=(SANS_FONT, 9, 'italic'))
+
+        self.tree.bind('<<TreeviewSelect>>', self._on_select)
+
+    def schedule_update(self, content: str):
+        """Debounced rebuild (500 ms)."""
+        if self._update_job:
+            self.after_cancel(self._update_job)
+        self._update_job = self.after(500, lambda: self.update(content))
+
+    def update(self, content: str):
+        """Immediately rebuild the outline tree from document content."""
+        self._update_job = None
+        self.tree.delete(*self.tree.get_children())
+        self._linenos = []
+
+        headings = []
+        in_code_block = False
+        for lineno, line in enumerate(content.split('\n'), 1):
+            if line.strip().startswith('```'):
+                in_code_block = not in_code_block
+                continue
+            if in_code_block:
+                continue
+            m = re.match(r'^(#{1,6})\s+(.+)', line)
+            if m:
+                headings.append((lineno, len(m.group(1)), m.group(2).strip()))
+
+        if not headings:
+            self.tree.insert('', tk.END, text='(no headings)', tags=('empty',))
+            self._linenos.append(None)
+            return
+
+        stack = []
+        for lineno, level, text in headings:
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            indent = '  ' * (level - 1)
+            label  = f'{indent}{"#" * level} {text}'
+            parent_iid = stack[-1][1] if stack else ''
+            iid = self.tree.insert(parent_iid, tk.END, text=label,
+                                   tags=(f'h{level}',), open=True)
+            stack.append((level, iid))
+            self._linenos.append(lineno)
+
+    def _on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        all_items = self._dfs_items()
+        try:
+            idx = all_items.index(sel[0])
+            lineno = self._linenos[idx]
+            if lineno and self._on_heading_click:
+                self._on_heading_click(lineno)
+        except (ValueError, IndexError):
+            pass
+
+    def _dfs_items(self):
+        result = []
+        def recurse(parent=''):
+            for child in self.tree.get_children(parent):
+                result.append(child)
+                recurse(child)
+        recurse()
+        return result
 
 
 class MarkdownNotepad(tk.Tk):
@@ -1318,10 +1585,9 @@ class MarkdownNotepad(tk.Tk):
         else:
             self.md_converter = None
         
+        self.live_render_var = tk.BooleanVar(value=self.theme.get('live_render_enabled', True))
         self._setup_ui()
         self._setup_bindings()
-        
-        # Restore session or create initial empty tab
         self._restore_session()
         self._update_title()
         
@@ -1456,8 +1722,19 @@ class MarkdownNotepad(tk.Tk):
         self._create_toolbar()
         
         # Main content area with PanedWindow for editor and AI sidebar
-        self.main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        self.main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # Outer paned: [outline?] | [main_paned]
+        self.outer_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        self.outer_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.outline_panel   = OutlinePanel(self.outer_paned,
+                                             on_heading_click=self._jump_to_line,
+                                             width=200)
+        self.outline_visible = False
+        # outline_panel is NOT added to outer_paned until first toggle
+
+        # Inner paned: editor | AI sidebar (unchanged)
+        self.main_paned = ttk.PanedWindow(self.outer_paned, orient=tk.HORIZONTAL)
+        self.outer_paned.add(self.main_paned, weight=1)
         
         # Left pane: Editor content with tabs
         self.content_frame = ttk.Frame(self.main_paned)
@@ -1592,6 +1869,16 @@ class MarkdownNotepad(tk.Tk):
         # AI Sidebar
         view_menu.add_command(label="AI Sidebar", command=self._toggle_ai_sidebar, accelerator="Ctrl+Shift+A")
         view_menu.add_command(label="AI Settings...", command=self._open_ai_settings)
+        view_menu.add_separator()
+        view_menu.add_command(label='Document Outline',
+                              command=self._toggle_outline_panel,
+                              accelerator='Ctrl+Shift+L')
+        view_menu.add_separator()
+        view_menu.add_checkbutton(
+            label='Live Re-render in Visual Mode',
+            variable=self.live_render_var,
+            command=self._toggle_live_render
+        )
         
         # Format menu (for source mode)
         format_menu = tk.Menu(menubar, tearoff=0)
@@ -1772,6 +2059,9 @@ class MarkdownNotepad(tk.Tk):
         # AI sidebar toggle
         self.bind("<Control-A>", lambda e: self._toggle_ai_sidebar())  # Ctrl+Shift+A
         
+        # Document Outline toggle
+        self.bind("<Control-L>", lambda e: self._toggle_outline_panel())
+        
         # Export shortcut
         self.bind("<Control-E>", lambda e: self._export_pdf())  # Ctrl+Shift+E
         
@@ -1783,6 +2073,42 @@ class MarkdownNotepad(tk.Tk):
         
         # Handle window close
         self.protocol("WM_DELETE_WINDOW", self.quit_app)
+
+    def _schedule_syntax_highlight(self, event=None):
+        if not getattr(self, '_syntax_hl_pending', False):
+            self._syntax_hl_pending = True
+            self.after(300, self._do_syntax_highlight)
+
+    def _do_syntax_highlight(self):
+        self._syntax_hl_pending = False
+        if self.current_tab:
+            self.current_tab._apply_syntax_highlighting()
+
+    def _jump_to_line(self, lineno: int):
+        if not self.current_tab:
+            return
+        if self.current_tab.current_mode == 'source':
+            editor = self.current_tab.source_editor
+            editor.see(f'{lineno}.0')
+            editor.mark_set(tk.INSERT, f'{lineno}.0')
+            editor.focus_set()
+        else:
+            content = self.current_tab.get_content()
+            total   = max(content.count('\n') + 1, 1)
+            self.current_tab.visual_viewer.text_widget.yview_moveto((lineno - 1) / total)
+
+    def _toggle_outline_panel(self):
+        if self.outline_visible:
+            self.outer_paned.forget(self.outline_panel)
+            self.outline_visible = False
+        else:
+            self.outer_paned.insert(0, self.outline_panel, weight=0, minsize=150)
+            self.outline_visible = True
+            self._schedule_outline_update()
+
+    def _schedule_outline_update(self):
+        if self.outline_visible and self.current_tab:
+            self.outline_panel.schedule_update(self.current_tab.get_content())
     
     # === Session Management Methods ===
     
@@ -1842,6 +2168,8 @@ class MarkdownNotepad(tk.Tk):
                     # Update visual viewer base path
                     if tab.file_path:
                         tab.visual_viewer.set_base_path(os.path.dirname(tab.file_path))
+                    
+                    tab.visual_viewer.live_render_enabled = self.theme.get('live_render_enabled', True)
                     
                     # Show correct mode
                     if tab_state.current_mode == "visual":
@@ -2359,11 +2687,15 @@ class MarkdownNotepad(tk.Tk):
         # Setup bindings for this tab
         self._setup_tab_bindings(tab)
         
+        tab.visual_viewer.live_render_enabled = self.theme.get('live_render_enabled', True)
+        
         # Select the new tab
         self.notebook.select(tab)
         self.current_tab = tab
         
         self._update_title()
+        self._do_syntax_highlight()
+        self._schedule_outline_update()
         return tab
     
     def _setup_tab_bindings(self, tab):
@@ -2374,6 +2706,7 @@ class MarkdownNotepad(tk.Tk):
         
         # Position tracking
         tab.source_editor.bind("<KeyRelease>", self._schedule_position_update)
+        tab.source_editor.bind("<KeyRelease>", self._schedule_syntax_highlight, add='+')
         tab.source_editor.bind("<ButtonRelease>", self._update_position)
         
         # Right-click context menu on editor
@@ -2434,6 +2767,8 @@ class MarkdownNotepad(tk.Tk):
                         self._update_word_count()
                         # Update AI sidebar context for new tab
                         self._update_ai_sidebar_context()
+                        self._do_syntax_highlight()
+                        self._schedule_outline_update()
                         break
         except:
             pass
@@ -2498,6 +2833,7 @@ class MarkdownNotepad(tk.Tk):
         if not self._position_update_pending:
             self._position_update_pending = True
             self.after(50, self._do_position_update)
+        self._schedule_outline_update()
     
     def _do_position_update(self):
         """Actually update position after debounce"""
@@ -2592,6 +2928,13 @@ class MarkdownNotepad(tk.Tk):
                 self.current_tab.source_editor.config(undo=True)
                 self._set_status("Normal mode: full features enabled")
     
+    def _toggle_live_render(self):
+        enabled = self.live_render_var.get()
+        for tab in self.tabs:
+            tab.visual_viewer.live_render_enabled = enabled
+        self.theme['live_render_enabled'] = enabled
+        self._save_theme()
+    
     def _on_ctrl_mousewheel(self, event):
         """Handle Ctrl+MouseWheel for zoom"""
         if event.delta > 0:
@@ -2605,17 +2948,29 @@ class MarkdownNotepad(tk.Tk):
         if self.current_font_size < self.max_font_size:
             self.current_font_size += 1
             self._apply_font_size()
+            for tab in self.tabs:
+                tab.theme['source_font_size'] = self.current_font_size
+                tab._setup_syntax_tags()
+                tab._apply_syntax_highlighting()
     
     def zoom_out(self):
         """Decrease font size"""
         if self.current_font_size > self.min_font_size:
             self.current_font_size -= 1
             self._apply_font_size()
+            for tab in self.tabs:
+                tab.theme['source_font_size'] = self.current_font_size
+                tab._setup_syntax_tags()
+                tab._apply_syntax_highlighting()
     
     def zoom_reset(self):
         """Reset font size to default"""
         self.current_font_size = self.theme['source_font_size']
         self._apply_font_size()
+        for tab in self.tabs:
+            tab.theme['source_font_size'] = self.current_font_size
+            tab._setup_syntax_tags()
+            tab._apply_syntax_highlighting()
     
     def _apply_font_size(self):
         """Apply current font size to all tabs"""
