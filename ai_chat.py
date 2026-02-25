@@ -238,6 +238,8 @@ class AISettings:
         'cached_gemini_models': [],
         'cached_ollama_models': [],
         'cached_deepseek_models': [],
+        # CLI provider
+        'cli_command': '',  # e.g. 'gh copilot chat' or 'claude' or 'gemini'
         # Context menu AI actions (right-click on selected text)
         'context_menu_actions': [
             {'name': 'Transfer to Chat', 'prompt': '', 'enabled': True},
@@ -379,7 +381,15 @@ class AISettings:
     @ollama_url.setter
     def ollama_url(self, value: str):
         self.settings['ollama_url'] = value
-    
+
+    @property
+    def cli_command(self) -> str:
+        return self.settings.get('cli_command', '')
+
+    @cli_command.setter
+    def cli_command(self, value: str):
+        self.settings['cli_command'] = value
+
     def is_configured(self) -> bool:
         """Check if API key is configured for current provider"""
         if self.provider == 'gemini':
@@ -387,7 +397,9 @@ class AISettings:
         elif self.provider == 'deepseek':
             return bool(self.deepseek_api_key)
         elif self.provider == 'ollama':
-            return bool(self.ollama_url)  # Ollama doesn't need API key
+            return bool(self.ollama_url)
+        elif self.provider == 'cli':
+            return bool(self.cli_command)
         return bool(self.api_key)
     
     def get_available_models(self) -> List[str]:
@@ -1617,6 +1629,201 @@ class DeepSeekClient(LLMClient):
 
 
 # =============================================================================
+# CLI Provider Client
+# =============================================================================
+
+class CliClient(LLMClient):
+    """LLM client that drives a persistent interactive CLI process.
+
+    The CLI command (e.g. 'gh copilot chat', 'claude', 'gemini') is launched
+    once as a subprocess and kept alive for the entire app session.  Each user
+    message is written to its stdin; stdout is streamed back until a short
+    silence indicates the response is complete.  CLI-native commands such as
+    /clear, /model, /models, /help are passed through transparently.
+    """
+
+    # Seconds of stdout silence that signals end-of-response
+    SILENCE_TIMEOUT = 0.8
+    # Generous timeout waiting for the very first response token
+    FIRST_TOKEN_TIMEOUT = 30.0
+    # Seconds to wait for initial welcome/prompt on startup
+    STARTUP_DRAIN_TIMEOUT = 4.0
+    # Regex to strip ANSI/VT100 escape sequences
+    _ANSI_RE = re.compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*\x07)')
+
+    def __init__(self, command: str):
+        self.command = command.strip()
+        self._process: Optional['subprocess.Popen'] = None
+        self._out_queue: 'queue.Queue[Optional[str]]' = queue.Queue()
+        self._reader_thread: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------------ #
+    # LLMClient ABC                                                        #
+    # ------------------------------------------------------------------ #
+
+    def send_message(self, messages, system_prompt='', max_tokens=4096,
+                     temperature=0.7, on_chunk=None, **kwargs) -> str:
+        full = ''
+        for chunk in self.send_message_stream(messages, system_prompt=system_prompt, **kwargs):
+            full += chunk
+        return full
+
+    def send_message_stream(self, messages, system_prompt='', max_tokens=4096,
+                            temperature=0.7, top_p=1.0, top_k=0,
+                            images=None, model=None, on_chunk=None,
+                            **kwargs):
+        self._ensure_alive()
+
+        # Extract last user message content (the CLI session owns its own context)
+        last = messages[-1] if messages else {}
+        content = last.get('content', '') if isinstance(last, dict) else getattr(last, 'content', '')
+
+        # Write to CLI stdin
+        self._process.stdin.write(content + '\n')
+        self._process.stdin.flush()
+
+        # Stream response until silence; yield each line
+        yield from self._iter_response()
+
+    def get_available_models(self) -> List[str]:
+        return []  # model managed by the CLI session
+
+    def test_connection(self) -> tuple:
+        """Check that the CLI command is reachable via the system shell.
+
+        Uses shell=True so PATH resolution matches what an interactive terminal
+        sees — this handles .cmd/.bat wrappers on Windows and shell-PATH
+        extensions that wouldn't be visible to a bare subprocess.run([...]) call.
+        """
+        import subprocess as _sp
+        if not self.command:
+            return False, "No CLI command configured."
+        exe = self.command.split()[0]
+        # Shell "not found" fingerprints (case-insensitive check)
+        _NOT_FOUND = ('not recognized', 'not found', 'no such file',
+                      'command not found', 'cannot find', 'is not recognized')
+        for probe in (f'{exe} --version', f'{exe} --help'):
+            try:
+                r = _sp.run(probe, shell=True, capture_output=True, text=True, timeout=8)
+                output = (r.stdout or r.stderr or '').strip()
+                low = output.lower()
+                is_not_found = any(p in low for p in _NOT_FOUND)
+                if not is_not_found and (r.returncode == 0 or output):
+                    first_line = output.split('\n')[0].strip() if output else ''
+                    return True, f'"{exe}" is available.' + (f'  {first_line}' if first_line else '')
+            except Exception:
+                continue
+        return False, (
+            f'"{exe}" could not be verified from this environment. '
+            f'Confirm it runs in your terminal first.'
+        )
+
+    # ------------------------------------------------------------------ #
+    # Session management                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _is_alive(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    def _ensure_alive(self):
+        if not self._is_alive():
+            self._start_session()
+
+    def _start_session(self):
+        import subprocess as _sp
+        # Fresh queue for new session
+        self._out_queue = queue.Queue()
+        self._process = _sp.Popen(
+            self.command,
+            shell=True,
+            stdin=_sp.PIPE,
+            stdout=_sp.PIPE,
+            stderr=_sp.STDOUT,  # merge stderr so errors appear in chat
+            text=True,
+            bufsize=0,
+        )
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name='CliReader'
+        )
+        self._reader_thread.start()
+        # Swallow welcome banner / initial prompt
+        self._drain(self.STARTUP_DRAIN_TIMEOUT)
+
+    def close_session(self):
+        """Terminate the CLI process cleanly."""
+        if self._is_alive():
+            try:
+                self._process.stdin.write('/exit\n')
+                self._process.stdin.flush()
+                self._process.wait(timeout=3)
+            except Exception:
+                pass
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
+        self._process = None
+
+    # ------------------------------------------------------------------ #
+    # I/O helpers                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _reader_loop(self):
+        """Background: copy stdout chars one-by-one into the queue."""
+        try:
+            while True:
+                ch = self._process.stdout.read(1)
+                if not ch:
+                    break
+                self._out_queue.put(ch)
+        finally:
+            self._out_queue.put(None)  # EOF sentinel
+
+    def _drain(self, timeout: float) -> str:
+        """Collect all pending output up to *timeout* seconds of silence."""
+        buf: list = []
+        t = timeout
+        while True:
+            try:
+                ch = self._out_queue.get(timeout=t)
+                if ch is None:
+                    break
+                buf.append(ch)
+                t = self.SILENCE_TIMEOUT
+            except queue.Empty:
+                break
+        return self._strip_ansi(''.join(buf))
+
+    def _iter_response(self):
+        """Generator: yield cleaned lines from stdout until silence timeout."""
+        line: list = []
+        t = self.FIRST_TOKEN_TIMEOUT
+        while True:
+            try:
+                ch = self._out_queue.get(timeout=t)
+                if ch is None:  # process exited
+                    break
+                line.append(ch)
+                t = self.SILENCE_TIMEOUT
+                if ch == '\n':
+                    cleaned = self._strip_ansi(''.join(line))
+                    if cleaned.strip():
+                        yield cleaned
+                    line = []
+            except queue.Empty:
+                # Silence — flush partial line and finish
+                if line:
+                    cleaned = self._strip_ansi(''.join(line))
+                    if cleaned.strip():
+                        yield cleaned
+                break
+
+    @classmethod
+    def _strip_ansi(cls, text: str) -> str:
+        return cls._ANSI_RE.sub('', text).replace('\r', '')
+
+
+# =============================================================================
 # LLM Client Factory
 # =============================================================================
 
@@ -1643,7 +1850,12 @@ def get_llm_client(settings: AISettings) -> Optional[LLMClient]:
         if not OPENAI_AVAILABLE:
             return None
         return DeepSeekClient(settings.deepseek_api_key)
-    
+
+    elif provider == 'cli':
+        if not settings.cli_command:
+            return None
+        return CliClient(settings.cli_command)
+
     return None
 
 
@@ -1712,7 +1924,7 @@ class AISettingsDialog(tk.Toplevel):
         ttk.Label(provider_frame, text="AI Provider:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.provider_var = tk.StringVar(value="anthropic")
         provider_combo = ttk.Combobox(provider_frame, textvariable=self.provider_var, 
-                                       values=["anthropic", "gemini", "deepseek", "ollama"], state="readonly", width=30)
+                                       values=["anthropic", "gemini", "deepseek", "ollama", "cli"], state="readonly", width=30)
         provider_combo.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
         provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
         
@@ -1763,6 +1975,19 @@ class AISettingsDialog(tk.Toplevel):
         self.ollama_url_entry.grid(row=3, column=1, sticky=tk.W, padx=(10, 0))
         ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('ollama'),
                    width=6).grid(row=3, column=3, padx=(5, 0))
+
+        # CLI Command
+        ttk.Label(api_frame, text="CLI Command:").grid(row=4, column=0, sticky=tk.W, pady=5)
+        self.cli_cmd_var = tk.StringVar()
+        self.cli_cmd_entry = ttk.Entry(api_frame, textvariable=self.cli_cmd_var, width=40)
+        self.cli_cmd_entry.grid(row=4, column=1, sticky=tk.W, padx=(10, 0))
+        cli_test_btn = ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('cli'), width=6)
+        cli_test_btn.grid(row=4, column=3, padx=(5, 0))
+        self._create_tooltip(self.cli_cmd_entry,
+            "Enter the command that starts an interactive CLI session,\n"
+            "e.g.  gh copilot chat  or  claude  or  gemini\n"
+            "The session stays alive while the app is open.\n"
+            "CLI commands like /clear, /model, /help are passed through.")
         
         # Model selection
         model_frame = ttk.LabelFrame(main_frame, text="Model", padding=10)
@@ -1893,6 +2118,7 @@ class AISettingsDialog(tk.Toplevel):
         self.gemini_key_var.set(self.settings.gemini_api_key)
         self.deepseek_key_var.set(self.settings.deepseek_api_key)
         self.ollama_url_var.set(self.settings.ollama_url)
+        self.cli_cmd_var.set(self.settings.cli_command)
         self.model_var.set(self.settings.model)
         self.max_tokens_var.set(self.settings.max_tokens)
         self.temp_var.set(self.settings.temperature)
@@ -2004,7 +2230,16 @@ class AISettingsDialog(tk.Toplevel):
         """Handle provider change - use cached models if available"""
         provider = self.provider_var.get()
         current_model = self.model_var.get()
-        
+
+        if provider == 'cli':
+            # CLI manages its own model; disable model selection
+            self.model_combo['values'] = []
+            self.model_var.set('(managed by CLI)')
+            self.model_combo.config(state='disabled')
+            return
+
+        self.model_combo.config(state='normal')
+
         if provider == 'anthropic':
             # Use cached models if available, otherwise defaults
             cached = self.settings.get('cached_anthropic_models', [])
@@ -2140,6 +2375,18 @@ class AISettingsDialog(tk.Toplevel):
             ollama_url = self.ollama_url_var.get()
             client = OllamaClient(ollama_url)
             success, message = client.test_connection()
+        elif provider == 'cli':
+            cmd = self.cli_cmd_var.get().strip()
+            if not cmd:
+                messagebox.showwarning("Warning", "Please enter a CLI command first.", parent=self)
+                return
+            client = CliClient(cmd)
+            success, message = client.test_connection()
+            if success:
+                messagebox.showinfo("Success", message, parent=self)
+            else:
+                messagebox.showerror("Error", message, parent=self)
+            return
         else:
             messagebox.showwarning("Warning", "Unknown provider.", parent=self)
             return
@@ -2173,7 +2420,11 @@ class AISettingsDialog(tk.Toplevel):
         self.settings.gemini_api_key = self.gemini_key_var.get()
         self.settings.deepseek_api_key = self.deepseek_key_var.get()
         self.settings.ollama_url = self.ollama_url_var.get()
-        self.settings.model = self.model_var.get()
+        self.settings.cli_command = self.cli_cmd_var.get().strip()
+        # Don't save '(managed by CLI)' placeholder as the model
+        saved_model = self.model_var.get()
+        if saved_model != '(managed by CLI)':
+            self.settings.model = saved_model
         self.settings.max_tokens = self.max_tokens_var.get()
         self.settings.temperature = self.temp_var.get()
         self.settings.top_p = self.top_p_var.get()
@@ -2308,7 +2559,22 @@ class ChatSidebar(tk.Frame):
     
     def _init_llm_client(self):
         """Initialize or reinitialize the LLM client"""
-        self.llm_client = get_llm_client(self.settings)
+        new_client = get_llm_client(self.settings)
+        # For CLI provider: if the command hasn't changed, keep the live session
+        if (isinstance(self.llm_client, CliClient)
+                and isinstance(new_client, CliClient)
+                and self.llm_client.command == new_client.command
+                and self.llm_client._is_alive()):
+            return
+        # Close any existing CLI session before replacing
+        if isinstance(self.llm_client, CliClient):
+            self.llm_client.close_session()
+        self.llm_client = new_client
+
+    def cleanup(self):
+        """Release resources (call when the sidebar is destroyed)."""
+        if isinstance(self.llm_client, CliClient):
+            self.llm_client.close_session()
     
     def _setup_ui(self):
         """Setup the sidebar UI"""
@@ -2609,6 +2875,10 @@ class ChatSidebar(tk.Frame):
             if not self.settings.gemini_api_key:
                 self._add_chat_message("system", "Gemini API key not configured. Please add in Settings.")
                 return
+        elif self.settings.provider == 'cli':
+            if not self.settings.cli_command:
+                self._add_chat_message("system", "CLI command not configured. Please add a CLI command in Settings.")
+                return
         else:
             if not self.settings.api_key:
                 self._add_chat_message("system", "API key not configured. Please add your API key in Settings.")
@@ -2706,7 +2976,7 @@ class ChatSidebar(tk.Frame):
                 self.llm_client.api_key = self.settings.gemini_api_key
             elif self.settings.provider == 'anthropic':
                 self.llm_client.api_key = self.settings.api_key
-            # Ollama doesn't need API key update
+            # Ollama and CLI don't need API key updates
             
             # Stream response with all parameters
             response_text = ""
