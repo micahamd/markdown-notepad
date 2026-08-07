@@ -10,6 +10,7 @@ import os
 import re
 import base64
 import hashlib
+import sys
 import threading
 import queue
 from pathlib import Path
@@ -1629,6 +1630,216 @@ class DeepSeekClient(LLMClient):
 
 
 # =============================================================================
+# ConPTY / PTY helpers for CliClient
+# =============================================================================
+
+if sys.platform == 'win32':
+    import ctypes
+    import ctypes.wintypes as _wt
+
+    class _WinPTYStream:
+        """File-like read/write wrapper around a Win32 pipe HANDLE.
+
+        Intentionally chunk-based: read_chunk() returns whatever bytes
+        arrive in a single ReadFile call, decoded to str.  This avoids
+        blocking on \\n, which TUI tools (e.g. gh copilot chat) never
+        emit for cursor-positioned response text.
+        """
+
+        _READ_BUF = 4096  # bytes per ReadFile call
+
+        def __init__(self, k32, handle: '_wt.HANDLE', mode: str):
+            self._k32    = k32
+            self._handle = handle
+            self._mode   = mode  # 'r' or 'w'
+
+        def write(self, text: str) -> int:
+            data    = text.encode('utf-8')
+            written = _wt.DWORD(0)
+            self._k32.WriteFile(self._handle, data, len(data),
+                                ctypes.byref(written), None)
+            return written.value
+
+        def flush(self):
+            pass  # WriteFile to a pipe is synchronous
+
+        def read_chunk(self) -> str:
+            """Block until data arrives; decode and return as str.
+            Returns '' on EOF or error.
+            """
+            buf   = ctypes.create_string_buffer(self._READ_BUF)
+            nread = _wt.DWORD(0)
+            ok = self._k32.ReadFile(self._handle, buf, self._READ_BUF,
+                                    ctypes.byref(nread), None)
+            if not ok or nread.value == 0:
+                return ''
+            return buf.raw[:nread.value].decode('utf-8', errors='replace')
+
+    class _WinPTY:
+        """Minimal Windows ConPTY wrapper using ctypes only.
+
+        Requires Windows 10 version 1809 (build 17763) or later.
+        Gives the child process a real pseudo-terminal so that interactive
+        TUI tools (e.g. 'gh copilot chat') see isatty(stdout)==True and
+        remain line-buffered / streaming.
+        """
+
+        def __init__(self, command: str, cols: int = 220, rows: int = 50):
+            import os as _os
+            k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+            # ── Structures ────────────────────────────────────────────────
+            class _STARTUPINFOW(ctypes.Structure):
+                _fields_ = [
+                    ('cb',             _wt.DWORD ), ('lpReserved',    _wt.LPWSTR),
+                    ('lpDesktop',      _wt.LPWSTR), ('lpTitle',       _wt.LPWSTR),
+                    ('dwX',            _wt.DWORD ), ('dwY',           _wt.DWORD ),
+                    ('dwXSize',        _wt.DWORD ), ('dwYSize',       _wt.DWORD ),
+                    ('dwXCountChars',  _wt.DWORD ), ('dwYCountChars', _wt.DWORD ),
+                    ('dwFillAttribute',_wt.DWORD ), ('dwFlags',       _wt.DWORD ),
+                    ('wShowWindow',    _wt.WORD  ), ('cbReserved2',   _wt.WORD  ),
+                    ('lpReserved2',    _wt.LPBYTE), ('hStdInput',     _wt.HANDLE),
+                    ('hStdOutput',     _wt.HANDLE), ('hStdError',     _wt.HANDLE),
+                ]
+
+            class _STARTUPINFOEXW(ctypes.Structure):
+                _fields_ = [
+                    ('StartupInfo',    _STARTUPINFOW),
+                    ('lpAttributeList', ctypes.c_void_p),
+                ]
+
+            class _PROCESS_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ('hProcess',    _wt.HANDLE), ('hThread',    _wt.HANDLE),
+                    ('dwProcessId', _wt.DWORD ), ('dwThreadId', _wt.DWORD ),
+                ]
+
+            # ── Create two pipe pairs ─────────────────────────────────────
+            # stdin  path: pty_in_write → [pipe] → pty_in_read  (PTY reads)
+            # stdout path: pty_out_write → [PTY writes] → pty_out_read (we read)
+            pty_in_read   = _wt.HANDLE()
+            pty_in_write  = _wt.HANDLE()
+            pty_out_read  = _wt.HANDLE()
+            pty_out_write = _wt.HANDLE()
+            if not k32.CreatePipe(ctypes.byref(pty_in_read),
+                                  ctypes.byref(pty_in_write), None, 0):
+                raise OSError(ctypes.get_last_error(), 'CreatePipe(stdin) failed')
+            if not k32.CreatePipe(ctypes.byref(pty_out_read),
+                                  ctypes.byref(pty_out_write), None, 0):
+                raise OSError(ctypes.get_last_error(), 'CreatePipe(stdout) failed')
+
+            # ── CreatePseudoConsole ───────────────────────────────────────
+            # COORD is packed as c_uint32: low 16 bits = X (cols), high 16 = Y (rows)
+            k32.CreatePseudoConsole.argtypes = [
+                ctypes.c_uint32,                          # COORD (by value)
+                _wt.HANDLE, _wt.HANDLE, _wt.DWORD,        # hInput, hOutput, dwFlags
+                ctypes.POINTER(_wt.HANDLE),                # phPC
+            ]
+            k32.CreatePseudoConsole.restype = ctypes.HRESULT
+            hpc = _wt.HANDLE()
+            size_coord = ctypes.c_uint32((rows << 16) | (cols & 0xFFFF))
+            hr = k32.CreatePseudoConsole(
+                size_coord, pty_in_read, pty_out_write, 0, ctypes.byref(hpc))
+            if hr != 0:
+                raise OSError(f'CreatePseudoConsole failed: hr={hr:#010x}')
+
+            # Close the ends now owned by the PTY (must happen BEFORE CreateProcess)
+            k32.CloseHandle(pty_in_read)
+            k32.CloseHandle(pty_out_write)
+
+            # ── PROC_THREAD_ATTRIBUTE_LIST ────────────────────────────────
+            attr_size = ctypes.c_size_t(0)
+            k32.InitializeProcThreadAttributeList(None, 1, 0,
+                                                  ctypes.byref(attr_size))
+            attr_buf = ctypes.create_string_buffer(attr_size.value)
+            k32.InitializeProcThreadAttributeList(attr_buf, 1, 0,
+                                                  ctypes.byref(attr_size))
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
+            k32.UpdateProcThreadAttribute(
+                attr_buf, 0,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                hpc,                          # lpValue = HPCON handle
+                ctypes.sizeof(_wt.HANDLE),    # cbSize
+                None, None,
+            )
+
+            # ── STARTUPINFOEXW ────────────────────────────────────────────
+            si_ex = _STARTUPINFOEXW()
+            si_ex.StartupInfo.cb = ctypes.sizeof(_STARTUPINFOEXW)
+            si_ex.lpAttributeList = ctypes.cast(attr_buf, ctypes.c_void_p)
+
+            # ── CreateProcessW ────────────────────────────────────────────
+            EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+            CREATE_UNICODE_ENVIRONMENT   = 0x00000400
+            env_dict = _os.environ.copy()
+            env_dict['NO_COLOR'] = '1'
+            env_dict['TERM']     = 'dumb'
+            env_block = '\x00'.join(f'{k}={v}' for k, v in env_dict.items()) + '\x00\x00'
+            env_wchar = ctypes.create_unicode_buffer(env_block)
+
+            # Wrap in cmd.exe /c so that PATH resolution works for bare
+            # commands like 'copilot' (CreateProcessW doesn't search PATH).
+            cmd_line = f'cmd.exe /c {command}'
+
+            pi = _PROCESS_INFORMATION()
+            ok = k32.CreateProcessW(
+                None, cmd_line,
+                None, None,
+                False,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                env_wchar, None,
+                ctypes.byref(si_ex),
+                ctypes.byref(pi),
+            )
+            k32.DeleteProcThreadAttributeList(attr_buf)
+            if not ok:
+                raise OSError(ctypes.get_last_error(),
+                              f'CreateProcessW failed for: {command}')
+            k32.CloseHandle(pi.hThread)
+
+            self._k32       = k32
+            self._hpc       = hpc
+            self._hprocess  = pi.hProcess
+            self._pid       = pi.dwProcessId
+            self._in_write  = pty_in_write
+            self._out_read  = pty_out_read
+            self.stdin  = _WinPTYStream(k32, pty_in_write,  'w')
+            self.stdout = _WinPTYStream(k32, pty_out_read,  'r')
+
+        def poll(self):
+            STILL_ACTIVE = 259
+            ec = _wt.DWORD()
+            if self._k32.GetExitCodeProcess(self._hprocess, ctypes.byref(ec)):
+                return None if ec.value == STILL_ACTIVE else ec.value
+            return 0
+
+        def terminate(self):
+            try:
+                self._k32.TerminateProcess(self._hprocess, 1)
+            except Exception:
+                pass
+
+        def wait(self, timeout=None):
+            ms = int(timeout * 1000) if timeout is not None else 0xFFFFFFFF
+            self._k32.WaitForSingleObject(self._hprocess, ms)
+
+        def close(self):
+            """Release all ConPTY and pipe handles."""
+            for attr, closer in (
+                ('_hpc',      self._k32.ClosePseudoConsole),
+                ('_in_write', self._k32.CloseHandle),
+                ('_out_read', self._k32.CloseHandle),
+                ('_hprocess', self._k32.CloseHandle),
+            ):
+                h = getattr(self, attr, None)
+                if h:
+                    try:
+                        closer(h)
+                    except Exception:
+                        pass
+
+
+# =============================================================================
 # CLI Provider Client
 # =============================================================================
 
@@ -1642,14 +1853,27 @@ class CliClient(LLMClient):
     /clear, /model, /models, /help are passed through transparently.
     """
 
-    # Seconds of stdout silence that signals end-of-response
-    SILENCE_TIMEOUT = 0.8
-    # Generous timeout waiting for the very first response token
+    # After first data arrives, wait this long for more before declaring done.
+    SILENCE_TIMEOUT = 3.0
+    # Wait up to 30 s for the very first byte after sending a message.
     FIRST_TOKEN_TIMEOUT = 30.0
-    # Seconds to wait for initial welcome/prompt on startup
-    STARTUP_DRAIN_TIMEOUT = 4.0
-    # Regex to strip ANSI/VT100 escape sequences
-    _ANSI_RE = re.compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*\x07)')
+    # Wait up to 10 s for the startup banner / loading spinner to finish.
+    STARTUP_DRAIN_TIMEOUT = 10.0
+    # Inter-chunk timeout used inside _drain (smaller than SILENCE_TIMEOUT so
+    # the startup drain doesn't take forever between banner chunks).
+    DRAIN_INTER_CHUNK_TIMEOUT = 1.0
+    # Regex to strip ANSI/VT100/DEC/OSC escape sequences
+    _ANSI_RE = re.compile(
+        r'\x1b(?:'
+        r'\[[0-?]*[ -/]*[@-~]'   # CSI sequences:  ESC [ ... <final>
+        r'|[()][AB012]'           # Charset designations
+        r'|\][^\x07\x1b]*(?:\x07|\x1b\\)'  # OSC sequences (window title etc.)
+        r'|[@-Z\\-_]'            # Two-char sequences (ESC + single byte)
+        r'|#[0-9]'               # DEC screen alignment
+        r')'
+    )
+    # Also strip bare \r and non-printable control chars
+    _CTRL_RE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
 
     def __init__(self, command: str):
         self.command = command.strip()
@@ -1678,9 +1902,13 @@ class CliClient(LLMClient):
         last = messages[-1] if messages else {}
         content = last.get('content', '') if isinstance(last, dict) else getattr(last, 'content', '')
 
+        print(f"[DEBUG] CLI send_message_stream: sending '{content[:50]}...'")
+
         # Write to CLI stdin
         self._process.stdin.write(content + '\n')
         self._process.stdin.flush()
+
+        print(f"[DEBUG] CLI message sent, waiting for response...")
 
         # Stream response until silence; yield each line
         yield from self._iter_response()
@@ -1730,18 +1958,56 @@ class CliClient(LLMClient):
             self._start_session()
 
     def _start_session(self):
-        import subprocess as _sp
         # Fresh queue for new session
         self._out_queue = queue.Queue()
-        self._process = _sp.Popen(
-            self.command,
-            shell=True,
-            stdin=_sp.PIPE,
-            stdout=_sp.PIPE,
-            stderr=_sp.STDOUT,  # merge stderr so errors appear in chat
-            text=True,
-            bufsize=0,
-        )
+        if sys.platform == 'win32':
+            # Use ConPTY so the child process sees isatty(stdout) == True,
+            # which keeps interactive TUI tools (e.g. 'gh copilot chat')
+            # line-buffered and streaming rather than fully-buffered/silent.
+            try:
+                self._process = _WinPTY(self.command)
+                print('[DEBUG] CLI session started via ConPTY')
+            except OSError as _e:
+                print(f'[DEBUG] ConPTY unavailable ({_e}), falling back to Popen')
+                import subprocess as _sp
+                self._process = _sp.Popen(
+                    self.command, shell=True,
+                    stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                    text=True, bufsize=1,
+                )
+        else:
+            # Non-Windows: use a pty master/slave pair for the same effect.
+            import subprocess as _sp
+            import pty as _pty
+            import os as _os
+            import io as _io
+            master_fd, slave_fd = _pty.openpty()
+            proc = _sp.Popen(
+                self.command, shell=True,
+                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                close_fds=True,
+                preexec_fn=_os.setsid,
+            )
+            _os.close(slave_fd)
+            _master_raw = _io.open(master_fd, 'r+b', buffering=0, closefd=True)
+
+            class _PTYStream:
+                def write(self, text):
+                    _master_raw.write(text.encode('utf-8'))
+                def flush(self): pass
+                def read(self, n=1):
+                    try:
+                        data = _master_raw.read(n)
+                        return data.decode('utf-8', errors='replace') if data else ''
+                    except OSError:
+                        return ''
+            _stream = _PTYStream()
+            proc.stdin  = _stream
+            proc.stdout = _stream
+            proc._pty_master = _master_raw
+            self._process = proc
+            print('[DEBUG] CLI session started via POSIX pty')
+
         self._reader_thread = threading.Thread(
             target=self._reader_loop, daemon=True, name='CliReader'
         )
@@ -1762,6 +2028,12 @@ class CliClient(LLMClient):
                 self._process.terminate()
             except Exception:
                 pass
+            # Release ConPTY handles (or pty master fd) if applicable
+            if hasattr(self._process, 'close'):
+                try:
+                    self._process.close()
+                except Exception:
+                    pass
         self._process = None
 
     # ------------------------------------------------------------------ #
@@ -1769,13 +2041,30 @@ class CliClient(LLMClient):
     # ------------------------------------------------------------------ #
 
     def _reader_loop(self):
-        """Background: copy stdout chars one-by-one into the queue."""
+        """Background: read raw chunks from the PTY and queue them as-is.
+
+        ANSI sequences are preserved here so that _iter_response can feed
+        everything through a VT100 screen buffer and reason about the final
+        rendered layout rather than the raw byte stream.
+        """
         try:
             while True:
-                ch = self._process.stdout.read(1)
-                if not ch:
+                if self._process is None:
                     break
-                self._out_queue.put(ch)
+                try:
+                    stdout = self._process.stdout
+                    if stdout is None:
+                        break
+                    # ConPTY path: read a full chunk without blocking on \n
+                    if hasattr(stdout, 'read_chunk'):
+                        raw = stdout.read_chunk()
+                    else:
+                        raw = stdout.read(1)
+                    if not raw:
+                        break
+                    self._out_queue.put(raw)  # raw (ANSI intact)
+                except (AttributeError, ValueError, OSError):
+                    break
         finally:
             self._out_queue.put(None)  # EOF sentinel
 
@@ -1787,40 +2076,253 @@ class CliClient(LLMClient):
             try:
                 ch = self._out_queue.get(timeout=t)
                 if ch is None:
+                    # EOF sentinel — re-queue so _iter_response() can also see it
+                    self._out_queue.put(None)
                     break
                 buf.append(ch)
-                t = self.SILENCE_TIMEOUT
+                # Use the short drain inter-chunk timeout (not SILENCE_TIMEOUT)
+                # so the welcome banner is consumed quickly.
+                t = self.DRAIN_INTER_CHUNK_TIMEOUT
             except queue.Empty:
                 break
         return self._strip_ansi(''.join(buf))
 
+    # ---- VT100 screen buffer ------------------------------------------ #
+
+    class _VT100Screen:
+        """Minimal VT100/ANSI screen emulator.
+
+        Interprets cursor-movement and erase sequences to maintain a 2-D
+        character buffer.  After feeding all raw PTY output, get_rows()
+        returns the final rendered text lines — correctly positioned, with
+        no escape codes.
+        """
+
+        def __init__(self, cols: int = 220, rows: int = 50):
+            self.cols = cols
+            self.rows = rows
+            self.buf  = [[' '] * cols for _ in range(rows)]
+            self.cx   = 0   # cursor column (0-based)
+            self.cy   = 0   # cursor row    (0-based)
+
+        def feed(self, text: str) -> None:  # noqa: C901
+            i = 0
+            n = len(text)
+            while i < n:
+                c = text[i]
+                if c == '\x1b' and i + 1 < n:
+                    nc = text[i + 1]
+                    if nc == '[':
+                        # CSI sequence: ESC [ <params> <cmd>
+                        j = i + 2
+                        while j < n and (text[j].isdigit() or text[j] in ';?'):
+                            j += 1
+                        if j < n:
+                            self._csi(text[j], text[i + 2:j])
+                            i = j + 1
+                            continue
+                    elif nc == ']':
+                        # OSC: skip to BEL or ST
+                        j = i + 2
+                        while j < n and text[j] != '\x07':
+                            if text[j] == '\x1b' and j + 1 < n and text[j+1] == '\\':
+                                j += 2
+                                break
+                            j += 1
+                        else:
+                            j += 1
+                        i = j
+                        continue
+                    else:
+                        i += 2
+                        continue
+                elif c == '\r':
+                    self.cx = 0
+                elif c == '\n':
+                    self.cy = min(self.cy + 1, self.rows - 1)
+                elif c == '\b':
+                    self.cx = max(self.cx - 1, 0)
+                elif ord(c) >= 32:
+                    if 0 <= self.cy < self.rows and 0 <= self.cx < self.cols:
+                        self.buf[self.cy][self.cx] = c
+                    self.cx += 1
+                    if self.cx >= self.cols:
+                        self.cx = 0
+                        self.cy = min(self.cy + 1, self.rows - 1)
+                i += 1
+
+        def _csi(self, cmd: str, params: str) -> None:
+            raw = params.replace('?', '')
+            nums: list = []
+            for p in raw.split(';'):
+                try:
+                    nums.append(int(p))
+                except ValueError:
+                    nums.append(0)
+
+            def _n(idx: int, default: int = 1) -> int:
+                return nums[idx] if idx < len(nums) and nums[idx] else default
+
+            if cmd in ('H', 'f'):
+                row = (_n(0, 1)) - 1
+                col = (_n(1, 1)) - 1
+                self.cy = max(0, min(row, self.rows - 1))
+                self.cx = max(0, min(col, self.cols - 1))
+            elif cmd == 'A':
+                self.cy = max(0, self.cy - _n(0))
+            elif cmd == 'B':
+                self.cy = min(self.rows - 1, self.cy + _n(0))
+            elif cmd == 'C':
+                self.cx = min(self.cols - 1, self.cx + _n(0))
+            elif cmd == 'D':
+                self.cx = max(0, self.cx - _n(0))
+            elif cmd == 'G':
+                self.cx = max(0, min(_n(0) - 1, self.cols - 1))
+            elif cmd == 'd':
+                self.cy = max(0, min(_n(0) - 1, self.rows - 1))
+            elif cmd == 'J':
+                mode = nums[0] if nums else 0
+                if mode in (2, 3):
+                    self.buf = [[' '] * self.cols for _ in range(self.rows)]
+                    self.cx = self.cy = 0
+                elif mode == 0:
+                    for col in range(self.cx, self.cols):
+                        self.buf[self.cy][col] = ' '
+                    for row in range(self.cy + 1, self.rows):
+                        self.buf[row] = [' '] * self.cols
+                elif mode == 1:
+                    for col in range(0, self.cx + 1):
+                        self.buf[self.cy][col] = ' '
+                    for row in range(0, self.cy):
+                        self.buf[row] = [' '] * self.cols
+            elif cmd == 'K':
+                mode = nums[0] if nums else 0
+                if mode == 0:
+                    for col in range(self.cx, self.cols):
+                        self.buf[self.cy][col] = ' '
+                elif mode == 1:
+                    for col in range(0, self.cx + 1):
+                        self.buf[self.cy][col] = ' '
+                elif mode == 2:
+                    self.buf[self.cy] = [' '] * self.cols
+            elif cmd == 'P':
+                m = _n(0)
+                row = self.buf[self.cy]
+                del row[self.cx:self.cx + m]
+                row.extend([' '] * m)
+            elif cmd == 'L':
+                for _ in range(_n(0)):
+                    self.buf.insert(self.cy, [' '] * self.cols)
+                    self.buf.pop()
+            elif cmd == 'M':
+                for _ in range(_n(0)):
+                    self.buf.pop(self.cy)
+                    self.buf.append([' '] * self.cols)
+            # Ignore: SGR colour (m), cursor visibility (l/h), margins (r), etc.
+
+        def get_rows(self) -> list:
+            """Return trailing-space-stripped row strings."""
+            return [''.join(row).rstrip() for row in self.buf]
+
+    # ---- Chrome detection on rendered rows ----------------------------- #
+
+    _BOX_RE      = re.compile(r'^[\u2500-\u257f\u2550-\u256c \u00b7\u200b\u2502]*$')
+    _HINT_RE     = re.compile(r'shift\+tab|ctrl\+[a-z]|switch mode|run command|'
+                              r'tab to select|enter to confirm|remaining req',
+                              re.IGNORECASE)
+    _PROMPT_RE   = re.compile(r'^\u276f')          # ❯  input echo
+    _GITPATH_RE  = re.compile(r'\u2387|\[\u2387')  # ⎇  git branch
+    _WINPATH_RE  = re.compile(r'^[A-Z]:\\')
+    _MODEL_RE    = re.compile(r'claude-|gpt-|gemini-|copilot', re.IGNORECASE)
+
+    @classmethod
+    def _is_chrome_row(cls, row: str) -> bool:
+        """Return True if *row* is TUI chrome rather than AI response text."""
+        s = row.strip()
+        if not s:
+            return True
+        if cls._BOX_RE.match(s):
+            return True
+        if cls._HINT_RE.search(s):
+            return True
+        if cls._PROMPT_RE.match(s):
+            return True
+        if cls._GITPATH_RE.search(s):
+            return True
+        if cls._WINPATH_RE.match(s):
+            return True
+        if cls._MODEL_RE.search(s) and len(s) < 80:
+            return True
+        return False
+
     def _iter_response(self):
-        """Generator: yield cleaned lines from stdout until silence timeout."""
-        line: list = []
+        """Collect raw PTY output, render incrementally through VT100 screen.
+
+        Timeout strategy:
+        - FIRST_TOKEN_TIMEOUT (30 s) is used as long as the rendered screen
+          contains only chrome — i.e. keyboard hints, dividers, input echo.
+          This keeps us waiting even when the TUI re-renders its chrome frames
+          between sending the message and the AI starting to reply.
+        - SILENCE_TIMEOUT (3 s) kicks in the moment we detect actual AI content
+          rows on the rendered screen.  Once content has appeared, a 3 s gap
+          means the response is complete.
+        """
+        screen = self._VT100Screen(cols=220, rows=50)
+        got_content = False
         t = self.FIRST_TOKEN_TIMEOUT
+        raw_chunks: list = []
+
         while True:
             try:
-                ch = self._out_queue.get(timeout=t)
-                if ch is None:  # process exited
+                chunk = self._out_queue.get(timeout=t)
+                if chunk is None:
+                    print(f'[DEBUG] CLI process exited after {len(raw_chunks)} raw chunks')
                     break
-                line.append(ch)
-                t = self.SILENCE_TIMEOUT
-                if ch == '\n':
-                    cleaned = self._strip_ansi(''.join(line))
-                    if cleaned.strip():
-                        yield cleaned
-                    line = []
+                raw_chunks.append(chunk)
+                screen.feed(chunk)
+
+                if not got_content:
+                    # Check rendered screen for any non-chrome content
+                    rows = screen.get_rows()
+                    if any(r.strip() and not self._is_chrome_row(r) for r in rows):
+                        got_content = True
+                        t = self.SILENCE_TIMEOUT
+                        print('[DEBUG] Content detected on screen, switching to short timeout')
+                    # else: keep FIRST_TOKEN_TIMEOUT — AI hasn't started responding yet
             except queue.Empty:
-                # Silence — flush partial line and finish
-                if line:
-                    cleaned = self._strip_ansi(''.join(line))
-                    if cleaned.strip():
-                        yield cleaned
+                print(f'[DEBUG] Silence after {len(raw_chunks)} raw chunks '
+                      f'(got_content={got_content})')
                 break
+
+        if not raw_chunks:
+            print('[DEBUG] No data from CLI provider')
+            return
+
+        # Final render and chrome extraction
+        rows = screen.get_rows()
+
+        # Debug: show non-empty rendered rows
+        print('[DEBUG] Rendered screen rows (non-empty):')
+        for i, r in enumerate(rows):
+            if r.strip():
+                print(f'  [{i:02d}] {repr(r[:120])}')
+
+        content_lines = [r.strip() for r in rows if not self._is_chrome_row(r)]
+        response = '\n'.join(content_lines).strip()
+
+        if response:
+            print(f'[DEBUG] Extracted response: {repr(response[:300])}')
+            yield response
+        else:
+            print('[DEBUG] All rows were chrome — yielding stripped fallback')
+            fallback = self._strip_ansi(''.join(raw_chunks)).strip()
+            if fallback:
+                yield fallback
 
     @classmethod
     def _strip_ansi(cls, text: str) -> str:
-        return cls._ANSI_RE.sub('', text).replace('\r', '')
+        cleaned = cls._ANSI_RE.sub('', text).replace('\r', '')
+        return cls._CTRL_RE.sub('', cleaned)
 
 
 # =============================================================================
@@ -1874,9 +2376,9 @@ class AISettingsDialog(tk.Toplevel):
         self.result = None
         
         self.title("AI Settings")
-        self.geometry("560x900")
+        self.geometry("560x560")
         self.resizable(True, True)
-        self.minsize(520, 780)
+        self.minsize(520, 500)
         self.transient(parent)
         self.grab_set()
         
@@ -1913,203 +2415,241 @@ class AISettingsDialog(tk.Toplevel):
         widget.bind('<Enter>', show_tooltip)
     
     def _setup_ui(self):
-        """Setup the dialog UI"""
-        main_frame = ttk.Frame(self, padding=15)
+        """Setup the dialog UI with a compact, tabbed layout."""
+        main_frame = ttk.Frame(self, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Provider selection
-        provider_frame = ttk.LabelFrame(main_frame, text="Provider", padding=10)
-        provider_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        ttk.Label(provider_frame, text="AI Provider:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.provider_var = tk.StringVar(value="anthropic")
-        provider_combo = ttk.Combobox(provider_frame, textvariable=self.provider_var, 
-                                       values=["anthropic", "gemini", "deepseek", "ollama", "cli"], state="readonly", width=30)
-        provider_combo.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
-        provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
-        
-        # API Keys Frame
-        api_frame = ttk.LabelFrame(main_frame, text="API Keys / Connection", padding=10)
-        api_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        # Anthropic API Key
-        ttk.Label(api_frame, text="Anthropic:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.api_key_var = tk.StringVar()
-        self.api_key_entry = ttk.Entry(api_frame, textvariable=self.api_key_var, width=40, show="•")
-        self.api_key_entry.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
-        
-        self.show_key_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(api_frame, text="Show", variable=self.show_key_var,
-                        command=self._toggle_key_visibility).grid(row=0, column=2, padx=(5, 0))
-        ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('anthropic'), 
-                   width=6).grid(row=0, column=3, padx=(5, 0))
-        
-        # Gemini API Key
-        ttk.Label(api_frame, text="Gemini:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.gemini_key_var = tk.StringVar()
-        self.gemini_key_entry = ttk.Entry(api_frame, textvariable=self.gemini_key_var, width=40, show="•")
-        self.gemini_key_entry.grid(row=1, column=1, sticky=tk.W, padx=(10, 0))
-        
-        self.show_gemini_key_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(api_frame, text="Show", variable=self.show_gemini_key_var,
-                        command=self._toggle_gemini_key_visibility).grid(row=1, column=2, padx=(5, 0))
-        ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('gemini'),
-                   width=6).grid(row=1, column=3, padx=(5, 0))
-        
-        # DeepSeek API Key
-        ttk.Label(api_frame, text="DeepSeek:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.deepseek_key_var = tk.StringVar()
-        self.deepseek_key_entry = ttk.Entry(api_frame, textvariable=self.deepseek_key_var, width=40, show="•")
-        self.deepseek_key_entry.grid(row=2, column=1, sticky=tk.W, padx=(10, 0))
-        
-        self.show_deepseek_key_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(api_frame, text="Show", variable=self.show_deepseek_key_var,
-                        command=self._toggle_deepseek_key_visibility).grid(row=2, column=2, padx=(5, 0))
-        ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('deepseek'),
-                   width=6).grid(row=2, column=3, padx=(5, 0))
-        
-        # Ollama URL
-        ttk.Label(api_frame, text="Ollama URL:").grid(row=3, column=0, sticky=tk.W, pady=5)
-        self.ollama_url_var = tk.StringVar(value="http://localhost:11434")
-        self.ollama_url_entry = ttk.Entry(api_frame, textvariable=self.ollama_url_var, width=40)
-        self.ollama_url_entry.grid(row=3, column=1, sticky=tk.W, padx=(10, 0))
-        ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('ollama'),
-                   width=6).grid(row=3, column=3, padx=(5, 0))
 
-        # CLI Command
-        ttk.Label(api_frame, text="CLI Command:").grid(row=4, column=0, sticky=tk.W, pady=5)
+        # Notebook with 3 tabs
+        nb = ttk.Notebook(main_frame)
+        nb.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        # ── Tab 1: Connection ─────────────────────────────────────────── #
+        t_conn = ttk.Frame(nb, padding=8)
+        nb.add(t_conn, text="  Connection  ")
+
+        prov_frame = ttk.LabelFrame(t_conn, text="Provider", padding=8)
+        prov_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(prov_frame, text="AI Provider:").grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.provider_var = tk.StringVar(value="anthropic")
+        provider_combo = ttk.Combobox(
+            prov_frame, textvariable=self.provider_var,
+            values=["anthropic", "gemini", "deepseek", "ollama", "cli"],
+            state="readonly", width=28)
+        provider_combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
+        provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
+
+        # Dynamic credential panel — one sub-frame per provider
+        cred_outer = ttk.LabelFrame(t_conn, text="API Keys / Connection", padding=8)
+        cred_outer.pack(fill=tk.X, pady=(0, 8))
+        self._cred_frames = {}
+
+        # Anthropic
+        f = ttk.Frame(cred_outer)
+        f.columnconfigure(1, weight=1)
+        ttk.Label(f, text="API Key:", width=11, anchor=tk.W).grid(row=0, column=0, sticky=tk.W)
+        self.api_key_var = tk.StringVar()
+        self.api_key_entry = ttk.Entry(f, textvariable=self.api_key_var, show="•")
+        self.api_key_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0))
+        self.show_key_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="Show", variable=self.show_key_var,
+                        command=self._toggle_key_visibility).grid(row=0, column=2, padx=(4, 0))
+        ttk.Button(f, text="Test", width=6,
+                   command=lambda: self._test_connection('anthropic')).grid(row=0, column=3, padx=(4, 0))
+        self._cred_frames['anthropic'] = f
+
+        # Gemini
+        f = ttk.Frame(cred_outer)
+        f.columnconfigure(1, weight=1)
+        ttk.Label(f, text="API Key:", width=11, anchor=tk.W).grid(row=0, column=0, sticky=tk.W)
+        self.gemini_key_var = tk.StringVar()
+        self.gemini_key_entry = ttk.Entry(f, textvariable=self.gemini_key_var, show="•")
+        self.gemini_key_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0))
+        self.show_gemini_key_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="Show", variable=self.show_gemini_key_var,
+                        command=self._toggle_gemini_key_visibility).grid(row=0, column=2, padx=(4, 0))
+        ttk.Button(f, text="Test", width=6,
+                   command=lambda: self._test_connection('gemini')).grid(row=0, column=3, padx=(4, 0))
+        self._cred_frames['gemini'] = f
+
+        # DeepSeek
+        f = ttk.Frame(cred_outer)
+        f.columnconfigure(1, weight=1)
+        ttk.Label(f, text="API Key:", width=11, anchor=tk.W).grid(row=0, column=0, sticky=tk.W)
+        self.deepseek_key_var = tk.StringVar()
+        self.deepseek_key_entry = ttk.Entry(f, textvariable=self.deepseek_key_var, show="•")
+        self.deepseek_key_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0))
+        self.show_deepseek_key_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="Show", variable=self.show_deepseek_key_var,
+                        command=self._toggle_deepseek_key_visibility).grid(row=0, column=2, padx=(4, 0))
+        ttk.Button(f, text="Test", width=6,
+                   command=lambda: self._test_connection('deepseek')).grid(row=0, column=3, padx=(4, 0))
+        self._cred_frames['deepseek'] = f
+
+        # Ollama
+        f = ttk.Frame(cred_outer)
+        f.columnconfigure(1, weight=1)
+        ttk.Label(f, text="URL:", width=11, anchor=tk.W).grid(row=0, column=0, sticky=tk.W)
+        self.ollama_url_var = tk.StringVar(value="http://localhost:11434")
+        self.ollama_url_entry = ttk.Entry(f, textvariable=self.ollama_url_var)
+        self.ollama_url_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0))
+        ttk.Button(f, text="Test", width=6,
+                   command=lambda: self._test_connection('ollama')).grid(row=0, column=2, padx=(4, 0))
+        self._cred_frames['ollama'] = f
+
+        # CLI
+        f = ttk.Frame(cred_outer)
+        f.columnconfigure(1, weight=1)
+        ttk.Label(f, text="Command:", width=11, anchor=tk.W).grid(row=0, column=0, sticky=tk.W)
         self.cli_cmd_var = tk.StringVar()
-        self.cli_cmd_entry = ttk.Entry(api_frame, textvariable=self.cli_cmd_var, width=40)
-        self.cli_cmd_entry.grid(row=4, column=1, sticky=tk.W, padx=(10, 0))
-        cli_test_btn = ttk.Button(api_frame, text="Test", command=lambda: self._test_connection('cli'), width=6)
-        cli_test_btn.grid(row=4, column=3, padx=(5, 0))
+        self.cli_cmd_entry = ttk.Entry(f, textvariable=self.cli_cmd_var)
+        self.cli_cmd_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0))
+        ttk.Button(f, text="Test", width=6,
+                   command=lambda: self._test_connection('cli')).grid(row=0, column=2, padx=(4, 0))
         self._create_tooltip(self.cli_cmd_entry,
             "Enter the command that starts an interactive CLI session,\n"
             "e.g.  gh copilot chat  or  claude  or  gemini\n"
             "The session stays alive while the app is open.\n"
             "CLI commands like /clear, /model, /help are passed through.")
-        
-        # Model selection
-        model_frame = ttk.LabelFrame(main_frame, text="Model", padding=10)
-        model_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        ttk.Label(model_frame, text="Model:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self._cred_frames['cli'] = f
+
+        # ── Tab 2: Parameters ─────────────────────────────────────────── #
+        t_params = ttk.Frame(nb, padding=8)
+        nb.add(t_params, text="  Parameters  ")
+
+        model_frame = ttk.LabelFrame(t_params, text="Model", padding=8)
+        model_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(model_frame, text="Model:").grid(row=0, column=0, sticky=tk.W, pady=4)
         self.model_var = tk.StringVar()
         self.model_combo = ttk.Combobox(model_frame, textvariable=self.model_var,
-                                         values=AISettings.ANTHROPIC_MODELS, width=35)
-        self.model_combo.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
-        
-        # Refresh models button
+                                         values=AISettings.ANTHROPIC_MODELS, width=32)
+        self.model_combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
         refresh_btn = ttk.Button(model_frame, text="🔄", width=3, command=self._refresh_models)
-        refresh_btn.grid(row=0, column=2, padx=(5, 0))
-        self._create_tooltip(refresh_btn, "Refresh model list: Fetches the latest available models from the API. Use this if you have access to new models that aren't showing in the dropdown.")
-        
-        # Parameters
-        params_frame = ttk.LabelFrame(main_frame, text="Generation Parameters", padding=10)
-        params_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        # Max tokens
-        ttk.Label(params_frame, text="Max Tokens:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        refresh_btn.grid(row=0, column=2, padx=(4, 0))
+        self._create_tooltip(refresh_btn,
+            "Refresh model list: Fetches the latest available models from the API. "
+            "Use this if you have access to new models that aren't showing in the dropdown.")
+
+        params_frame = ttk.LabelFrame(t_params, text="Generation Parameters", padding=8)
+        params_frame.pack(fill=tk.X, pady=(0, 8))
+
+        # Max Tokens
+        ttk.Label(params_frame, text="Max Tokens:").grid(row=0, column=0, sticky=tk.W, pady=4)
         self.max_tokens_var = tk.IntVar(value=4096)
-        max_tokens_spin = ttk.Spinbox(params_frame, from_=256, to=8192, 
-                                       textvariable=self.max_tokens_var, width=10)
-        max_tokens_spin.grid(row=0, column=1, sticky=tk.W, padx=(10, 0))
-        max_tokens_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
-        max_tokens_tip.grid(row=0, column=2, padx=(5, 0))
-        self._create_tooltip(max_tokens_tip, "Maximum number of tokens to generate in the response. Higher values allow longer responses but may cost more. A typical page of text is ~500-800 tokens. Common values: 1024 (short), 2048 (medium), 4096 (long), 8192 (very long).")
-        
+        ttk.Spinbox(params_frame, from_=256, to=8192,
+                    textvariable=self.max_tokens_var, width=10).grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
+        max_t_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
+        max_t_tip.grid(row=0, column=2, padx=(4, 0))
+        self._create_tooltip(max_t_tip,
+            "Maximum number of tokens to generate. Higher = longer responses but may cost more.\n"
+            "Common values: 1024 (short), 2048 (medium), 4096 (long), 8192 (very long).")
+
         # Temperature
-        ttk.Label(params_frame, text="Temperature:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        temp_frame = ttk.Frame(params_frame)
-        temp_frame.grid(row=1, column=1, sticky=tk.W, padx=(10, 0))
-        
+        ttk.Label(params_frame, text="Temperature:").grid(row=1, column=0, sticky=tk.W, pady=4)
+        temp_inner = ttk.Frame(params_frame)
+        temp_inner.grid(row=1, column=1, sticky=tk.W, padx=(8, 0))
         self.temp_var = tk.DoubleVar(value=0.7)
-        self.temp_scale = ttk.Scale(temp_frame, from_=0.0, to=2.0, variable=self.temp_var,
-                                     orient=tk.HORIZONTAL, length=150, command=self._update_temp_label)
+        self.temp_scale = ttk.Scale(temp_inner, from_=0.0, to=2.0, variable=self.temp_var,
+                                     orient=tk.HORIZONTAL, length=140, command=self._update_temp_label)
         self.temp_scale.pack(side=tk.LEFT)
-        self.temp_label = ttk.Label(temp_frame, text="0.70", width=5)
-        self.temp_label.pack(side=tk.LEFT, padx=(5, 0))
+        self.temp_label = ttk.Label(temp_inner, text="0.70", width=5)
+        self.temp_label.pack(side=tk.LEFT, padx=(4, 0))
         temp_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
-        temp_tip.grid(row=1, column=2, padx=(5, 0))
-        self._create_tooltip(temp_tip, "Controls randomness in responses. Lower = more focused, consistent, and deterministic. Higher = more creative, varied, and unpredictable. Range: 0.0-2.0. Recommended: 0.3-0.5 for factual tasks, 0.7-0.9 for creative writing, 1.0+ for brainstorming.")
-        
-        # Top-p (nucleus sampling)
-        ttk.Label(params_frame, text="Top-p:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        top_p_frame = ttk.Frame(params_frame)
-        top_p_frame.grid(row=2, column=1, sticky=tk.W, padx=(10, 0))
-        
+        temp_tip.grid(row=1, column=2, padx=(4, 0))
+        self._create_tooltip(temp_tip,
+            "Controls randomness. Lower = more focused & deterministic. Higher = more creative.\n"
+            "Range 0-2. Recommended: 0.3-0.5 (factual), 0.7-0.9 (creative), 1.0+ (brainstorm).")
+
+        # Top-p
+        ttk.Label(params_frame, text="Top-p:").grid(row=2, column=0, sticky=tk.W, pady=4)
+        top_p_inner = ttk.Frame(params_frame)
+        top_p_inner.grid(row=2, column=1, sticky=tk.W, padx=(8, 0))
         self.top_p_var = tk.DoubleVar(value=1.0)
-        self.top_p_scale = ttk.Scale(top_p_frame, from_=0.0, to=1.0, variable=self.top_p_var,
-                                      orient=tk.HORIZONTAL, length=150, command=self._update_top_p_label)
+        self.top_p_scale = ttk.Scale(top_p_inner, from_=0.0, to=1.0, variable=self.top_p_var,
+                                      orient=tk.HORIZONTAL, length=140, command=self._update_top_p_label)
         self.top_p_scale.pack(side=tk.LEFT)
-        self.top_p_label = ttk.Label(top_p_frame, text="1.00", width=5)
-        self.top_p_label.pack(side=tk.LEFT, padx=(5, 0))
+        self.top_p_label = ttk.Label(top_p_inner, text="1.00", width=5)
+        self.top_p_label.pack(side=tk.LEFT, padx=(4, 0))
         top_p_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
-        top_p_tip.grid(row=2, column=2, padx=(5, 0))
-        self._create_tooltip(top_p_tip, "Nucleus sampling: only considers tokens whose cumulative probability exceeds this threshold. 1.0 = consider all possible tokens. Lower values (e.g., 0.9) = more focused, coherent output by eliminating unlikely words. Often used together with temperature. Most users should leave at 1.0.")
-        
+        top_p_tip.grid(row=2, column=2, padx=(4, 0))
+        self._create_tooltip(top_p_tip,
+            "Nucleus sampling: considers only tokens whose cumulative probability exceeds this value.\n"
+            "1.0 = all tokens; lower = more focused. Most users should leave at 1.0.")
+
         # Top-k
-        ttk.Label(params_frame, text="Top-k:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        ttk.Label(params_frame, text="Top-k:").grid(row=3, column=0, sticky=tk.W, pady=4)
         self.top_k_var = tk.IntVar(value=0)
-        top_k_spin = ttk.Spinbox(params_frame, from_=0, to=100, 
-                                  textvariable=self.top_k_var, width=10)
-        top_k_spin.grid(row=3, column=1, sticky=tk.W, padx=(10, 0))
+        ttk.Spinbox(params_frame, from_=0, to=100,
+                    textvariable=self.top_k_var, width=10).grid(row=3, column=1, sticky=tk.W, padx=(8, 0))
         top_k_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
-        top_k_tip.grid(row=3, column=2, padx=(5, 0))
-        self._create_tooltip(top_k_tip, "Only considers the top-k most likely tokens at each step. 0 = disabled (use model's default behavior). Lower values (e.g., 10-20) = more focused and deterministic. Higher values (e.g., 40-50) = more diverse but potentially less coherent. Leave at 0 for most use cases.")
-        
-        # Image size
-        ttk.Label(params_frame, text="Image Max Size:").grid(row=4, column=0, sticky=tk.W, pady=5)
-        img_frame = ttk.Frame(params_frame)
-        img_frame.grid(row=4, column=1, sticky=tk.W, padx=(10, 0))
+        top_k_tip.grid(row=3, column=2, padx=(4, 0))
+        self._create_tooltip(top_k_tip,
+            "Considers only the top-k most likely tokens. 0 = disabled (model default).\n"
+            "Lower = more focused. Leave at 0 for most use cases.")
+
+        # Image Max Size
+        ttk.Label(params_frame, text="Image Max Size:").grid(row=4, column=0, sticky=tk.W, pady=4)
+        img_inner = ttk.Frame(params_frame)
+        img_inner.grid(row=4, column=1, sticky=tk.W, padx=(8, 0))
         self.img_size_var = tk.IntVar(value=512)
-        img_size_spin = ttk.Spinbox(img_frame, from_=256, to=1024, increment=128,
-                                     textvariable=self.img_size_var, width=10)
-        img_size_spin.pack(side=tk.LEFT)
-        ttk.Label(img_frame, text="px").pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Spinbox(img_inner, from_=256, to=1024, increment=128,
+                    textvariable=self.img_size_var, width=10).pack(side=tk.LEFT)
+        ttk.Label(img_inner, text="px").pack(side=tk.LEFT, padx=(4, 0))
         img_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
-        img_tip.grid(row=4, column=2, padx=(5, 0))
-        self._create_tooltip(img_tip, "Maximum dimension (width or height) for images sent to the AI. Images are resized proportionally to fit within this size while maintaining aspect ratio. Larger sizes = more detail visible to AI but slower processing and higher API costs. Recommended: 512px (standard), 768px (detailed), 1024px (maximum detail).")
-        
-        # System prompt
-        prompt_frame = ttk.LabelFrame(main_frame, text="System Prompt", padding=10)
-        prompt_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
-        self.system_prompt_text = tk.Text(prompt_frame, height=5, wrap=tk.WORD)
+        img_tip.grid(row=4, column=2, padx=(4, 0))
+        self._create_tooltip(img_tip,
+            "Maximum dimension for images sent to the AI.\n"
+            "Larger = more detail but slower and costlier.\n"
+            "Recommended: 512px (standard), 768px (detailed), 1024px (maximum).")
+
+        # ── Tab 3: Prompt & Actions ───────────────────────────────────── #
+        t_prompt = ttk.Frame(nb, padding=8)
+        nb.add(t_prompt, text="  Prompt & Actions  ")
+
+        prompt_frame = ttk.LabelFrame(t_prompt, text="System Prompt", padding=8)
+        prompt_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        self.system_prompt_text = tk.Text(prompt_frame, height=6, wrap=tk.WORD)
+        prompt_sb = ttk.Scrollbar(prompt_frame, orient=tk.VERTICAL,
+                                   command=self.system_prompt_text.yview)
+        self.system_prompt_text.configure(yscrollcommand=prompt_sb.set)
+        prompt_sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.system_prompt_text.pack(fill=tk.BOTH, expand=True)
-        
-        # Context menu actions configuration
-        ctx_frame = ttk.LabelFrame(main_frame, text="Context Menu AI Actions", padding=10)
-        ctx_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
+
+        ctx_frame = ttk.LabelFrame(t_prompt, text="Context Menu AI Actions", padding=8)
+        ctx_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
         ctx_top = ttk.Frame(ctx_frame)
-        ctx_top.pack(fill=tk.X, pady=(0, 5))
+        ctx_top.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(ctx_top, text="Right-click actions for selected text. Use {selection} as placeholder.",
                   font=('Segoe UI', 8), foreground='#666666').pack(side=tk.LEFT)
-        ttk.Button(ctx_top, text="+ Add", width=6, command=self._add_context_action).pack(side=tk.RIGHT)
-        
-        # Scrollable list of actions
+        ttk.Button(ctx_top, text="+ Add", width=6,
+                   command=self._add_context_action).pack(side=tk.RIGHT)
+
         self.ctx_list_frame = ttk.Frame(ctx_frame)
         self.ctx_list_frame.pack(fill=tk.BOTH, expand=True)
-        
+
         self.ctx_canvas = tk.Canvas(self.ctx_list_frame, height=120, bg='#ffffff', highlightthickness=0)
-        ctx_scrollbar = ttk.Scrollbar(self.ctx_list_frame, orient=tk.VERTICAL, command=self.ctx_canvas.yview)
+        ctx_scrollbar = ttk.Scrollbar(self.ctx_list_frame, orient=tk.VERTICAL,
+                                       command=self.ctx_canvas.yview)
         self.ctx_inner = ttk.Frame(self.ctx_canvas)
-        self.ctx_inner.bind('<Configure>', lambda e: self.ctx_canvas.configure(scrollregion=self.ctx_canvas.bbox('all')))
+        self.ctx_inner.bind('<Configure>',
+                             lambda e: self.ctx_canvas.configure(
+                                 scrollregion=self.ctx_canvas.bbox('all')))
         self.ctx_canvas.create_window((0, 0), window=self.ctx_inner, anchor='nw')
         self.ctx_canvas.configure(yscrollcommand=ctx_scrollbar.set)
         self.ctx_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         ctx_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Store action widgets for reading back
+
         self.ctx_action_widgets = []
-        
-        # Buttons
+
+        # ── Buttons (below notebook) ──────────────────────────────────── #
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X)
-        
-        ttk.Button(btn_frame, text="Discard Changes", command=self.destroy).pack(side=tk.RIGHT, padx=(5, 0))
-        ttk.Button(btn_frame, text="Save Changes", command=self._save_settings).pack(side=tk.RIGHT)
+        ttk.Button(btn_frame, text="Discard Changes",
+                   command=self.destroy).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(btn_frame, text="Save Changes",
+                   command=self._save_settings).pack(side=tk.RIGHT)
     
     def _load_current_settings(self):
         """Load current settings into the dialog"""
@@ -2227,9 +2767,16 @@ class AISettingsDialog(tk.Toplevel):
         self.top_p_label.config(text=f"{self.top_p_var.get():.2f}")
     
     def _on_provider_change(self, event=None):
-        """Handle provider change - use cached models if available"""
+        """Handle provider change: update credential panel and model list."""
         provider = self.provider_var.get()
         current_model = self.model_var.get()
+
+        # Show only the relevant credential sub-frame
+        for p, f in self._cred_frames.items():
+            if p == provider:
+                f.pack(fill=tk.X)
+            else:
+                f.pack_forget()
 
         if provider == 'cli':
             # CLI manages its own model; disable model selection
@@ -2241,11 +2788,9 @@ class AISettingsDialog(tk.Toplevel):
         self.model_combo.config(state='normal')
 
         if provider == 'anthropic':
-            # Use cached models if available, otherwise defaults
             cached = self.settings.get('cached_anthropic_models', [])
             models = cached if cached else AISettings.ANTHROPIC_MODELS
             self.model_combo['values'] = models
-            # Only change model if current isn't in the list
             if current_model not in models:
                 self.model_var.set(models[0] if models else '')
         elif provider == 'gemini':
@@ -2977,9 +3522,10 @@ class ChatSidebar(tk.Frame):
             elif self.settings.provider == 'anthropic':
                 self.llm_client.api_key = self.settings.api_key
             # Ollama and CLI don't need API key updates
-            
+
             # Stream response with all parameters
             response_text = ""
+            chunk_count = 0
             for chunk in self.llm_client.send_message_stream(
                 messages,
                 system_prompt=self.settings.system_prompt,
@@ -2990,18 +3536,28 @@ class ChatSidebar(tk.Frame):
                 images=images if images else None,
                 model=self.settings.model
             ):
+                chunk_count += 1
                 response_text += chunk
                 self._streaming_buffer += chunk
                 self.response_queue.put(('chunk', chunk))
-            
+
+            # Debug: log if no chunks were received
+            if chunk_count == 0:
+                print(f"[DEBUG] No chunks received from {self.settings.provider} provider")
+            else:
+                print(f"[DEBUG] Received {chunk_count} chunks from {self.settings.provider} provider")
+
             # Save assistant message to history
             assistant_msg = ChatMessage(role="assistant", content=response_text)
             if self.current_document_id:
                 self.history_manager.add_message(assistant_msg, self.current_document_id)
-            
+
             self.response_queue.put(('done', None))
-            
+
         except Exception as e:
+            import traceback
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            print(f"[ERROR] _generate_response: {error_msg}")
             self.response_queue.put(('error', str(e)))
     
     def _process_queue(self):
@@ -3059,6 +3615,11 @@ class ChatSidebar(tk.Frame):
                     self.status_label.config(text="Error")
         except queue.Empty:
             pass
+        except Exception as e:
+            print(f"[ERROR] _process_queue: {e}")
+            self.is_generating = False
+            self.send_btn.config(state=tk.NORMAL)
+            self.status_label.config(text="Error")
         
         # Schedule next check
         self.after(50, self._process_queue)
@@ -3088,7 +3649,11 @@ class ChatSidebar(tk.Frame):
                 self.chat_display.insert(tk.END, content, 'message')
         
         if role == 'assistant' and streaming:
-            self._streaming_start_index = self.chat_display.index(tk.END)
+            # Use a named Tkinter mark so the position tracks correctly even
+            # when embedded widgets (copy buttons) are inserted before it.
+            self.chat_display.mark_set('streaming_start', tk.END)
+            self.chat_display.mark_gravity('streaming_start', tk.LEFT)
+            self._streaming_start_index = 'streaming_start'
             self._streaming_buffer = ''
         
         if not streaming and role in ('user', 'assistant'):
