@@ -11,8 +11,11 @@ import re
 import base64
 import hashlib
 import sys
+import shutil
+import subprocess
 import threading
 import queue
+from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Callable, Iterator
@@ -221,13 +224,27 @@ class AISettings:
         "deepseek-reasoner",
     ]
     
+    # Default AGY models & efforts
+    AGY_MODELS = [
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.1-pro",
+        "claude-sonnet-4.6",
+        "claude-opus-4.6",
+        "gpt-oss-120b",
+    ]
+    AGY_EFFORTS = ["low", "medium", "high"]
+    
     DEFAULT_SETTINGS = {
-        'provider': 'anthropic',
+        'provider': 'agy',
         'api_key': '',
         'gemini_api_key': '',  # Separate API key for Gemini
         'deepseek_api_key': '',  # Separate API key for DeepSeek
         'ollama_url': 'http://localhost:11434',  # Ollama server URL
-        'model': 'claude-sonnet-4-20250514',
+        'agy_path': '',  # Custom path to agy CLI executable
+        'agy_model': 'gemini-3.6-flash',
+        'agy_effort': 'low',
+        'model': 'gemini-3.6-flash',
         'system_prompt': 'You are a helpful AI assistant. You help users with their markdown documents, answer questions, and provide writing assistance.',
         'max_tokens': 4096,
         'temperature': 0.7,
@@ -239,6 +256,7 @@ class AISettings:
         'cached_gemini_models': [],
         'cached_ollama_models': [],
         'cached_deepseek_models': [],
+        'cached_agy_models': [],
         # CLI provider
         'cli_command': '',  # e.g. 'gh copilot chat' or 'claude' or 'gemini'
         # Context menu AI actions (right-click on selected text)
@@ -391,9 +409,36 @@ class AISettings:
     def cli_command(self, value: str):
         self.settings['cli_command'] = value
 
+    @property
+    def agy_path(self) -> str:
+        return self.settings.get('agy_path', '')
+
+    @agy_path.setter
+    def agy_path(self, value: str):
+        self.settings['agy_path'] = value
+
+    @property
+    def agy_model(self) -> str:
+        return self.settings.get('agy_model', 'gemini-2.5-flash')
+
+    @agy_model.setter
+    def agy_model(self, value: str):
+        self.settings['agy_model'] = value
+
+    @property
+    def agy_effort(self) -> str:
+        return self.settings.get('agy_effort', 'low')
+
+    @agy_effort.setter
+    def agy_effort(self, value: str):
+        self.settings['agy_effort'] = value
+
     def is_configured(self) -> bool:
-        """Check if API key is configured for current provider"""
-        if self.provider == 'gemini':
+        """Check if API key or CLI backend is configured for current provider"""
+        if self.provider in ('agy', 'antigravity'):
+            cmd = self.agy_path or find_antigravity_cli_command()
+            return bool(cmd)
+        elif self.provider == 'gemini':
             return bool(self.gemini_api_key)
         elif self.provider == 'deepseek':
             return bool(self.deepseek_api_key)
@@ -405,7 +450,10 @@ class AISettings:
     
     def get_available_models(self) -> List[str]:
         """Get available models for current provider"""
-        if self.provider == 'anthropic':
+        if self.provider in ('agy', 'antigravity'):
+            cached = self.settings.get('cached_agy_models', [])
+            return cached if cached else self.AGY_MODELS.copy()
+        elif self.provider == 'anthropic':
             return self.ANTHROPIC_MODELS.copy()
         elif self.provider == 'gemini':
             return self.GEMINI_MODELS.copy()
@@ -1840,6 +1888,242 @@ if sys.platform == 'win32':
 
 
 # =============================================================================
+# Antigravity CLI (agy) Provider Client & Helpers
+# =============================================================================
+
+@lru_cache(maxsize=1)
+def find_antigravity_cli_command() -> str:
+    candidates = []
+
+    # 1. Environment Variable Overrides
+    env_path = os.getenv("ANTIGRAVITY_CLI_PATH", os.getenv("AGY_PATH", "")).strip()
+    if env_path:
+        candidates.append(env_path)
+
+    # 2. Standard Global Paths (Windows & Cross-Platform)
+    home = Path.home()
+    local_agy = home / 'AppData' / 'Local' / 'agy' / 'bin' / 'agy.exe'
+    npm_dir = home / 'AppData' / 'Roaming' / 'npm'
+    
+    candidates.extend([
+        str(local_agy),
+        str(npm_dir / 'agy.cmd'),
+        str(npm_dir / 'antigravity.cmd'),
+        'agy.cmd',
+        'antigravity.cmd',
+        'agy.exe',
+        'antigravity.exe',
+        'agy',
+        'antigravity'
+    ])
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        # CRITICAL SAFETY GUARD: Exclude deprecated gemini cli executables
+        if 'gemini' in candidate.lower():
+            continue
+        candidate_path = Path(candidate)
+        if candidate_path.exists():
+            return str(candidate_path)
+        resolved = shutil.which(candidate)
+        if resolved and 'gemini' not in resolved.lower():
+            return resolved
+
+    return ""
+
+
+def launch_cli_auth_window():
+    """Launch an independent terminal console window running agy signin."""
+    try:
+        cmd_executable = shutil.which("cmd.exe") or "cmd.exe"
+        cli_bin = find_antigravity_cli_command() or "agy"
+        auth_cmd = f'start "Antigravity CLI Signin" {cmd_executable} /k "{cli_bin} signin"'
+        subprocess.Popen(auth_cmd, shell=True)
+        return True, "Launched CLI authentication window. Follow prompts in external console."
+    except Exception as e:
+        return False, f"Failed to launch terminal window: {e}"
+
+
+def call_antigravity_cli(system_prompt: str, user_message: str, model_name: str = "gemini-3.6-flash", effort: str = "low", cli_command: str = "") -> str:
+    """Execute non-interactive prompt call via agy CLI."""
+    executable = str(cli_command or find_antigravity_cli_command()).strip()
+    if not executable:
+        raise RuntimeError("Antigravity CLI (agy) executable was not found. Verify installation or set AGY path in Settings.")
+
+    prompt_input = f"{system_prompt.strip()}\n\n{user_message.strip()}".strip() if system_prompt and system_prompt.strip() else user_message.strip()
+    cmd = [
+        executable,
+        '--dangerously-skip-permissions',
+        '--output-format', 'json'
+    ]
+
+    if model_name and str(model_name).strip():
+        cmd.extend(['--model', str(model_name).strip()])
+        eff = str(effort or 'low').strip().lower()
+        if eff in ('low', 'medium', 'high'):
+            cmd.extend(['--effort', eff])
+        else:
+            cmd.extend(['--effort', 'low'])
+
+    cmd.extend(['-p', prompt_input])
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=180
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Antigravity CLI executable not found: {executable}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Antigravity CLI timed out while generating a response.") from exc
+
+    stdout_text = str(completed.stdout or '').strip()
+    stderr_text = str(completed.stderr or '').strip()
+    detail = stderr_text or stdout_text or f"exit code {completed.returncode}"
+
+    # Fallback guard: if --effort was passed but model doesn't support it, retry without --effort
+    if completed.returncode != 0 and '--effort' in cmd and 'effort is not supported' in detail.lower():
+        cmd_no_effort = [c for c in cmd]
+        try:
+            eff_idx = cmd_no_effort.index('--effort')
+            del cmd_no_effort[eff_idx:eff_idx + 2]
+        except ValueError:
+            pass
+        
+        try:
+            completed = subprocess.run(
+                cmd_no_effort,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=180
+            )
+            stdout_text = str(completed.stdout or '').strip()
+            stderr_text = str(completed.stderr or '').strip()
+            detail = stderr_text or stdout_text or f"exit code {completed.returncode}"
+        except Exception:
+            pass
+
+    if completed.returncode != 0:
+        raise RuntimeError(f"Antigravity CLI failed: {detail}")
+
+    if not stdout_text:
+        raise RuntimeError("Antigravity CLI returned no output.")
+
+    try:
+        payload = json.loads(stdout_text)
+        response_text = str(payload.get('response', payload.get('text', payload.get('output', '')))).strip()
+        if not response_text:
+            response_text = stdout_text
+    except Exception:
+        response_text = stdout_text
+
+    return response_text
+
+
+def list_antigravity_models(cli_command: str = "") -> List[str]:
+    """List models available to the agy CLI session."""
+    executable = str(cli_command or find_antigravity_cli_command()).strip()
+    fallback = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-pro", "claude-sonnet-4.6", "claude-opus-4.6", "gpt-oss-120b"]
+    if not executable:
+        return fallback
+
+    cmd = [executable, 'models', '--output-format', 'json']
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', timeout=30)
+        if completed.returncode == 0 and completed.stdout:
+            data = json.loads(completed.stdout)
+            if isinstance(data, list):
+                res = [str(m.get('name', m)) for m in data if m]
+                return res if res else fallback
+            elif isinstance(data, dict):
+                models = data.get('models', [])
+                res = [str(m.get('name', m)) for m in models if m]
+                return res if res else fallback
+    except Exception:
+        pass
+    return fallback
+
+
+def test_antigravity_connection(model_name: str = "gemini-3.6-flash", effort: str = "low", cli_command: str = "") -> str:
+    """Run lightweight test query ('hi') to verify CLI connection."""
+    test_sys = "You are a test assistant. Reply with the single word HI."
+    test_msg = "hi"
+    res = call_antigravity_cli(test_sys, test_msg, model_name=model_name, effort=effort, cli_command=cli_command)
+    return str(res or '').strip()
+
+
+class AgyClient(LLMClient):
+    """LLM client using Google Antigravity CLI (agy) backend."""
+
+    def __init__(self, model: str = "gemini-3.6-flash", effort: str = "low", cli_command: str = ""):
+        self.model = model or "gemini-3.6-flash"
+        self.effort = effort or "low"
+        self.cli_command = cli_command or find_antigravity_cli_command()
+
+    def send_message(self, messages, system_prompt='', max_tokens=4096,
+                     temperature=0.7, on_chunk=None, **kwargs) -> str:
+        user_parts = []
+        for msg in messages:
+            role = msg.get('role', 'user') if isinstance(msg, dict) else getattr(msg, 'role', 'user')
+            content = msg.get('content', '') if isinstance(msg, dict) else getattr(msg, 'content', '')
+            if role == 'system':
+                system_prompt += f"\n{content}"
+            else:
+                user_parts.append(f"{role.capitalize()}: {content}")
+
+        user_message = "\n".join(user_parts) if user_parts else ""
+        model = kwargs.get('model') or self.model
+        effort = kwargs.get('effort') or self.effort
+
+        response = call_antigravity_cli(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            model_name=model,
+            effort=effort,
+            cli_command=self.cli_command
+        )
+        if on_chunk:
+            on_chunk(response)
+        return response
+
+    def send_message_stream(self, messages, system_prompt='', max_tokens=4096,
+                            temperature=0.7, top_p=1.0, top_k=0,
+                            images=None, model=None, on_chunk=None,
+                            **kwargs):
+        res = self.send_message(
+            messages=messages,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            on_chunk=on_chunk,
+            model=model,
+            **kwargs
+        )
+        yield res
+
+    def get_available_models(self) -> List[str]:
+        return list_antigravity_models(self.cli_command)
+
+    def test_connection(self) -> tuple:
+        try:
+            res = test_antigravity_connection(
+                model_name=self.model,
+                effort=self.effort,
+                cli_command=self.cli_command
+            )
+            return True, f"AGY CLI connection successful! Output: '{res}'"
+        except Exception as e:
+            return False, f"AGY CLI connection failed: {e}"
+
+
+# =============================================================================
 # CLI Provider Client
 # =============================================================================
 
@@ -2333,7 +2617,13 @@ def get_llm_client(settings: AISettings) -> Optional[LLMClient]:
     """Factory function to get appropriate LLM client based on settings"""
     provider = settings.provider
     
-    if provider == 'anthropic':
+    if provider in ('agy', 'antigravity'):
+        cli_cmd = settings.agy_path or find_antigravity_cli_command()
+        model = settings.agy_model or 'gemini-2.5-flash'
+        effort = settings.agy_effort or 'low'
+        return AgyClient(model=model, effort=effort, cli_command=cli_cmd)
+
+    elif provider == 'anthropic':
         if not ANTHROPIC_AVAILABLE:
             return None
         return AnthropicClient(settings.api_key)
@@ -2431,10 +2721,10 @@ class AISettingsDialog(tk.Toplevel):
         prov_frame.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(prov_frame, text="AI Provider:").grid(row=0, column=0, sticky=tk.W, pady=4)
-        self.provider_var = tk.StringVar(value="anthropic")
+        self.provider_var = tk.StringVar(value="agy")
         provider_combo = ttk.Combobox(
             prov_frame, textvariable=self.provider_var,
-            values=["anthropic", "gemini", "deepseek", "ollama", "cli"],
+            values=["agy", "anthropic", "gemini", "deepseek", "ollama", "cli"],
             state="readonly", width=28)
         provider_combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
         provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
@@ -2443,6 +2733,34 @@ class AISettingsDialog(tk.Toplevel):
         cred_outer = ttk.LabelFrame(t_conn, text="API Keys / Connection", padding=8)
         cred_outer.pack(fill=tk.X, pady=(0, 8))
         self._cred_frames = {}
+
+        # AGY (Google Antigravity CLI)
+        f_agy = ttk.Frame(cred_outer)
+        f_agy.columnconfigure(1, weight=1)
+        
+        ttk.Label(f_agy, text="AGY Path:", width=11, anchor=tk.W).grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.agy_path_var = tk.StringVar()
+        self.agy_path_entry = ttk.Entry(f_agy, textvariable=self.agy_path_var)
+        self.agy_path_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0), pady=2)
+        
+        btn_frame = ttk.Frame(f_agy)
+        btn_frame.grid(row=0, column=2, padx=(4, 0), pady=2)
+        ttk.Button(btn_frame, text="Auto", width=5, command=self._auto_detect_agy_path).pack(side=tk.LEFT, padx=1)
+        ttk.Button(btn_frame, text="Browse", width=6, command=self._browse_agy_path).pack(side=tk.LEFT, padx=1)
+        ttk.Button(btn_frame, text="Test", width=5, command=lambda: self._test_connection('agy')).pack(side=tk.LEFT, padx=1)
+        
+        row2 = ttk.Frame(f_agy)
+        row2.grid(row=1, column=0, columnspan=3, sticky=tk.EW, pady=(4, 0))
+        ttk.Label(row2, text="Reasoning Effort:").pack(side=tk.LEFT)
+        self.agy_effort_var = tk.StringVar(value='low')
+        effort_combo = ttk.Combobox(row2, textvariable=self.agy_effort_var, values=AISettings.AGY_EFFORTS, state="readonly", width=8)
+        effort_combo.pack(side=tk.LEFT, padx=(4, 16))
+        
+        signin_btn = ttk.Button(row2, text="🔑 Launch Signin Console", command=launch_cli_auth_window)
+        signin_btn.pack(side=tk.LEFT)
+        self._create_tooltip(signin_btn, "Open external terminal window running 'agy signin' for interactive authentication.")
+        
+        self._cred_frames['agy'] = f_agy
 
         # Anthropic
         f = ttk.Frame(cred_outer)
@@ -2651,6 +2969,23 @@ class AISettingsDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="Save Changes",
                    command=self._save_settings).pack(side=tk.RIGHT)
     
+    def _auto_detect_agy_path(self):
+        cmd = find_antigravity_cli_command()
+        if cmd:
+            self.agy_path_var.set(cmd)
+            messagebox.showinfo("Auto-detect", f"Found AGY CLI executable at:\n{cmd}", parent=self)
+        else:
+            messagebox.showwarning("Auto-detect", "Could not locate agy executable automatically. Please browse manually.", parent=self)
+
+    def _browse_agy_path(self):
+        filename = filedialog.askopenfilename(
+            title="Select agy executable",
+            filetypes=[("Executables", "*.exe *.cmd *.bat"), ("All Files", "*.*")],
+            parent=self
+        )
+        if filename:
+            self.agy_path_var.set(filename)
+
     def _load_current_settings(self):
         """Load current settings into the dialog"""
         self.provider_var.set(self.settings.provider)
@@ -2659,6 +2994,8 @@ class AISettingsDialog(tk.Toplevel):
         self.deepseek_key_var.set(self.settings.deepseek_api_key)
         self.ollama_url_var.set(self.settings.ollama_url)
         self.cli_cmd_var.set(self.settings.cli_command)
+        self.agy_path_var.set(self.settings.agy_path or find_antigravity_cli_command())
+        self.agy_effort_var.set(self.settings.agy_effort or 'low')
         self.model_var.set(self.settings.model)
         self.max_tokens_var.set(self.settings.max_tokens)
         self.temp_var.set(self.settings.temperature)
@@ -2778,7 +3115,13 @@ class AISettingsDialog(tk.Toplevel):
             else:
                 f.pack_forget()
 
-        if provider == 'cli':
+        if provider in ('agy', 'antigravity'):
+            cached = self.settings.get('cached_agy_models', [])
+            models = cached if cached else AISettings.AGY_MODELS
+            self.model_combo['values'] = models
+            current_agy = self.settings.agy_model
+            self.model_var.set(current_agy if current_agy in models else (models[0] if models else 'gemini-2.5-flash'))
+        elif provider == 'cli':
             # CLI manages its own model; disable model selection
             self.model_combo['values'] = []
             self.model_var.set('(managed by CLI)')
@@ -2816,7 +3159,21 @@ class AISettingsDialog(tk.Toplevel):
         """Fetch available models from the API and cache them"""
         provider = self.provider_var.get()
         
-        if provider == 'anthropic':
+        if provider in ('agy', 'antigravity'):
+            cli_cmd = self.agy_path_var.get().strip()
+            try:
+                models = list_antigravity_models(cli_cmd)
+                if models:
+                    self.model_combo['values'] = models
+                    self.settings.set('cached_agy_models', models)
+                    self.settings.save()
+                    messagebox.showinfo("Success", f"Found {len(models)} AGY models (cached).", parent=self)
+                else:
+                    messagebox.showwarning("Warning", "No AGY models found.", parent=self)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to fetch AGY models: {str(e)}", parent=self)
+
+        elif provider == 'anthropic':
             api_key = self.api_key_var.get()
             if not api_key:
                 messagebox.showwarning("Warning", "Please enter an Anthropic API key first.", parent=self)
@@ -2895,7 +3252,13 @@ class AISettingsDialog(tk.Toplevel):
             provider = self.provider_var.get()
         
         client = None
-        if provider == 'anthropic':
+        if provider in ('agy', 'antigravity'):
+            cli_cmd = self.agy_path_var.get().strip()
+            effort = self.agy_effort_var.get().strip()
+            model = self.model_var.get().strip() or 'gemini-2.5-flash'
+            client = AgyClient(model=model, effort=effort, cli_command=cli_cmd)
+            success, message = client.test_connection()
+        elif provider == 'anthropic':
             api_key = self.api_key_var.get()
             if not api_key:
                 messagebox.showwarning("Warning", "Please enter an Anthropic API key first.", parent=self)
@@ -2943,7 +3306,9 @@ class AISettingsDialog(tk.Toplevel):
                 if models:
                     self.model_combo['values'] = models
                     # Cache models based on provider
-                    if provider == 'anthropic':
+                    if provider in ('agy', 'antigravity'):
+                        self.settings.set('cached_agy_models', models)
+                    elif provider == 'anthropic':
                         self.settings.set('cached_anthropic_models', models)
                     elif provider == 'gemini':
                         self.settings.set('cached_gemini_models', models)
@@ -2966,6 +3331,11 @@ class AISettingsDialog(tk.Toplevel):
         self.settings.deepseek_api_key = self.deepseek_key_var.get()
         self.settings.ollama_url = self.ollama_url_var.get()
         self.settings.cli_command = self.cli_cmd_var.get().strip()
+        self.settings.agy_path = self.agy_path_var.get().strip()
+        self.settings.agy_effort = self.agy_effort_var.get().strip()
+        if self.provider_var.get() in ('agy', 'antigravity'):
+            self.settings.agy_model = self.model_var.get().strip()
+
         # Don't save '(managed by CLI)' placeholder as the model
         saved_model = self.model_var.get()
         if saved_model != '(managed by CLI)':

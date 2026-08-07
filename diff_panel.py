@@ -193,6 +193,10 @@ class DiffPanel(tk.Toplevel):
         """Background thread: stream LLM response"""
         try:
             response_text = ""
+            is_agy = self.settings and getattr(self.settings, 'provider', '') in ('agy', 'antigravity')
+            target_model = self.settings.agy_model if (is_agy and getattr(self.settings, 'agy_model', '')) else (self.settings.model if self.settings else None)
+            target_effort = self.settings.agy_effort if (is_agy and getattr(self.settings, 'agy_effort', '')) else None
+
             for chunk in self.llm_client.send_message_stream(
                 self.messages,
                 system_prompt=self.settings.system_prompt if self.settings else "",
@@ -201,7 +205,8 @@ class DiffPanel(tk.Toplevel):
                 top_p=self.settings.top_p if self.settings else 1.0,
                 top_k=self.settings.top_k if self.settings else 0,
                 images=self.images if self.images else None,
-                model=self.settings.model if self.settings else None
+                model=target_model,
+                effort=target_effort
             ):
                 response_text += chunk
                 self.response_queue.put(('chunk', chunk))

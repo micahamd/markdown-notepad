@@ -839,6 +839,12 @@ class MarkdownVisualWidget(tk.Frame):
     
     def set_content(self, markdown_text):
         """Set and render markdown content with images - optimized for large files"""
+        import hashlib as _hl
+        content_hash = _hl.md5(markdown_text.encode()).hexdigest()
+        if content_hash == self._last_rendered_hash and self.text_widget.get('1.0', tk.END).strip():
+            return
+        self._last_rendered_hash = content_hash
+
         # Cancel any pending render
         if self._render_job:
             self.after_cancel(self._render_job)
@@ -3251,7 +3257,7 @@ class MarkdownNotepad(tk.Tk):
                 messagebox.showerror("Error", f"Could not open file:\n{e}")
     
     def open_with_markitdown(self):
-        """Open any file and convert with MarkItDown, extracting images if possible"""
+        """Open any file and convert with MarkItDown in a background thread."""
         if not MARKITDOWN_AVAILABLE:
             messagebox.showwarning(
                 "MarkItDown Not Available",
@@ -3272,76 +3278,106 @@ class MarkdownNotepad(tk.Tk):
         ]
         
         filepath = filedialog.askopenfilename(filetypes=filetypes)
-        if filepath:
+        if not filepath:
+            return
+
+        # Create non-blocking progress dialog
+        progress_dialog = tk.Toplevel(self)
+        progress_dialog.title("Converting Document")
+        progress_dialog.geometry("380x130")
+        progress_dialog.transient(self)
+        progress_dialog.grab_set()
+        progress_dialog.resizable(False, False)
+        
+        frame = ttk.Frame(progress_dialog, padding=15)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(frame, text=f"Converting with MarkItDown:\n{os.path.basename(filepath)}", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, pady=(0, 10))
+        pbar = ttk.Progressbar(frame, mode="indeterminate")
+        pbar.pack(fill=tk.X, pady=(0, 8))
+        pbar.start(10)
+        
+        status_lbl = ttk.Label(frame, text="Processing document in background...", foreground="gray")
+        status_lbl.pack(anchor=tk.W)
+
+        self._set_status(f"Converting: {os.path.basename(filepath)}...")
+
+        def worker():
             try:
-                self._set_status(f"Converting with MarkItDown: {filepath}...")
-                self.update()
-                
-                # Convert with MarkItDown
                 result = self.md_converter.convert(filepath)
                 content = result.text_content
-                
-                # Try to extract images from Office documents
                 extracted_images = {}
+                output_dir = None
+
                 if ImageExtractor.can_extract(filepath):
-                    # Ask user if they want to extract images
-                    extract = messagebox.askyesno(
-                        "Extract Images?",
-                        "This document may contain images. Would you like to extract them?\n\n"
-                        "Images will be saved alongside your markdown file."
-                    )
-                    
-                    if extract:
-                        # Create output directory for images
-                        base_name = Path(filepath).stem
-                        output_dir = filedialog.askdirectory(
-                            title="Select folder to save extracted images",
-                            mustexist=True
+                    # Request image extraction on main UI thread
+                    def ask_and_extract():
+                        nonlocal extracted_images, output_dir, content
+                        extract = messagebox.askyesno(
+                            "Extract Images?",
+                            "This document may contain images. Would you like to extract them?\n\n"
+                            "Images will be saved alongside your markdown file."
                         )
-                        
-                        if output_dir:
-                            self._set_status("Extracting images...")
-                            self.update()
-                            
-                            extracted_images = ImageExtractor.extract_images(filepath, output_dir)
-                            
-                            if extracted_images:
-                                # Append image references to content
-                                content = ImageExtractor.insert_image_references(
-                                    content, extracted_images, output_dir
-                                )
-                                self.extracted_images_dir = output_dir
-                
-                # Create a new tab for the converted content
-                tab = self.new_tab(content=content)
-                tab.is_modified = True  # Mark as modified since not yet saved
-                self._update_tab_title(tab)
-                
-                # Set base path for visual viewer
-                if extracted_images and output_dir:
-                    tab.visual_viewer.set_base_path(output_dir)
-                
-                # Status message
-                img_count = len(extracted_images)
-                if img_count > 0:
-                    self._set_status(f"Converted: {os.path.basename(filepath)} ({img_count} images extracted)")
-                    messagebox.showinfo(
-                        "Conversion Complete",
-                        f"Successfully converted '{os.path.basename(filepath)}' to Markdown.\n\n"
-                        f"Extracted {img_count} image(s) to: {self.extracted_images_dir}\n\n"
-                        "Use 'Save As' to save the markdown output."
-                    )
-                else:
-                    self._set_status(f"Converted: {os.path.basename(filepath)}")
-                    messagebox.showinfo(
-                        "Conversion Complete",
-                        f"Successfully converted '{os.path.basename(filepath)}' to Markdown.\n\n"
-                        "Use 'Save As' to save the markdown output."
-                    )
+                        if extract:
+                            output_dir = filedialog.askdirectory(
+                                title="Select folder to save extracted images",
+                                mustexist=True
+                            )
+                            if output_dir:
+                                extracted_images = ImageExtractor.extract_images(filepath, output_dir)
+                                if extracted_images:
+                                    content = ImageExtractor.insert_image_references(
+                                        content, extracted_images, output_dir
+                                    )
+
+                    progress_dialog.after(0, ask_and_extract)
+
+                def on_success():
+                    try:
+                        pbar.stop()
+                        progress_dialog.destroy()
+                    except Exception:
+                        pass
                     
+                    tab = self.new_tab(content=content)
+                    tab.is_modified = True
+                    self._update_tab_title(tab)
+                    
+                    if extracted_images and output_dir:
+                        tab.visual_viewer.set_base_path(output_dir)
+                    
+                    img_count = len(extracted_images)
+                    if img_count > 0:
+                        self._set_status(f"Converted: {os.path.basename(filepath)} ({img_count} images extracted)")
+                        messagebox.showinfo(
+                            "Conversion Complete",
+                            f"Successfully converted '{os.path.basename(filepath)}' to Markdown.\n\n"
+                            f"Extracted {img_count} image(s) to: {output_dir}\n\n"
+                            "Use 'Save As' to save the markdown output."
+                        )
+                    else:
+                        self._set_status(f"Converted: {os.path.basename(filepath)}")
+                        messagebox.showinfo(
+                            "Conversion Complete",
+                            f"Successfully converted '{os.path.basename(filepath)}' to Markdown.\n\n"
+                            "Use 'Save As' to save the markdown output."
+                        )
+
+                self.after(0, on_success)
+
             except Exception as e:
-                messagebox.showerror("Conversion Error", f"Could not convert file:\n{e}")
-                self._set_status("Conversion failed")
+                def on_error(err=e):
+                    try:
+                        pbar.stop()
+                        progress_dialog.destroy()
+                    except Exception:
+                        pass
+                    messagebox.showerror("Conversion Error", f"Could not convert file:\n{err}")
+                    self._set_status("Conversion failed")
+
+                self.after(0, on_error)
+
+        threading.Thread(target=worker, daemon=True).start()
     
     def save_file(self):
         """Save the current tab's file"""
