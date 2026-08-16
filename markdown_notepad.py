@@ -41,6 +41,13 @@ except ImportError:
     MARKITDOWN_AVAILABLE = False
     print("Warning: markitdown not installed. Install with: pip install 'markitdown[all]'")
 
+# File extensions supported for MarkItDown document conversion
+MARKITDOWN_DOCUMENT_EXTENSIONS = {
+    '.pdf', '.epub', '.docx', '.pptx', '.xlsx', '.xls',
+    '.html', '.htm', '.msg', '.jpg', '.jpeg', '.png',
+    '.gif', '.bmp', '.wav', '.mp3'
+}
+
 # Try to import tkhtmlview for visual rendering
 try:
     from tkhtmlview import HTMLLabel
@@ -1689,28 +1696,7 @@ class MarkdownNotepad(tk.Tk):
                     self._update_recent_files_menu()
             return
         
-        # Check if already open
-        for tab in self.tabs:
-            if tab.file_path == filepath:
-                self.notebook.select(tab)
-                self._set_status(f"File already open: {os.path.basename(filepath)}")
-                return
-        
-        # Open the file
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            tab = self.new_tab(file_path=filepath, content=content)
-            tab.is_modified = False
-            self._update_tab_title(tab)
-            self._set_status(f"Opened: {filepath}")
-            tab.visual_viewer.set_base_path(os.path.dirname(filepath))
-            
-            # Move to top of recent files
-            self._add_to_recent_files(filepath)
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not open file:\n{e}")
+        self.open_file(filepath)
     
     def _clear_recent_files(self):
         """Clear the recent files list"""
@@ -3220,71 +3206,116 @@ class MarkdownNotepad(tk.Tk):
         self.new_tab()
         self._set_status("New file created")
     
-    def open_file(self):
-        """Open a markdown file in a new tab"""
-        filetypes = [
-            ("Markdown files", "*.md *.markdown"),
-            ("Text files", "*.txt"),
-            ("All files", "*.*")
-        ]
-        
-        filepath = filedialog.askopenfilename(filetypes=filetypes)
-        if filepath:
-            # Check if already open in a tab
-            for tab in self.tabs:
-                if tab.file_path == filepath:
-                    # Switch to that tab
-                    self.notebook.select(tab)
-                    self._set_status(f"File already open: {os.path.basename(filepath)}")
-                    return
-            
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                # Create a new tab for this file
-                tab = self.new_tab(file_path=filepath, content=content)
-                tab.is_modified = False
-                self._update_tab_title(tab)
-                self._set_status(f"Opened: {filepath}")
-                
-                # Update visual viewer base path for relative image resolution
-                tab.visual_viewer.set_base_path(os.path.dirname(filepath))
-                
-                # Add to recent files
-                self._add_to_recent_files(filepath)
-            except Exception as e:
-                messagebox.showerror("Error", f"Could not open file:\n{e}")
-    
-    def open_with_markitdown(self):
+    def open_file(self, filepath=None):
+        """Open a markdown, text, or converted document in a new tab"""
+        if not filepath:
+            filetypes = [
+                ("All Supported Files", "*.md *.markdown *.txt *.pdf *.epub *.docx *.pptx *.xlsx *.xls *.html *.htm *.csv *.json *.xml *.msg *.py *.js *.wav *.mp3"),
+                ("Markdown & Text files", "*.md *.markdown *.txt *.csv *.json *.xml *.py *.js"),
+                ("PDF documents", "*.pdf"),
+                ("EPUB eBooks", "*.epub"),
+                ("Microsoft Word", "*.docx"),
+                ("Microsoft PowerPoint", "*.pptx"),
+                ("Microsoft Excel", "*.xlsx *.xls"),
+                ("HTML files", "*.html *.htm"),
+                ("All files", "*.*")
+            ]
+            filepath = filedialog.askopenfilename(filetypes=filetypes)
+            if not filepath:
+                return
+
+        filepath = os.path.normpath(filepath)
+
+        # Check if already open in a tab
+        for tab in self.tabs:
+            if tab.file_path and os.path.normpath(tab.file_path) == filepath:
+                self.notebook.select(tab)
+                self._set_status(f"File already open: {os.path.basename(filepath)}")
+                return
+
+        ext = Path(filepath).suffix.lower()
+
+        # If it's a binary/document format supported by MarkItDown, route directly to MarkItDown
+        if MARKITDOWN_AVAILABLE and ext in MARKITDOWN_DOCUMENT_EXTENSIONS:
+            self.open_with_markitdown(filepath)
+            return
+
+        # Attempt reading as plain text / markdown
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            tab = self.new_tab(file_path=filepath, content=content)
+            tab.is_modified = False
+            self._update_tab_title(tab)
+            self._set_status(f"Opened: {filepath}")
+            tab.visual_viewer.set_base_path(os.path.dirname(filepath))
+            self._add_to_recent_files(filepath)
+        except UnicodeDecodeError:
+            # Fallback to MarkItDown if available
+            if MARKITDOWN_AVAILABLE:
+                self.open_with_markitdown(filepath)
+            else:
+                messagebox.showerror("Error", f"Could not decode file '{os.path.basename(filepath)}' as text/UTF-8.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open file:\n{e}")
+
+    def open_with_markitdown(self, filepath=None):
         """Open any file and convert with MarkItDown in a background thread."""
-        if not MARKITDOWN_AVAILABLE:
+        if not MARKITDOWN_AVAILABLE or self.md_converter is None:
             messagebox.showwarning(
                 "MarkItDown Not Available",
                 "MarkItDown is not installed.\n\nInstall with:\npip install 'markitdown[all]'"
             )
             return
         
-        filetypes = [
-            ("All supported files", "*.pdf *.docx *.pptx *.xlsx *.xls *.html *.htm *.csv *.json *.xml *.epub *.jpg *.jpeg *.png *.gif *.bmp *.wav *.mp3 *.msg"),
-            ("PDF files", "*.pdf"),
-            ("Word documents", "*.docx"),
-            ("PowerPoint", "*.pptx"),
-            ("Excel files", "*.xlsx *.xls"),
-            ("HTML files", "*.html *.htm"),
-            ("Images", "*.jpg *.jpeg *.png *.gif *.bmp"),
-            ("Audio", "*.wav *.mp3"),
-            ("All files", "*.*")
-        ]
-        
-        filepath = filedialog.askopenfilename(filetypes=filetypes)
         if not filepath:
-            return
+            filetypes = [
+                ("All Supported Files", "*.pdf *.epub *.docx *.pptx *.xlsx *.xls *.html *.htm *.csv *.json *.xml *.msg *.jpg *.jpeg *.png *.gif *.bmp *.wav *.mp3 *.md *.txt"),
+                ("PDF documents", "*.pdf"),
+                ("EPUB eBooks", "*.epub"),
+                ("Word documents", "*.docx"),
+                ("PowerPoint", "*.pptx"),
+                ("Excel files", "*.xlsx *.xls"),
+                ("HTML files", "*.html *.htm"),
+                ("Images", "*.jpg *.jpeg *.png *.gif *.bmp"),
+                ("Audio", "*.wav *.mp3"),
+                ("All files", "*.*")
+            ]
+            filepath = filedialog.askopenfilename(filetypes=filetypes)
+            if not filepath:
+                return
+
+        filepath = os.path.normpath(filepath)
+
+        # Check if already open in a tab
+        for tab in self.tabs:
+            if tab.file_path and os.path.normpath(tab.file_path) == filepath:
+                self.notebook.select(tab)
+                self._set_status(f"File already open: {os.path.basename(filepath)}")
+                return
+
+        # Check image extraction before starting background thread to avoid UI dialog races
+        extract_images = False
+        output_dir = None
+        if ImageExtractor.can_extract(filepath):
+            extract_images = messagebox.askyesno(
+                "Extract Images?",
+                "This document may contain embedded images. Would you like to extract them?\n\n"
+                "Images will be saved alongside your markdown file."
+            )
+            if extract_images:
+                output_dir = filedialog.askdirectory(
+                    title="Select folder to save extracted images",
+                    mustexist=True
+                )
+                if not output_dir:
+                    extract_images = False
 
         # Create non-blocking progress dialog
         progress_dialog = tk.Toplevel(self)
         progress_dialog.title("Converting Document")
-        progress_dialog.geometry("380x130")
+        progress_dialog.geometry("400x140")
         progress_dialog.transient(self)
         progress_dialog.grab_set()
         progress_dialog.resizable(False, False)
@@ -3302,82 +3333,67 @@ class MarkdownNotepad(tk.Tk):
 
         self._set_status(f"Converting: {os.path.basename(filepath)}...")
 
+        conv_queue = queue.Queue()
+
         def worker():
             try:
                 result = self.md_converter.convert(filepath)
-                content = result.text_content
-                extracted_images = {}
-                output_dir = None
+                content = str(getattr(result, 'text_content', None) or getattr(result, 'markdown', '') or "")
+                extracted = {}
 
-                if ImageExtractor.can_extract(filepath):
-                    # Request image extraction on main UI thread
-                    def ask_and_extract():
-                        nonlocal extracted_images, output_dir, content
-                        extract = messagebox.askyesno(
-                            "Extract Images?",
-                            "This document may contain images. Would you like to extract them?\n\n"
-                            "Images will be saved alongside your markdown file."
+                if extract_images and output_dir:
+                    extracted = ImageExtractor.extract_images(filepath, output_dir)
+                    if extracted:
+                        content = ImageExtractor.insert_image_references(
+                            content, extracted, output_dir
                         )
-                        if extract:
-                            output_dir = filedialog.askdirectory(
-                                title="Select folder to save extracted images",
-                                mustexist=True
-                            )
-                            if output_dir:
-                                extracted_images = ImageExtractor.extract_images(filepath, output_dir)
-                                if extracted_images:
-                                    content = ImageExtractor.insert_image_references(
-                                        content, extracted_images, output_dir
-                                    )
 
-                    progress_dialog.after(0, ask_and_extract)
+                conv_queue.put(('success', content, extracted, output_dir, filepath))
+            except Exception as e:
+                conv_queue.put(('error', str(e), filepath))
 
-                def on_success():
-                    try:
-                        pbar.stop()
-                        progress_dialog.destroy()
-                    except Exception:
-                        pass
-                    
-                    tab = self.new_tab(content=content)
-                    tab.is_modified = True
+        def poll_queue():
+            try:
+                msg_type, *args = conv_queue.get_nowait()
+                try:
+                    pbar.stop()
+                    progress_dialog.destroy()
+                except Exception:
+                    pass
+
+                if msg_type == 'success':
+                    content, extracted, out_dir, fpath = args
+                    tab = self.new_tab(file_path=fpath, content=content)
+                    tab.is_modified = False
                     self._update_tab_title(tab)
                     
-                    if extracted_images and output_dir:
-                        tab.visual_viewer.set_base_path(output_dir)
+                    if out_dir:
+                        tab.visual_viewer.set_base_path(out_dir)
+                    else:
+                        tab.visual_viewer.set_base_path(os.path.dirname(fpath))
                     
-                    img_count = len(extracted_images)
+                    self._add_to_recent_files(fpath)
+                    
+                    img_count = len(extracted)
                     if img_count > 0:
-                        self._set_status(f"Converted: {os.path.basename(filepath)} ({img_count} images extracted)")
+                        self._set_status(f"Converted: {os.path.basename(fpath)} ({img_count} images extracted)")
                         messagebox.showinfo(
                             "Conversion Complete",
-                            f"Successfully converted '{os.path.basename(filepath)}' to Markdown.\n\n"
-                            f"Extracted {img_count} image(s) to: {output_dir}\n\n"
-                            "Use 'Save As' to save the markdown output."
+                            f"Successfully converted '{os.path.basename(fpath)}' to Markdown.\n\n"
+                            f"Extracted {img_count} image(s) to: {out_dir}"
                         )
                     else:
-                        self._set_status(f"Converted: {os.path.basename(filepath)}")
-                        messagebox.showinfo(
-                            "Conversion Complete",
-                            f"Successfully converted '{os.path.basename(filepath)}' to Markdown.\n\n"
-                            "Use 'Save As' to save the markdown output."
-                        )
-
-                self.after(0, on_success)
-
-            except Exception as e:
-                def on_error(err=e):
-                    try:
-                        pbar.stop()
-                        progress_dialog.destroy()
-                    except Exception:
-                        pass
-                    messagebox.showerror("Conversion Error", f"Could not convert file:\n{err}")
+                        self._set_status(f"Converted: {os.path.basename(fpath)}")
+                elif msg_type == 'error':
+                    err_msg, fpath = args
+                    messagebox.showerror("Conversion Error", f"Could not convert '{os.path.basename(fpath)}':\n{err_msg}")
                     self._set_status("Conversion failed")
-
-                self.after(0, on_error)
+            except queue.Empty:
+                if progress_dialog.winfo_exists():
+                    self.after(50, poll_queue)
 
         threading.Thread(target=worker, daemon=True).start()
+        self.after(50, poll_queue)
     
     def save_file(self):
         """Save the current tab's file"""
@@ -4846,6 +4862,11 @@ class FindDialog(tk.Toplevel):
 def main():
     """Main entry point"""
     app = MarkdownNotepad()
+    import sys
+    if len(sys.argv) > 1:
+        for arg in sys.argv[1:]:
+            if os.path.exists(arg):
+                app.open_file(arg)
     app.mainloop()
 
 
