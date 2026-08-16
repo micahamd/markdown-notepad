@@ -95,9 +95,8 @@ def _build_css(theme: Optional[Dict] = None, page_settings: Optional[Dict] = Non
     h3 {{ font-size: 1.3em; margin: 0.6em 0 0.3em; }}
     h4 {{ font-size: 1.1em; margin: 0.5em 0 0.25em; }}
     h5, h6 {{ font-size: 1em; margin: 0.5em 0 0.25em; }}
-    p {{ margin: 0.5em 0; }}
+    p {{ margin: 0.8em 0; text-align: justify; text-justify: inter-word; hyphens: auto; }}
     blockquote {{
-        border-left: 4px solid #ccc;
         margin: 1em 0;
         padding: 0.5em 1em;
         color: #555;

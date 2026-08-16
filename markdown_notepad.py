@@ -76,7 +76,14 @@ try:
     AI_CHAT_AVAILABLE = True
 except ImportError:
     AI_CHAT_AVAILABLE = False
-    print("Warning: ai_chat module not found. AI chat disabled.")
+    print("Warning: ai_chat not found. AI features disabled.")
+
+# Import text cleaner for algorithmic cleanup & reflow
+try:
+    from text_cleaner import clean_document, TextCleanerOptions
+    TEXT_CLEANER_AVAILABLE = True
+except ImportError:
+    TEXT_CLEANER_AVAILABLE = False
 
 # Import diff panel
 try:
@@ -1041,8 +1048,8 @@ class MarkdownVisualWidget(tk.Frame):
             
             # Normal text
             else:
-                self._insert_inline(line)
-                self.text_widget.insert(tk.END, '\n')
+                self._insert_inline(line, ('paragraph',))
+                self.text_widget.insert(tk.END, '\n', 'paragraph')
         
         # Flush any remaining table at end of content
         if in_table and table_rows:
@@ -1814,6 +1821,9 @@ class MarkdownNotepad(tk.Tk):
         edit_menu.add_command(label="Find...", command=self.find_text, accelerator="Ctrl+F")
         edit_menu.add_command(label="Find & Replace...", command=self.find_replace, accelerator="Ctrl+H")
         edit_menu.add_command(label="Go to Line...", command=self.goto_line, accelerator="Ctrl+G")
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Clean & Reflow Document", command=self.clean_current_document, accelerator="Ctrl+Shift+R")
+        edit_menu.add_command(label="Clean & Reflow Selection", command=self.clean_selected_text)
         
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -1926,6 +1936,10 @@ class MarkdownNotepad(tk.Tk):
         save_btn = ttk.Button(toolbar, text="Save", command=self.save_file, style="Toolbar.TButton")
         save_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(save_btn, "Save File (Ctrl+S)")
+
+        reflow_btn = ttk.Button(toolbar, text="Reflow", command=self.clean_current_document, style="Toolbar.TButton")
+        reflow_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(reflow_btn, "Clean & Reflow Document - Fix soft wraps & hyphens (Ctrl+Shift+R)")
         
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
         # Mode toggle
@@ -2056,6 +2070,9 @@ class MarkdownNotepad(tk.Tk):
         
         # Export shortcut
         self.bind("<Control-E>", lambda e: self._export_pdf())  # Ctrl+Shift+E
+
+        # Clean & Reflow shortcut
+        self.bind("<Control-R>", lambda e: self.clean_current_document())  # Ctrl+Shift+R
         
         # Focus mode toggle
         self.bind("<F11>", lambda e: self._toggle_focus_mode())
@@ -3338,7 +3355,14 @@ class MarkdownNotepad(tk.Tk):
         def worker():
             try:
                 result = self.md_converter.convert(filepath)
-                content = str(getattr(result, 'text_content', None) or getattr(result, 'markdown', '') or "")
+                raw_content = str(getattr(result, 'text_content', None) or getattr(result, 'markdown', '') or "")
+                
+                # Apply algorithmic text cleaning & reflow
+                if TEXT_CLEANER_AVAILABLE:
+                    content = clean_document(raw_content)
+                else:
+                    content = raw_content
+
                 extracted = {}
 
                 if extract_images and output_dir:
@@ -3507,6 +3531,59 @@ class MarkdownNotepad(tk.Tk):
         if self.current_tab:
             self.current_tab.source_editor.tag_add(tk.SEL, "1.0", tk.END)
         return "break"
+
+    def clean_current_document(self):
+        """Clean and reflow the current tab's markdown text using algorithmic normalization."""
+        if not self.current_tab:
+            return
+        if not TEXT_CLEANER_AVAILABLE:
+            messagebox.showwarning("Feature Unavailable", "Text cleaner module is not available.")
+            return
+
+        current_content = self.current_tab.get_content()
+        if not current_content.strip():
+            return
+
+        cleaned = clean_document(current_content)
+        if cleaned != current_content:
+            self.current_tab.set_content(cleaned)
+            self.current_tab.is_modified = True
+            self._update_tab_title(self.current_tab)
+            self._set_status("Document text cleaned and reflowed")
+        else:
+            self._set_status("Document text is already clean")
+
+    def clean_selected_text(self):
+        """Clean and reflow only the currently selected text in the active tab."""
+        if not self.current_tab:
+            return
+        if not TEXT_CLEANER_AVAILABLE:
+            messagebox.showwarning("Feature Unavailable", "Text cleaner module is not available.")
+            return
+
+        # Determine active text widget based on current tab mode
+        if self.current_tab.current_mode == "visual":
+            text_widget = self.current_tab.visual_viewer.text_widget
+        else:
+            text_widget = self.current_tab.source_editor.text_widget
+
+        try:
+            sel_start = text_widget.index(tk.SEL_FIRST)
+            sel_end = text_widget.index(tk.SEL_LAST)
+            selected_text = text_widget.get(sel_start, sel_end)
+        except tk.TclError:
+            messagebox.showinfo("No Selection", "Please select text to clean and reflow.")
+            return
+
+        if not selected_text.strip():
+            return
+
+        cleaned = clean_document(selected_text)
+        text_widget.delete(sel_start, sel_end)
+        text_widget.insert(sel_start, cleaned)
+        self.current_tab.is_modified = True
+        self._update_tab_title(self.current_tab)
+        self._set_status("Selected text cleaned and reflowed")
     
     def find_text(self):
         """Open find dialog"""
