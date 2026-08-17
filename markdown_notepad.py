@@ -85,6 +85,13 @@ try:
 except ImportError:
     TEXT_CLEANER_AVAILABLE = False
 
+# Import document image extractor
+try:
+    from document_image_extractor import DocumentImageExtractor, extract_document_images
+    DOC_IMAGE_EXTRACTOR_AVAILABLE = True
+except ImportError:
+    DOC_IMAGE_EXTRACTOR_AVAILABLE = False
+
 # Import diff panel
 try:
     from diff_panel import DiffPanel
@@ -214,74 +221,42 @@ class ToolTip:
 class ImageExtractor:
     """
     Extracts images from documents alongside MarkItDown conversion.
-    Supports: DOCX, PPTX, XLSX (Office Open XML formats use ZIP with embedded images)
+    Supports: PDF, EPUB, DOCX, PPTX, XLSX.
     """
-    
-    SUPPORTED_EXTENSIONS = {'.docx', '.pptx', '.xlsx'}
-    IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.emf', '.wmf'}
     
     @staticmethod
     def can_extract(filepath):
         """Check if we can extract images from this file type"""
+        if DOC_IMAGE_EXTRACTOR_AVAILABLE:
+            return DocumentImageExtractor.can_extract(filepath)
         ext = Path(filepath).suffix.lower()
-        return ext in ImageExtractor.SUPPORTED_EXTENSIONS
+        return ext in {'.pdf', '.epub', '.docx', '.pptx', '.xlsx'}
     
     @staticmethod
-    def extract_images(filepath, output_dir):
-        """
-        Extract images from Office documents.
-        Returns a dict mapping original image paths to extracted file paths.
-        """
-        extracted = {}
-        ext = Path(filepath).suffix.lower()
-        
-        if ext not in ImageExtractor.SUPPORTED_EXTENSIONS:
+    def extract_images(filepath, output_dir, raw_markdown=""):
+        """Extract images from document and return dict of extracted image paths."""
+        if DOC_IMAGE_EXTRACTOR_AVAILABLE:
+            _, extracted, _ = DocumentImageExtractor.extract_and_integrate(
+                filepath, output_dir=output_dir, raw_markdown=raw_markdown
+            )
             return extracted
-        
-        try:
-            # Office Open XML formats are ZIP files
-            with zipfile.ZipFile(filepath, 'r') as zf:
-                for name in zf.namelist():
-                    # Images are typically in word/media/, ppt/media/, xl/media/
-                    if '/media/' in name.lower():
-                        img_ext = Path(name).suffix.lower()
-                        if img_ext in ImageExtractor.IMAGE_EXTENSIONS:
-                            # Extract to output directory
-                            img_filename = Path(name).name
-                            output_path = os.path.join(output_dir, img_filename)
-                            
-                            # Handle duplicates
-                            counter = 1
-                            base, ext_part = os.path.splitext(output_path)
-                            while os.path.exists(output_path):
-                                output_path = f"{base}_{counter}{ext_part}"
-                                counter += 1
-                            
-                            # Extract the image
-                            with zf.open(name) as src, open(output_path, 'wb') as dst:
-                                dst.write(src.read())
-                            
-                            extracted[name] = output_path
-        except Exception as e:
-            print(f"Error extracting images: {e}")
-        
-        return extracted
+        return {}
     
     @staticmethod
     def insert_image_references(markdown_text, extracted_images, output_dir):
-        """
-        Append extracted image references to the markdown text.
-        """
+        """Append extracted image references if not already present."""
         if not extracted_images:
             return markdown_text
         
-        # Add a section for extracted images
+        # If references already exist in markdown_text, return as is
+        if re.search(r'!\[.*?\]\(.*?\)', markdown_text):
+            return markdown_text
+
+        # Otherwise add a section for extracted images
         image_section = "\n\n---\n\n## Extracted Images\n\n"
         for orig_path, local_path in extracted_images.items():
             filename = os.path.basename(local_path)
-            # Use relative path from output directory
-            rel_path = os.path.basename(local_path)
-            image_section += f"![{filename}]({rel_path})\n\n"
+            image_section += f"![{filename}]({filename})\n\n"
         
         return markdown_text + image_section
 
@@ -565,22 +540,43 @@ class ImageHandler:
             return None
     
     def _load_file_image(self, file_path):
-        """Load image from file path"""
-        # Resolve relative paths
-        if not os.path.isabs(file_path):
-            file_path = os.path.join(self.base_path, file_path)
+        """Load image from file path with robust fallback resolution."""
+        resolved_path = None
         
-        # Normalize path
-        file_path = os.path.normpath(file_path)
-        
+        # Check direct path
+        if os.path.isabs(file_path) and os.path.exists(file_path):
+            resolved_path = file_path
+        else:
+            # Try relative to base_path
+            candidate = os.path.normpath(os.path.join(self.base_path, file_path))
+            if os.path.exists(candidate):
+                resolved_path = candidate
+            else:
+                # Try just filename in base_path
+                base_candidate = os.path.normpath(os.path.join(self.base_path, os.path.basename(file_path)))
+                if os.path.exists(base_candidate):
+                    resolved_path = base_candidate
+                elif os.path.isdir(self.base_path):
+                    # Search inside any _assets or images subfolders in base_path
+                    filename = os.path.basename(file_path)
+                    try:
+                        for entry in os.scandir(self.base_path):
+                            if entry.is_dir() and (entry.name.endswith('_assets') or entry.name in ('assets', 'images', 'Images', 'media')):
+                                sub_candidate = os.path.join(entry.path, filename)
+                                if os.path.exists(sub_candidate):
+                                    resolved_path = sub_candidate
+                                    break
+                    except Exception:
+                        pass
+
+        if not resolved_path or not os.path.exists(resolved_path):
+            return None
+
+        file_path = os.path.normpath(resolved_path)
+
         # Check cache
         if file_path in self.image_cache:
             return self.image_cache[file_path]
-        
-        # Security: ensure path doesn't escape base directory too much
-        # (allow some traversal but be cautious)
-        if not os.path.exists(file_path):
-            return None
         
         try:
             image = Image.open(file_path)
@@ -955,7 +951,7 @@ class MarkdownVisualWidget(tk.Frame):
         
         for i, line in enumerate(lines):
             # Check if this line contains an image
-            img_match = re.match(r'!\[.*?\]\(.*?\)', line.strip())
+            img_match = re.search(r'!\[.*?\]\(.*?\)|<img\s+[^>]*src=.*?>', line.strip(), re.IGNORECASE)
             
             # Handle code blocks
             if line.strip().startswith('```'):
@@ -994,15 +990,24 @@ class MarkdownVisualWidget(tk.Frame):
             
             # Handle images - insert placeholder with embedded image
             if img_match and PIL_AVAILABLE:
-                # Find the matching image info
+                matched_img = None
                 for img in images:
                     if img.get('full_match') and img['full_match'] in line:
-                        self._insert_image_inline(img)
+                        matched_img = img
                         break
-                else:
-                    # No matching image found, render as text
-                    self._insert_inline(line)
+
+                if matched_img:
+                    full_match = matched_img['full_match']
+                    before, _, after = line.partition(full_match)
+                    if before.strip():
+                        self._insert_inline(before, ('paragraph',))
+                    self._insert_image_inline(matched_img)
+                    if after.strip():
+                        self._insert_inline(after, ('paragraph',))
                     self.text_widget.insert(tk.END, '\n')
+                else:
+                    self._insert_inline(line, ('paragraph',))
+                    self.text_widget.insert(tk.END, '\n', 'paragraph')
                 continue
             
             # Headers
@@ -3314,20 +3319,19 @@ class MarkdownNotepad(tk.Tk):
 
         # Check image extraction before starting background thread to avoid UI dialog races
         extract_images = False
-        output_dir = None
+        default_assets_dir = DocumentImageExtractor.get_default_assets_dir(filepath) if DOC_IMAGE_EXTRACTOR_AVAILABLE else os.path.join(os.path.dirname(filepath), "assets")
+        output_dir = default_assets_dir
+
         if ImageExtractor.can_extract(filepath):
             extract_images = messagebox.askyesno(
-                "Extract Images?",
-                "This document may contain embedded images. Would you like to extract them?\n\n"
-                "Images will be saved alongside your markdown file."
+                "Extract & Display Images?",
+                "This document contains embedded images.\n\n"
+                f"Would you like to extract them inline to:\n{os.path.basename(default_assets_dir)}/\n\n"
+                "Images will be displayed inline throughout the markdown text.",
+                default=messagebox.YES
             )
-            if extract_images:
-                output_dir = filedialog.askdirectory(
-                    title="Select folder to save extracted images",
-                    mustexist=True
-                )
-                if not output_dir:
-                    extract_images = False
+            if not extract_images:
+                output_dir = None
 
         # Create non-blocking progress dialog
         progress_dialog = tk.Toplevel(self)
@@ -3356,23 +3360,19 @@ class MarkdownNotepad(tk.Tk):
             try:
                 result = self.md_converter.convert(filepath)
                 raw_content = str(getattr(result, 'text_content', None) or getattr(result, 'markdown', '') or "")
-                
-                # Apply algorithmic text cleaning & reflow
-                if TEXT_CLEANER_AVAILABLE:
-                    content = clean_document(raw_content)
-                else:
-                    content = raw_content
-
                 extracted = {}
 
-                if extract_images and output_dir:
-                    extracted = ImageExtractor.extract_images(filepath, output_dir)
-                    if extracted:
-                        content = ImageExtractor.insert_image_references(
-                            content, extracted, output_dir
-                        )
+                if extract_images and output_dir and DOC_IMAGE_EXTRACTOR_AVAILABLE:
+                    content, extracted, assets_path = DocumentImageExtractor.extract_and_integrate(
+                        filepath, output_dir=output_dir, raw_markdown=raw_content, clean_text=True
+                    )
+                else:
+                    if TEXT_CLEANER_AVAILABLE:
+                        content = clean_document(raw_content)
+                    else:
+                        content = raw_content
 
-                conv_queue.put(('success', content, extracted, output_dir, filepath))
+                conv_queue.put(('success', content, extracted, output_dir if extract_images else None, filepath))
             except Exception as e:
                 conv_queue.put(('error', str(e), filepath))
 

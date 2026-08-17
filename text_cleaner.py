@@ -288,6 +288,12 @@ class TextCleaner:
                 output_paragraphs.append(line)
                 continue
 
+            # Preserve standalone image tags
+            if re.match(r'^\s*(?:!\[.*?\]\(.*?\)|<img\s+[^>]*>)\s*$', stripped, re.IGNORECASE):
+                flush_paragraph()
+                output_paragraphs.append(stripped)
+                continue
+
             if not current_paragraph:
                 current_paragraph.append(stripped)
             else:
@@ -313,7 +319,7 @@ class TextCleaner:
         has_lower = any(c.islower() for c in line)
         if has_upper and not has_lower:
             words = line.split()
-            return len(words) >= 1 and not line.startswith(('#', '-', '*', '|', '>'))
+            return len(words) >= 1 and not line.startswith(('#', '-', '*', '|', '>', '!', '<', '['))
         return False
 
     @classmethod
