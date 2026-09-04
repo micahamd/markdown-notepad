@@ -33,10 +33,13 @@ except ImportError:
 
 # Try to import python-docx for DOCX
 try:
+    import docx
     from docx import Document as DocxDocument
     from docx.shared import Inches, Pt, Cm, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
     from docx.enum.style import WD_STYLE_TYPE
+    from docx.oxml.ns import qn
     DOCX_AVAILABLE = True
 except ImportError:
     DOCX_AVAILABLE = False
@@ -545,8 +548,56 @@ def _add_inline_formatting(paragraph, text: str):
         paragraph.add_run(text[last_end:])
 
 
+def _parse_docx_image_params(alt_text: str):
+    """Parse extended image parameters from alt text for DOCX formatting"""
+    res = {'alt': alt_text, 'width': None, 'height': None, 'align': 'center', 'caption': None}
+    if not alt_text or '|' not in alt_text:
+        return res
+    parts = alt_text.split('|')
+    res['alt'] = parts[0].strip()
+    param_str = '|'.join(parts[1:]).strip()
+
+    kv_pattern = re.compile(r'(\w+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^,;|]+))')
+    kv_matches = list(kv_pattern.finditer(param_str))
+    if kv_matches:
+        for m in kv_matches:
+            k = m.group(1).lower()
+            v = (m.group(2) or m.group(3) or m.group(4) or '').strip()
+            if k == 'width':
+                dim = re.match(r'(\d+)', v)
+                if dim:
+                    res['width'] = int(dim.group(1))
+            elif k == 'height':
+                dim = re.match(r'(\d+)', v)
+                if dim:
+                    res['height'] = int(dim.group(1))
+            elif k == 'align':
+                if v.lower() in ('left', 'right', 'center'):
+                    res['align'] = v.lower()
+            elif k == 'caption':
+                res['caption'] = v
+    else:
+        tokens = [t.strip() for t in re.split(r'[,|]', param_str) if t.strip()]
+        for token in tokens:
+            m_dim = re.match(r'^(\d+)\s*[xX×]\s*(\d+)$', token)
+            if m_dim:
+                res['width'] = int(m_dim.group(1))
+                res['height'] = int(m_dim.group(2))
+                continue
+            m_w = re.match(r'^(\d+)(?:px)?$', token)
+            if m_w:
+                res['width'] = int(m_w.group(1))
+                continue
+            if token.lower() in ('left', 'right', 'center'):
+                res['align'] = token.lower()
+                continue
+            if not res['caption']:
+                res['caption'] = token
+    return res
+
+
 def _add_table(doc, table_lines: list):
-    """Add a markdown table to the document"""
+    """Add a styled markdown table to the document"""
     if len(table_lines) < 2:
         return
     
@@ -566,52 +617,132 @@ def _add_table(doc, table_lines: list):
     num_cols = len(headers)
     table = doc.add_table(rows=1 + len(rows), cols=num_cols)
     table.style = 'Table Grid'
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
     
     # Header row
+    hdr_row = table.rows[0]
+    hdr_row._tr.get_or_add_trPr().append(
+        hdr_row._tr.makeelement(qn('w:tblHeader'), {})
+    )
     for j, header in enumerate(headers):
         if j < num_cols:
-            cell = table.rows[0].cells[j]
+            cell = hdr_row.cells[j]
             cell.text = header
+            # Add subtle gray shading to header
+            shd = cell._element.get_or_add_tcPr().makeelement(
+                qn('w:shd'), {
+                    qn('w:val'): 'clear',
+                    qn('w:color'): 'auto',
+                    qn('w:fill'): 'F1F5F9'
+                }
+            )
+            cell._element.get_or_add_tcPr().append(shd)
             for p in cell.paragraphs:
+                p.paragraph_format.space_before = Pt(4)
+                p.paragraph_format.space_after = Pt(4)
                 for run in p.runs:
                     run.bold = True
+                    run.font.color.rgb = RGBColor(0x0F, 0x17, 0x2A)
     
     # Data rows
     for i, row in enumerate(rows):
+        data_row = table.rows[i + 1]
+        is_alt = (i % 2 == 1)
         for j, cell_text in enumerate(row):
             if j < num_cols:
-                table.rows[i + 1].cells[j].text = cell_text
+                cell = data_row.cells[j]
+                cell.text = cell_text
+                if is_alt:
+                    shd = cell._element.get_or_add_tcPr().makeelement(
+                        qn('w:shd'), {
+                            qn('w:val'): 'clear',
+                            qn('w:color'): 'auto',
+                            qn('w:fill'): 'F8FAFC'
+                        }
+                    )
+                    cell._element.get_or_add_tcPr().append(shd)
+                for p in cell.paragraphs:
+                    p.paragraph_format.space_before = Pt(3)
+                    p.paragraph_format.space_after = Pt(3)
     
     # Add spacing after table
-    doc.add_paragraph()
+    p_after = doc.add_paragraph()
+    p_after.paragraph_format.space_before = Pt(4)
+    p_after.paragraph_format.space_after = Pt(6)
 
 
 def _add_image(doc, img_path: str, alt_text: str, base_path: Optional[str] = None):
-    """Add an image to the document"""
+    """Add an image to the document with extended parameter support and fallback path resolution"""
+    params = _parse_docx_image_params(alt_text)
+    clean_alt = params['alt']
+    caption = params['caption']
+    width_px = params['width']
+    align = params['align']
+
     # Handle base64 data URIs
     if img_path.startswith('data:'):
-        _add_base64_image(doc, img_path, alt_text)
+        _add_base64_image(doc, img_path, clean_alt)
         return
     
-    # Resolve relative path
-    if base_path and not os.path.isabs(img_path):
-        img_path = os.path.abspath(os.path.join(base_path, img_path))
-    
-    if os.path.exists(img_path):
+    # Fallback search for relative image paths
+    resolved_path = None
+    if os.path.isabs(img_path) and os.path.exists(img_path):
+        resolved_path = img_path
+    elif base_path:
+        cand1 = os.path.normpath(os.path.join(base_path, img_path))
+        if os.path.exists(cand1):
+            resolved_path = cand1
+        else:
+            cand2 = os.path.normpath(os.path.join(base_path, os.path.basename(img_path)))
+            if os.path.exists(cand2):
+                resolved_path = cand2
+            elif os.path.isdir(base_path):
+                fname = os.path.basename(img_path)
+                try:
+                    for entry in os.scandir(base_path):
+                        if entry.is_dir() and (entry.name.endswith('_assets') or entry.name in ('assets', 'images', 'Images', 'media')):
+                            sub_cand = os.path.join(entry.path, fname)
+                            if os.path.exists(sub_cand):
+                                resolved_path = sub_cand
+                                break
+                except Exception:
+                    pass
+
+    if resolved_path and os.path.exists(resolved_path):
         try:
-            # Determine width — fit to page (max ~6 inches)
-            doc.add_picture(img_path, width=Inches(5.5))
-            if alt_text:
-                p = doc.add_paragraph(alt_text)
+            if width_px:
+                target_w = Inches(min(6.2, max(1.0, width_px / 96.0)))
+            else:
+                target_w = Inches(5.2)
+
+            p = doc.add_paragraph()
+            if align == 'left':
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            elif align == 'right':
+                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            else:
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                for run in p.runs:
-                    run.font.italic = True
-                    run.font.size = Pt(9)
-                    run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+
+            p.paragraph_format.space_before = Pt(8)
+            p.paragraph_format.space_after = Pt(2)
+            run = p.add_run()
+            run.add_picture(resolved_path, width=target_w)
+
+            # Display caption
+            display_caption = caption or clean_alt
+            if display_caption:
+                cp = doc.add_paragraph(display_caption)
+                cp.alignment = p.alignment
+                cp.paragraph_format.space_before = Pt(2)
+                cp.paragraph_format.space_after = Pt(10)
+                for crun in cp.runs:
+                    crun.font.italic = True
+                    crun.font.size = Pt(9.5)
+                    crun.font.color.rgb = RGBColor(0x64, 0x74, 0x8B)
         except Exception as e:
-            doc.add_paragraph(f"[Image: {alt_text or img_path}] (Failed to embed: {e})")
+            doc.add_paragraph(f"[Image: {clean_alt or img_path}] (Failed to embed: {e})")
     else:
-        doc.add_paragraph(f"[Image: {alt_text or img_path}] (File not found)")
+        doc.add_paragraph(f"[Image: {clean_alt or img_path}] (File not found)")
 
 
 def _add_base64_image(doc, data_uri: str, alt_text: str):

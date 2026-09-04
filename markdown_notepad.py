@@ -380,10 +380,15 @@ class ImageHandler:
             if file_path.startswith('data:'):
                 continue
             
-            # Parse size from alt text
-            alt_text, width, height = self._parse_alt_size(alt_text)
+            # Parse extended parameters from alt text
+            alt_info = self._parse_extended_alt(alt_text)
+            alt_text = alt_info['alt']
+            width = alt_info['width']
+            height = alt_info['height']
+            align = alt_info['align']
+            caption = alt_info['caption']
             
-            # Also check title for size hints
+            # Also check title for size hints if not already found
             if title and not width:
                 w, h = self._parse_size_string(title)
                 if w:
@@ -397,7 +402,9 @@ class ImageHandler:
                 'type': 'file',
                 'path': file_path,
                 'width': width,
-                'height': height
+                'height': height,
+                'align': align,
+                'caption': caption
             })
         
         # Find HTML img tags
@@ -433,26 +440,83 @@ class ImageHandler:
                 'path': src,
                 'width': width,
                 'height': height,
+                'align': 'center',
+                'caption': None,
                 'is_html': True
             })
         
         return sorted(images, key=lambda x: x['start'])
     
+    def _parse_extended_alt(self, alt_text):
+        """
+        Parse extended image syntax from alt text:
+        Supports:
+        - "description|width=450,align=center,caption='Figure 1'"
+        - "description|400x300|center"
+        - "description|400"
+        - "description"
+        Returns dict with: alt, width, height, align, caption
+        """
+        result = {
+            'alt': alt_text,
+            'width': None,
+            'height': None,
+            'align': 'center',
+            'caption': None
+        }
+        if not alt_text or '|' not in alt_text:
+            return result
+        
+        parts = alt_text.split('|')
+        result['alt'] = parts[0].strip()
+        param_str = '|'.join(parts[1:]).strip()
+
+        # Check for key=value parameters
+        kv_pattern = re.compile(r'(\w+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^,;|]+))')
+        kv_matches = list(kv_pattern.finditer(param_str))
+
+        if kv_matches:
+            for m in kv_matches:
+                k = m.group(1).lower()
+                v = (m.group(2) or m.group(3) or m.group(4) or '').strip()
+                if k == 'width':
+                    dim = re.match(r'(\d+)', v)
+                    if dim:
+                        result['width'] = int(dim.group(1))
+                elif k == 'height':
+                    dim = re.match(r'(\d+)', v)
+                    if dim:
+                        result['height'] = int(dim.group(1))
+                elif k == 'align':
+                    if v.lower() in ('left', 'right', 'center'):
+                        result['align'] = v.lower()
+                elif k == 'caption':
+                    result['caption'] = v
+        else:
+            # Check for positional shorthand (e.g. "400x300", "center", "400")
+            tokens = [t.strip() for t in re.split(r'[,|]', param_str) if t.strip()]
+            for token in tokens:
+                m_dim = re.match(r'^(\d+)\s*[xX×]\s*(\d+)$', token)
+                if m_dim:
+                    result['width'] = int(m_dim.group(1))
+                    result['height'] = int(m_dim.group(2))
+                    continue
+                m_w = re.match(r'^(\d+)(?:px)?$', token)
+                if m_w:
+                    result['width'] = int(m_w.group(1))
+                    continue
+                if token.lower() in ('left', 'right', 'center'):
+                    result['align'] = token.lower()
+                    continue
+                if not result['caption']:
+                    result['caption'] = token
+
+        return result
+
     def _parse_alt_size(self, alt_text):
-        """
-        Parse size hints from alt text.
-        Supports formats:
-        - "description|200x100" -> (description, 200, 100)
-        - "description|200" -> (description, 200, None)
-        - "description" -> (description, None, None)
-        """
-        if '|' in alt_text:
-            parts = alt_text.rsplit('|', 1)
-            alt = parts[0].strip()
-            size_str = parts[1].strip()
-            width, height = self._parse_size_string(size_str)
-            return alt, width, height
-        return alt_text, None, None
+        """Backward compatibility helper returning (alt, width, height)"""
+        info = self._parse_extended_alt(alt_text)
+        return info['alt'], info['width'], info['height']
     
     def _parse_size_string(self, size_str):
         """Parse a size string like '200x100' or '200'"""
@@ -742,13 +806,12 @@ class MarkdownVisualWidget(tk.Frame):
         self.embedded_images = {}  # Track embedded images by text index
         self._render_job = None  # For cancelling pending renders
         self.on_content_change = on_content_change  # Callback for content changes
-        self.live_render_enabled = True
-        self._live_render_job    = None
         self._last_rendered_hash = ''
+        self.current_theme = None
         self._setup_widget()
     
     def _setup_widget(self):
-        """Setup the visual rendering widget - single Text widget for performance"""
+        """Setup the visual rendering widget - read-only presentation canvas"""
         # Main text widget with scrollbar
         self.text_frame = ttk.Frame(self)
         self.text_frame.pack(fill=tk.BOTH, expand=True)
@@ -760,20 +823,20 @@ class MarkdownVisualWidget(tk.Frame):
             self.text_frame,
             wrap=tk.WORD,
             font=("Segoe UI", 11),
-            padx=30,
-            pady=20,
+            padx=40,
+            pady=24,
             bg="#ffffff",
             fg="#1a1a1a",
             relief=tk.FLAT,
             borderwidth=0,
             yscrollcommand=self.scrollbar.set,
             cursor="xterm",
-            insertbackground="#333333",
             selectbackground="#b3d9ff",
             selectforeground="#000000",
             spacing1=2,  # Space above lines
-            spacing2=1,  # Space between wrapped lines  
-            spacing3=4,  # Space below lines (paragraph spacing)
+            spacing2=3,  # Proportional space between wrapped lines  
+            spacing3=6,  # Space below lines
+            state=tk.DISABLED  # Strictly read-only presentation
         )
         self.text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.scrollbar.config(command=self.text_widget.yview)
@@ -781,13 +844,59 @@ class MarkdownVisualWidget(tk.Frame):
         # Setup text tags for styling
         self._setup_text_tags()
         
-        # Bind mousewheel and editing events
+        # Bind mousewheel and zoom
         self.text_widget.bind("<MouseWheel>", self._on_mousewheel)
-        self.text_widget.bind("<KeyRelease>", self._on_edit)
         self.text_widget.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
+        
+        # Bind resize configuration for responsive centered reading column
+        self.text_widget.bind("<Configure>", self._on_configure)
+
+        # Right-click context menu for selection and copying
+        self._setup_context_menu()
         
         self.render_mode = "text"
     
+    def _setup_context_menu(self):
+        """Create right-click context menu for copying selected text"""
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="Copy", command=self._copy_selection, accelerator="Ctrl+C")
+        self.context_menu.add_command(label="Select All", command=self._select_all, accelerator="Ctrl+A")
+        self.text_widget.bind("<Button-3>", self._show_context_menu)
+
+    def _show_context_menu(self, event):
+        try:
+            has_sel = bool(self.text_widget.tag_ranges(tk.SEL))
+        except Exception:
+            has_sel = False
+        self.context_menu.entryconfigure("Copy", state=tk.NORMAL if has_sel else tk.DISABLED)
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+
+    def _copy_selection(self):
+        try:
+            sel_text = self.text_widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+            self.clipboard_clear()
+            self.clipboard_append(sel_text)
+        except tk.TclError:
+            pass
+
+    def _select_all(self):
+        self.text_widget.tag_add(tk.SEL, "1.0", tk.END)
+        return "break"
+
+    def _on_configure(self, event=None):
+        """Dynamically center reading sheet layout on wide screens"""
+        width = event.width if event else self.winfo_width()
+        if width > 120:
+            max_reading_width = 820
+            if width > max_reading_width + 50:
+                pad = (width - max_reading_width) // 2
+            else:
+                pad = max(24, int(width * 0.04))
+            try:
+                self.text_widget.config(padx=pad)
+            except Exception:
+                pass
+
     def _on_mousewheel(self, event):
         """Handle mousewheel scrolling"""
         self.text_widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -795,52 +904,7 @@ class MarkdownVisualWidget(tk.Frame):
     
     def _on_ctrl_mousewheel(self, event):
         """Handle Ctrl+MouseWheel for zoom (propagate to parent)"""
-        # Let the main app handle zoom
         return
-    
-    def _on_edit(self, event=None):
-        """Handle text edits - notify parent of changes"""
-        content = self.text_widget.get('1.0', tk.END).rstrip('\n')
-        self.content = content
-        if self.on_content_change:
-            self.on_content_change(content)
-
-        if self.live_render_enabled:
-            if self._live_render_job:
-                self.after_cancel(self._live_render_job)
-            import hashlib as _hl
-            h = _hl.md5(content.encode()).hexdigest()
-            if h != self._last_rendered_hash:
-                self._live_render_job = self.after(450, lambda: self._do_live_render(content, h))
-
-    def _do_live_render(self, content: str, expected_hash: str):
-        self._live_render_job = None
-        current = self.text_widget.get('1.0', tk.END).rstrip('\n')
-        import hashlib as _hl
-        if _hl.md5(current.encode()).hexdigest() != expected_hash:
-            return
-
-        char_offset = None
-        try:
-            cursor_idx  = self.text_widget.index(tk.INSERT)
-            pre_text    = self.text_widget.get('1.0', cursor_idx)
-            char_offset = len(pre_text)
-        except Exception:
-            pass
-
-        self._last_rendered_hash = expected_hash
-        self.set_content(content)
-
-        if char_offset is not None:
-            try:
-                full  = self.text_widget.get('1.0', tk.END)
-                pre   = full[:char_offset]
-                row   = pre.count('\n') + 1
-                col   = len(pre) - (pre.rfind('\n') + 1)
-                self.text_widget.mark_set(tk.INSERT, f'{row}.{col}')
-                self.text_widget.see(tk.INSERT)
-            except Exception:
-                pass
     
     def set_base_path(self, path):
         """Set the base path for resolving relative image paths"""
@@ -848,7 +912,7 @@ class MarkdownVisualWidget(tk.Frame):
         self.image_handler.base_path = path
     
     def set_content(self, markdown_text):
-        """Set and render markdown content with images - optimized for large files"""
+        """Set and render markdown content with images in read-only presentation mode"""
         import hashlib as _hl
         content_hash = _hl.md5(markdown_text.encode()).hexdigest()
         if content_hash == self._last_rendered_hash and self.text_widget.get('1.0', tk.END).strip():
@@ -862,7 +926,8 @@ class MarkdownVisualWidget(tk.Frame):
         
         self.content = markdown_text
         
-        # Clear previous content
+        # Enable text widget temporarily to replace content
+        self.text_widget.config(state=tk.NORMAL)
         self.text_widget.delete(1.0, tk.END)
         self.embedded_images.clear()
         self.image_handler.clear_caches()
@@ -870,18 +935,17 @@ class MarkdownVisualWidget(tk.Frame):
         # Find all images in the text
         images = self.image_handler.find_images(markdown_text)
         
-        # For small documents, render immediately
-        # For large documents, render progressively
         line_count = markdown_text.count('\n')
-        
         if line_count < 500:
             self._render_content(markdown_text, images)
+            self.text_widget.config(state=tk.DISABLED)
         else:
             # Progressive rendering for large documents
             self._render_progressive(markdown_text, images, 0)
     
     def _render_progressive(self, full_text, images, start_line):
         """Render content progressively to avoid UI freeze"""
+        self.text_widget.config(state=tk.NORMAL)
         lines = full_text.split('\n')
         end_line = min(start_line + self.RENDER_CHUNK_SIZE, len(lines))
         
@@ -893,12 +957,12 @@ class MarkdownVisualWidget(tk.Frame):
         
         self._render_content(chunk, chunk_images, is_chunk=True)
         
-        # Schedule next chunk or finalize
         if end_line < len(lines):
             self._render_job = self.after(10, 
                 lambda: self._render_progressive(full_text, images, end_line))
         else:
             self._render_job = None
+            self.text_widget.config(state=tk.DISABLED)
     
     # Inline markdown pattern: captures bold, italic, code, links in order
     _INLINE_RE = re.compile(
@@ -1060,8 +1124,22 @@ class MarkdownVisualWidget(tk.Frame):
         if in_table and table_rows:
             self._render_table(table_rows)
     
+    def _is_dark(self, hex_color):
+        """Helper to determine if a background color is dark"""
+        if not hex_color or not isinstance(hex_color, str):
+            return False
+        c = hex_color.lstrip('#')
+        if len(c) == 6:
+            try:
+                r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+                lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+                return lum < 0.5
+            except ValueError:
+                pass
+        return False
+
     def _render_table(self, table_rows):
-        """Render a markdown table with proper formatting"""
+        """Render a markdown table as a styled native grid frame inside the text widget"""
         if not table_rows:
             return
         
@@ -1070,15 +1148,12 @@ class MarkdownVisualWidget(tk.Frame):
         separator_idx = -1
         
         for i, row in enumerate(table_rows):
-            # Split by | and strip whitespace
             cells = [c.strip() for c in row.split('|')]
-            # Remove empty first/last cells from leading/trailing |
             if cells and cells[0] == '':
                 cells = cells[1:]
             if cells and cells[-1] == '':
                 cells = cells[:-1]
             
-            # Check if this is the separator row (contains only -, :, and spaces)
             if all(re.match(r'^[-:]+$', c) for c in cells if c):
                 separator_idx = i
             else:
@@ -1087,120 +1162,115 @@ class MarkdownVisualWidget(tk.Frame):
         if not parsed_rows:
             return
         
-        # Calculate column widths
+        headers = parsed_rows[0]
+        data_rows = parsed_rows[1:]
         num_cols = max(len(row) for row in parsed_rows)
-        col_widths = [0] * num_cols
+        while len(headers) < num_cols:
+            headers.append('')
+
+        # Theme-derived table colors
+        bg_col = self.text_widget.cget('bg')
+        is_dark = self._is_dark(bg_col)
         
-        for row in parsed_rows:
-            for j, cell in enumerate(row):
-                if j < num_cols:
-                    col_widths[j] = max(col_widths[j], len(cell))
-        
-        # Ensure minimum width
-        col_widths = [max(w, 3) for w in col_widths]
-        
-        # Build the formatted table
-        self.text_widget.insert(tk.END, '\n')
-        
-        # Top border
-        border = '┌' + '┬'.join('─' * (w + 2) for w in col_widths) + '┐\n'
-        self.text_widget.insert(tk.END, border, "table_border")
-        
-        for row_idx, row in enumerate(parsed_rows):
-            # Pad row to have correct number of columns
+        tbl_border = "#475569" if is_dark else "#cbd5e1"
+        header_bg = "#334155" if is_dark else "#f1f5f9"
+        header_fg = "#f8fafc" if is_dark else "#0f172a"
+        row_bg = "#1e293b" if is_dark else "#ffffff"
+        row_alt_bg = "#0f172a" if is_dark else "#f8fafc"
+        cell_fg = "#e2e8f0" if is_dark else "#1e293b"
+
+        font_family = self.current_theme.get('visual_font', SANS_FONT) if self.current_theme else SANS_FONT
+        font_size = self.current_theme.get('visual_font_size', 11) if self.current_theme else 11
+
+        table_frame = tk.Frame(self.text_widget, bg=tbl_border, bd=1, relief=tk.SOLID)
+
+        # Header row
+        for col_idx, h in enumerate(headers):
+            lbl = tk.Label(table_frame, text=h, font=(font_family, font_size, "bold"),
+                           bg=header_bg, fg=header_fg, padx=14, pady=7, anchor="w", justify=tk.LEFT)
+            lbl.grid(row=0, column=col_idx, sticky="nsew", padx=1, pady=1)
+
+        # Data rows
+        for row_idx, row in enumerate(data_rows):
             while len(row) < num_cols:
                 row.append('')
-            
-            # Data row
-            row_text = '│'
-            for j, cell in enumerate(row):
-                row_text += ' ' + cell.ljust(col_widths[j]) + ' │'
-            row_text += '\n'
-            
-            # Use different tag for header row
-            if row_idx == 0 and separator_idx == 1:
-                self.text_widget.insert(tk.END, row_text, "table_header")
-            else:
-                self.text_widget.insert(tk.END, row_text, "table_cell")
-            
-            # Add separator after header or between rows
-            if row_idx == 0 and separator_idx == 1:
-                sep = '├' + '┼'.join('─' * (w + 2) for w in col_widths) + '┤\n'
-                self.text_widget.insert(tk.END, sep, "table_border")
-        
-        # Bottom border
-        border = '└' + '┴'.join('─' * (w + 2) for w in col_widths) + '┘\n'
-        self.text_widget.insert(tk.END, border, "table_border")
+            c_bg = row_alt_bg if (row_idx % 2 == 1) else row_bg
+            for col_idx, cell in enumerate(row):
+                lbl = tk.Label(table_frame, text=cell, font=(font_family, font_size),
+                               bg=c_bg, fg=cell_fg, padx=14, pady=6, anchor="w", justify=tk.LEFT)
+                lbl.grid(row=row_idx + 1, column=col_idx, sticky="nsew", padx=1, pady=1)
+
+        for col_idx in range(num_cols):
+            table_frame.grid_columnconfigure(col_idx, weight=1)
+
         self.text_widget.insert(tk.END, '\n')
+        self.text_widget.window_create(tk.END, window=table_frame, padx=10, pady=8)
+        self.text_widget.insert(tk.END, '\n\n')
     
     def _insert_image_inline(self, img_info):
-        """Insert an image inline in the text widget with optional sizing"""
-        # Try to load the image
+        """Insert an image inline in the text widget with extended sizing, alignment, and captions"""
         image = self.image_handler.load_image(img_info)
         
         if image:
-            # Determine display size
-            # Priority: explicit size > default thumbnail
             display_width = img_info.get('width')
             display_height = img_info.get('height')
+            align = img_info.get('align', 'center')
+            caption_text = img_info.get('caption')
+            alt_text = img_info.get('alt', '')
+
+            orig_w, orig_h = image.size
             
             if display_width or display_height:
-                # Calculate size maintaining aspect ratio
-                orig_w, orig_h = image.size
-                
                 if display_width and display_height:
                     max_size = (display_width, display_height)
                 elif display_width:
-                    # Calculate height to maintain aspect ratio
                     ratio = display_width / orig_w
-                    max_size = (display_width, int(orig_h * ratio))
+                    max_size = (display_width, max(1, int(orig_h * ratio)))
                 else:
-                    # Calculate width to maintain aspect ratio
                     ratio = display_height / orig_h
-                    max_size = (int(orig_w * ratio), display_height)
-                
-                # Cap at reasonable maximum
-                max_size = (min(max_size[0], 800), min(max_size[1], 600))
+                    max_size = (max(1, int(orig_w * ratio)), display_height)
+                max_size = (min(max_size[0], 1000), min(max_size[1], 800))
             else:
-                # Default thumbnail size
-                max_size = (200, 200)
+                # Modern default width (sharp, readable figures up to 550px)
+                target_w = min(orig_w, 550)
+                ratio = target_w / orig_w
+                max_size = (target_w, max(1, int(orig_h * ratio)))
             
             photo = self.image_handler.get_photo_image(image, thumbnail=True, max_size=max_size)
             
             if photo:
-                # Insert image into text widget
-                self.text_widget.image_create(tk.END, image=photo, padx=10, pady=5)
+                align_tag = f"image_{align}" if f"image_{align}" in ('image_left', 'image_right', 'image_center') else "image_center"
                 
-                # Store reference and image for click handling
+                # Center/Align image using line tag
+                self.text_widget.insert(tk.END, '\n')
+                self.text_widget.image_create(tk.END, image=photo, padx=15, pady=8)
+                self.text_widget.insert(tk.END, '\n', align_tag)
+                
                 index = self.text_widget.index(tk.END + "-2c")
-                self.embedded_images[index] = (photo, image, img_info.get('alt', ''))
+                self.embedded_images[index] = (photo, image, alt_text or caption_text or '')
                 
-                # Add caption with size info
-                alt_text = img_info.get('alt', '')
-                orig_size = f"{image.size[0]}×{image.size[1]}"
                 display_size = f"{photo.width()}×{photo.height()}"
                 
-                if display_width or display_height:
-                    caption = f"  {alt_text} ({display_size}, original: {orig_size})" if alt_text else f"  ({display_size})"
+                # Format caption
+                if caption_text:
+                    full_caption = f"{caption_text} ({display_size})"
+                elif alt_text:
+                    full_caption = f"{alt_text} ({display_size})"
                 else:
-                    caption = f"  {alt_text} ({orig_size})" if alt_text else f"  ({orig_size})"
+                    full_caption = f"({display_size})"
                 
-                self.text_widget.insert(tk.END, caption + '\n', "image_caption")
-                
-                # Bind click on images
+                self.text_widget.insert(tk.END, full_caption + '\n\n', "image_caption")
                 self.text_widget.tag_bind("image", "<Button-1>", self._on_image_click)
                 return
         
-        # Fallback: show placeholder text
+        # Fallback placeholder
         alt = img_info.get('alt', 'image')
-        self.text_widget.insert(tk.END, f"\n  [🖼️ {alt}]\n", "image_placeholder")
+        self.text_widget.insert(tk.END, f"\n[🖼️ {alt}]\n\n", "image_placeholder")
     
     def _on_image_click(self, event):
         """Handle click on embedded image"""
-        # Find which image was clicked
         index = self.text_widget.index(f"@{event.x},{event.y}")
         for img_index, (photo, full_image, alt) in self.embedded_images.items():
-            # Check if click is near this image
             if self.text_widget.compare(index, ">=", img_index + "-1c") and \
                self.text_widget.compare(index, "<=", img_index + "+1c"):
                 self._show_full_image(full_image, alt)
@@ -1213,62 +1283,103 @@ class MarkdownVisualWidget(tk.Frame):
     
     def _setup_text_tags(self):
         """Setup text tags for markdown styling on the main text widget"""
+        self._update_tags_for_theme(self.current_theme or {})
+
+    def _update_tags_for_theme(self, theme):
+        """Update tag colors and fonts dynamically according to active theme"""
         tw = self.text_widget
-        
-        # Heading styles - improved spacing for document flow
-        tw.tag_configure("h1", font=(SANS_FONT, 26, "bold"), spacing1=20, spacing3=12, foreground="#1a1a2e")
-        tw.tag_configure("h2", font=(SANS_FONT, 22, "bold"), spacing1=18, spacing3=10, foreground="#16213e")
-        tw.tag_configure("h3", font=(SANS_FONT, 18, "bold"), spacing1=14, spacing3=8, foreground="#1f4068")
-        tw.tag_configure("h4", font=(SANS_FONT, 15, "bold"), spacing1=10, spacing3=6, foreground="#1b1b2f")
-        tw.tag_configure("h5", font=(SANS_FONT, 13, "bold"), spacing1=8, spacing3=4, foreground="#1b1b2f")
-        tw.tag_configure("h6", font=(SANS_FONT, 12, "bold"), spacing1=6, spacing3=3, foreground="#1b1b2f")
-        
+        bg_col = theme.get('visual_bg', '#ffffff')
+        fg_col = theme.get('visual_fg', '#1a1a1a')
+        font_family = theme.get('visual_font', SANS_FONT)
+        font_size = theme.get('visual_font_size', 11)
+
+        is_dark = self._is_dark(bg_col)
+
+        if is_dark:
+            h1_fg = "#f8fafc"
+            h2_fg = "#f1f5f9"
+            h3_fg = "#e2e8f0"
+            h4_fg = "#cbd5e1"
+            h5_fg = "#94a3b8"
+            h6_fg = "#94a3b8"
+            code_bg = "#1e1e2e"
+            code_fg = "#cdd6f4"
+            inline_code_bg = "#282a36"
+            inline_code_fg = "#f38ba8"
+            quote_bg = "#181825"
+            quote_fg = "#a6adc8"
+            link_fg = "#89b4fa"
+            hr_fg = "#45475a"
+            cap_fg = "#94a3b8"
+        else:
+            h1_fg = "#0f172a"
+            h2_fg = "#1e293b"
+            h3_fg = "#334155"
+            h4_fg = "#475569"
+            h5_fg = "#64748b"
+            h6_fg = "#64748b"
+            code_bg = "#282c34"
+            code_fg = "#abb2bf"
+            inline_code_bg = "#f1f5f9"
+            inline_code_fg = "#be185d"
+            quote_bg = "#f8fafc"
+            quote_fg = "#475569"
+            link_fg = "#2563eb"
+            hr_fg = "#e2e8f0"
+            cap_fg = "#64748b"
+
+        # Heading styles
+        tw.tag_configure("h1", font=(font_family, font_size + 14, "bold"), spacing1=24, spacing3=12, foreground=h1_fg)
+        tw.tag_configure("h2", font=(font_family, font_size + 10, "bold"), spacing1=18, spacing3=10, foreground=h2_fg)
+        tw.tag_configure("h3", font=(font_family, font_size + 6, "bold"), spacing1=14, spacing3=8, foreground=h3_fg)
+        tw.tag_configure("h4", font=(font_family, font_size + 3, "bold"), spacing1=10, spacing3=6, foreground=h4_fg)
+        tw.tag_configure("h5", font=(font_family, font_size + 1, "bold"), spacing1=8, spacing3=4, foreground=h5_fg)
+        tw.tag_configure("h6", font=(font_family, font_size, "bold"), spacing1=6, spacing3=3, foreground=h6_fg)
+
         # Inline styles
-        tw.tag_configure("bold", font=(SANS_FONT, 11, "bold"))
-        tw.tag_configure("italic", font=(SANS_FONT, 11, "italic"))
-        tw.tag_configure("code", font=(MONO_FONT, 10), background="#f5f2f0", foreground="#c7254e",
-                        relief=tk.FLAT)
-        tw.tag_configure("code_block", font=(MONO_FONT, 10), background="#282c34", foreground="#abb2bf", 
-                        spacing1=10, spacing3=10, lmargin1=25, lmargin2=25, rmargin=25)
+        tw.tag_configure("bold", font=(font_family, font_size, "bold"))
+        tw.tag_configure("italic", font=(font_family, font_size, "italic"))
+        tw.tag_configure("code", font=(MONO_FONT, max(9, font_size - 1)), background=inline_code_bg, foreground=inline_code_fg, relief=tk.FLAT)
+        tw.tag_configure("code_block", font=(MONO_FONT, max(9, font_size - 1)), background=code_bg, foreground=code_fg, 
+                        spacing1=10, spacing3=10, lmargin1=24, lmargin2=24, rmargin=24)
         
         # Block styles
-        tw.tag_configure("blockquote", font=(SANS_FONT, 11, "italic"), foreground="#6c757d", 
-                        lmargin1=40, lmargin2=40, spacing1=5, spacing3=5,
-                        background="#f8f9fa")
-        tw.tag_configure("list_item", lmargin1=25, lmargin2=45, spacing1=2, spacing3=2)
-        tw.tag_configure("link", foreground="#0066cc", underline=True)
-        tw.tag_configure("hr", font=(SANS_FONT, 2), foreground="#dee2e6", spacing1=15, spacing3=15)
-        
-        # Table styles
-        tw.tag_configure("table", font=(MONO_FONT, 10), background="#f8f9fa", lmargin1=15, 
-                        spacing1=5, spacing3=5)
-        tw.tag_configure("table_border", font=(MONO_FONT, 10), foreground="#6c757d", 
-                        lmargin1=20, lmargin2=20)
-        tw.tag_configure("table_header", font=(MONO_FONT, 10, "bold"), background="#e9ecef",
-                        lmargin1=20, lmargin2=20)
-        tw.tag_configure("table_cell", font=(MONO_FONT, 10), background="#f8f9fa",
-                        lmargin1=20, lmargin2=20)
-        
-        # Image styles
-        tw.tag_configure("image_caption", font=(SANS_FONT, 9, "italic"), foreground="#6c757d",
-                        spacing1=3, spacing3=8, justify="center")
-        tw.tag_configure("image_placeholder", font=(SANS_FONT, 10), foreground="#868e96", 
-                        background="#f1f3f5", lmargin1=25, spacing1=5, spacing3=5)
-        
-        # Paragraph spacing (normal text)
-        tw.tag_configure("paragraph", spacing1=3, spacing3=6)
-    
+        tw.tag_configure("blockquote", font=(font_family, font_size, "italic"), foreground=quote_fg, 
+                        lmargin1=32, lmargin2=32, spacing1=6, spacing3=6, background=quote_bg)
+        tw.tag_configure("list_item", lmargin1=24, lmargin2=44, spacing1=2, spacing3=3)
+        tw.tag_configure("link", foreground=link_fg, underline=True)
+        tw.tag_configure("hr", font=(font_family, 2), foreground=hr_fg, spacing1=16, spacing3=16)
+
+        # Image alignment and caption styles
+        tw.tag_configure("image_caption", font=(font_family, max(9, font_size - 2), "italic"), foreground=cap_fg,
+                        spacing1=4, spacing3=10, justify="center")
+        tw.tag_configure("image_center", justify="center")
+        tw.tag_configure("image_left", justify="left")
+        tw.tag_configure("image_right", justify="right")
+        tw.tag_configure("image_placeholder", font=(font_family, font_size), foreground=cap_fg, 
+                        background=quote_bg, lmargin1=24, spacing1=6, spacing3=6)
+
+        # Paragraph spacing (proportional reading rhythm)
+        tw.tag_configure("paragraph", spacing1=2, spacing2=3, spacing3=8)
+
     def get_content(self):
         """Get the current content"""
         return self.content
     
     def apply_theme(self, theme):
-        """Apply theme settings to the visual widget"""
+        """Apply theme settings to the visual widget while preserving customization"""
+        self.current_theme = theme
+        bg = theme.get('visual_bg', '#ffffff')
+        fg = theme.get('visual_fg', '#1a1a1a')
+        font_family = theme.get('visual_font', 'Segoe UI')
+        font_size = theme.get('visual_font_size', 11)
+
         self.text_widget.config(
-            bg=theme.get('visual_bg', '#ffffff'),
-            fg=theme.get('visual_fg', '#1a1a1a'),
-            font=(theme.get('visual_font', 'Segoe UI'), theme.get('visual_font_size', 11))
+            bg=bg,
+            fg=fg,
+            font=(font_family, font_size)
         )
+        self._update_tags_for_theme(theme)
 
 
 class DocumentTab(ttk.Frame):
@@ -1349,17 +1460,17 @@ class DocumentTab(ttk.Frame):
         return "Untitled"
     
     def get_content(self):
-        """Get current document content"""
-        if self.current_mode == "visual":
-            return self.visual_viewer.get_content()
+        """Get canonical document content from source editor"""
         return self.source_editor.get(1.0, tk.END).rstrip()
     
     def set_content(self, content):
-        """Set document content"""
+        """Set document content and refresh visual viewer if active"""
         self.source_editor.delete(1.0, tk.END)
         self.source_editor.insert(1.0, content)
         self.source_editor.edit_modified(False)
         self.is_modified = False
+        if self.current_mode == "visual":
+            self.visual_viewer.set_content(content)
     
     def apply_theme(self, theme):
         """Apply theme to this tab"""
@@ -3008,15 +3119,7 @@ class MarkdownNotepad(tk.Tk):
         """Switch current tab to source editing mode"""
         if not self.current_tab:
             return
-            
-        # Sync any changes from visual mode first
-        if self.current_tab.current_mode == "visual":
-            visual_content = self.current_tab.visual_viewer.get_content()
-            source_content = self.current_tab.source_editor.get(1.0, tk.END).rstrip()
-            if visual_content != source_content:
-                self.current_tab.source_editor.delete(1.0, tk.END)
-                self.current_tab.source_editor.insert(1.0, visual_content)
-        
+
         self.current_tab.visual_frame.pack_forget()
         self.current_tab.source_frame.pack(fill=tk.BOTH, expand=True)
         self.current_tab.current_mode = "source"
@@ -3025,11 +3128,11 @@ class MarkdownNotepad(tk.Tk):
         self._set_status("Source mode - edit raw markdown")
     
     def _show_visual_mode(self):
-        """Switch current tab to visual rendering mode"""
+        """Switch current tab to visual reading presentation mode"""
         if not self.current_tab:
             return
             
-        # Update visual view with current content
+        # Update visual view with pristine canonical content from source
         content = self.current_tab.source_editor.get(1.0, tk.END).rstrip()
         self.current_tab.visual_viewer.set_content(content)
         
@@ -3038,14 +3141,11 @@ class MarkdownNotepad(tk.Tk):
         self.current_tab.current_mode = "visual"
         self.mode_var.set("visual")
         self.mode_label.config(text="Visual Mode")
-        self._set_status("Visual mode - editable rendered preview")
+        self._set_status("Visual mode - reading presentation view")
     
     def _on_visual_edit(self, content):
-        """Called when visual editor content changes"""
-        if self.current_tab:
-            self.current_tab.is_modified = True
-            self._update_tab_title(self.current_tab)
-            self._update_title()
+        """Called when visual editor content changes (read-only presentation view)"""
+        pass
     
     def _toggle_mode(self):
         """Toggle between source and visual mode"""
