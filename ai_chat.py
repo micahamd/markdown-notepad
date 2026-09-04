@@ -3794,94 +3794,106 @@ class ChatSidebar(tk.Frame):
             if not self.settings.cli_command:
                 self._add_chat_message("system", "CLI command not configured. Please add a CLI command in Settings.")
                 return
+        elif self.settings.provider in ('agy', 'antigravity'):
+            pass
+        elif self.settings.provider == 'deepseek':
+            if not self.settings.deepseek_api_key:
+                self._add_chat_message("system", "DeepSeek API key not configured. Please add in Settings.")
+                return
         else:
             if not self.settings.api_key:
                 self._add_chat_message("system", "API key not configured. Please add your API key in Settings.")
                 return
         
-        # Clear input
-        self.input_text.delete(1.0, tk.END)
-        
-        # Build display message (include attachment info)
-        display_msg = message
-        if self.attached_files:
-            attachment_names = [f['name'] for f in self.attached_files]
-            display_msg = f"{message}\n📎 Attached: {', '.join(attachment_names)}" if message else f"📎 Attached: {', '.join(attachment_names)}"
-        
-        # Add user message to display
-        self._add_chat_message("user", display_msg)
-        
-        # Prepare messages for API
-        messages = []
-        
-        # Include chat history if enabled
-        if self.include_history_var.get() and self.current_document_id:
-            history = self.history_manager.get_history(self.current_document_id)
-            for msg in history[-10:]:  # Last 10 messages
-                messages.append({"role": msg.role, "content": msg.content})
-        
-        # Build current message content
-        content_parts = []
-        images = []
-        
-        # Include document content if enabled
-        if self.include_doc_var.get() and self.get_document_content:
-            doc_content = self.get_document_content()
-            if doc_content:
-                content_parts.append(f"[Current Document]\n{doc_content}\n[End Document]\n\n")
-        
-        # Get images from document if available
-        if self.get_document_images and self.include_doc_var.get():
-            doc_images = self.get_document_images()
-            for img_data in doc_images[:3]:  # Limit to 3 images
-                try:
-                    img = img_data.get('image')
-                    if img and PIL_AVAILABLE:
-                        encoded = self.llm_client.encode_image_for_api(
-                            img, 
-                            self.settings.image_max_size[0]
-                        )
-                        if encoded:
-                            images.append(encoded)
-                except:
-                    pass
-        
-        # Process attached files
-        for attachment in self.attached_files:
-            if attachment['type'] == 'image':
-                images.append(attachment['content'])
-            elif attachment['type'] == 'text':
-                content_parts.append(f"\n[Attached File: {attachment['name']}]\n{attachment['content']}\n[End File]\n")
-        
-        # Clear attachments after sending
-        self.attached_files.clear()
-        self._update_attachments_display()
-        
-        content_parts.append(message)
-        full_content = "".join(content_parts)
-        
-        messages.append({"role": "user", "content": full_content})
-        
-        # Save user message to history
-        user_msg = ChatMessage(role="user", content=message)
-        if self.current_document_id:
-            self.history_manager.add_message(user_msg, self.current_document_id)
-        
-        # Start async generation
+        # Immediate debounce and state lock
         self.is_generating = True
         self.send_btn.config(state=tk.DISABLED)
         self.status_label.config(text="Generating...")
         
-        # Add placeholder for assistant response
-        self._add_chat_message("assistant", "", streaming=True)
+        # Clear input
+        self.input_text.delete(1.0, tk.END)
         
-        # Start generation thread
-        thread = threading.Thread(
-            target=self._generate_response,
-            args=(messages, images),
-            daemon=True
-        )
-        thread.start()
+        try:
+            # Build display message (include attachment info)
+            display_msg = message
+            if self.attached_files:
+                attachment_names = [f['name'] for f in self.attached_files]
+                display_msg = f"{message}\n📎 Attached: {', '.join(attachment_names)}" if message else f"📎 Attached: {', '.join(attachment_names)}"
+            
+            # Add user message to display
+            self._add_chat_message("user", display_msg)
+            
+            # Prepare messages for API
+            messages = []
+            
+            # Include chat history if enabled
+            if self.include_history_var.get() and self.current_document_id:
+                history = self.history_manager.get_history(self.current_document_id)
+                for msg in history[-10:]:  # Last 10 messages
+                    messages.append({"role": msg.role, "content": msg.content})
+            
+            # Build current message content
+            content_parts = []
+            images = []
+            
+            # Include document content if enabled
+            if self.include_doc_var.get() and self.get_document_content:
+                doc_content = self.get_document_content()
+                if doc_content:
+                    content_parts.append(f"[Current Document]\n{doc_content}\n[End Document]\n\n")
+            
+            # Get images from document if available
+            if self.get_document_images and self.include_doc_var.get():
+                doc_images = self.get_document_images()
+                for img_data in doc_images[:3]:  # Limit to 3 images
+                    try:
+                        img = img_data.get('image')
+                        if img and PIL_AVAILABLE:
+                            encoded = self.llm_client.encode_image_for_api(
+                                img, 
+                                self.settings.image_max_size[0]
+                            )
+                            if encoded:
+                                images.append(encoded)
+                    except:
+                        pass
+            
+            # Process attached files
+            for attachment in self.attached_files:
+                if attachment['type'] == 'image':
+                    images.append(attachment['content'])
+                elif attachment['type'] == 'text':
+                    content_parts.append(f"\n[Attached File: {attachment['name']}]\n{attachment['content']}\n[End File]\n")
+            
+            # Clear attachments after sending
+            self.attached_files.clear()
+            self._update_attachments_display()
+            
+            content_parts.append(message)
+            full_content = "".join(content_parts)
+            
+            messages.append({"role": "user", "content": full_content})
+            
+            # Save user message to history
+            user_msg = ChatMessage(role="user", content=message)
+            if self.current_document_id:
+                self.history_manager.add_message(user_msg, self.current_document_id)
+            
+            # Add placeholder for assistant response
+            self._add_chat_message("assistant", "", streaming=True)
+            
+            # Start generation thread
+            thread = threading.Thread(
+                target=self._generate_response,
+                args=(messages, images),
+                daemon=True
+            )
+            thread.start()
+        except Exception as e:
+            self.is_generating = False
+            self.send_btn.config(state=tk.NORMAL)
+            self.status_label.config(text="Error")
+            self._add_chat_message("system", f"Failed to dispatch message: {str(e)}")
     
     def _generate_response(self, messages: List[Dict], images: List[str]):
         """Generate response in background thread"""
@@ -3891,6 +3903,8 @@ class ChatSidebar(tk.Frame):
                 self.llm_client.api_key = self.settings.gemini_api_key
             elif self.settings.provider == 'anthropic':
                 self.llm_client.api_key = self.settings.api_key
+            elif self.settings.provider == 'deepseek':
+                self.llm_client.api_key = self.settings.deepseek_api_key
             # Ollama and CLI don't need API key updates
 
             # Stream response with all parameters
@@ -3908,7 +3922,6 @@ class ChatSidebar(tk.Frame):
             ):
                 chunk_count += 1
                 response_text += chunk
-                self._streaming_buffer += chunk
                 self.response_queue.put(('chunk', chunk))
 
             # Debug: log if no chunks were received
@@ -3922,7 +3935,7 @@ class ChatSidebar(tk.Frame):
             if self.current_document_id:
                 self.history_manager.add_message(assistant_msg, self.current_document_id)
 
-            self.response_queue.put(('done', None))
+            self.response_queue.put(('done', response_text))
 
         except Exception as e:
             import traceback
@@ -3942,17 +3955,17 @@ class ChatSidebar(tk.Frame):
                     self.is_generating = False
                     self.send_btn.config(state=tk.NORMAL)
                     self.status_label.config(text="Ready")
+                    completed_text = content if content is not None else self._streaming_buffer
                     # Re-render last assistant message with markdown formatting
-                    if self._streaming_buffer:
+                    if completed_text:
                         self.chat_display.config(state=tk.NORMAL)
-                        self.chat_display.delete(self._streaming_start_index, tk.END)
-                        self._insert_markdown_text(self._streaming_buffer)
-                        self.chat_display.config(state=tk.DISABLED)
-                        self.chat_display.see(tk.END)
-                    # Copy button for streaming message
-                    if self._streaming_buffer:
-                        streamed_text = self._streaming_buffer
+                        # Accurately delete the raw streamed chunks
+                        if self.chat_display.get('streaming_start', tk.END).strip():
+                            self.chat_display.delete('streaming_start', tk.END)
+                        self._insert_markdown_text(completed_text)
+                        self._message_texts.append(completed_text)
 
+                        # Copy button for streaming message
                         def _make_copy_streamed(text):
                             def _do():
                                 self.clipboard_clear()
@@ -3961,7 +3974,6 @@ class ChatSidebar(tk.Frame):
                                 self.after(1500, lambda: self.status_label.config(text='Ready'))
                             return _do
 
-                        self.chat_display.config(state=tk.NORMAL)
                         btn = tk.Button(
                             self.chat_display,
                             text='⧉', font=(SANS_FONT, 8),
@@ -3969,11 +3981,12 @@ class ChatSidebar(tk.Frame):
                             bg=self.chat_display.cget('bg'), fg='#888888',
                             activeforeground='#0066cc',
                             cursor='hand2', padx=2, pady=0,
-                            command=_make_copy_streamed(streamed_text)
+                            command=_make_copy_streamed(completed_text)
                         )
                         self.chat_display.window_create(tk.END, window=btn, padx=2)
                         self.chat_display.insert(tk.END, '\n')
                         self.chat_display.config(state=tk.DISABLED)
+                        self.chat_display.see(tk.END)
                         self._streaming_buffer = ''
                     # If we have a pending selection, show Apply to Document button
                     if self.pending_selection:
@@ -3998,9 +4011,12 @@ class ChatSidebar(tk.Frame):
         """Add a message to the chat display"""
         self.chat_display.config(state=tk.NORMAL)
         
-        # Add separator if not first message
+        # Add separator if not first message, cleaning up any trailing whitespace first
         current_content = self.chat_display.get(1.0, tk.END).strip()
         if current_content:
+            last_content_idx = self.chat_display.search(r'\S', tk.END, backwards=True, regexp=True)
+            if last_content_idx:
+                self.chat_display.delete(f"{last_content_idx}+1c", tk.END)
             self.chat_display.insert(tk.END, "\n\n")
         
         # Add role label
@@ -4019,9 +4035,8 @@ class ChatSidebar(tk.Frame):
                 self.chat_display.insert(tk.END, content, 'message')
         
         if role == 'assistant' and streaming:
-            # Use a named Tkinter mark so the position tracks correctly even
-            # when embedded widgets (copy buttons) are inserted before it.
-            self.chat_display.mark_set('streaming_start', tk.END)
+            # Use a named Tkinter mark anchored at 'end-1c' (after role label, before terminal newline)
+            self.chat_display.mark_set('streaming_start', 'end-1c')
             self.chat_display.mark_gravity('streaming_start', tk.LEFT)
             self._streaming_start_index = 'streaming_start'
             self._streaming_buffer = ''
