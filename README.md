@@ -50,7 +50,9 @@ A feature-rich markdown notepad application built with Python and Tkinter, power
 - **Multi-Tab Editing**: Open multiple documents with Ctrl+Tab navigation
 - **Find & Replace**: Full search and replace functionality (Ctrl+H)
 - **Go to Line**: Jump to specific line numbers (Ctrl+G)
-- **Zoom**: Ctrl+Plus/Minus or Ctrl+MouseWheel
+- **Page Layout**: Word-style fixed-width page (Letter, A4, Narrow, Wide) centred on a coloured desk in both Source and Visual modes; configurable margins, or switch it off for full-width editing
+- **Zoom**: 25-400% (Ctrl+Plus/Minus, Ctrl+MouseWheel, status-bar slider, Fit Width); scales the page, text, tables and images together
+- **Full Screen**: F11 hides all chrome and shows the page on a dark desk (Esc or F11 to exit)
 - **Word Wrap Toggle**: Configurable text wrapping
 - **Theme Customization**: Customize colors and fonts for source/visual modes
 - **Image Management**: Insert, resize, and manage images in documents
@@ -114,10 +116,11 @@ python markdown_notepad.py
 | Toggle Mode | Ctrl+E |
 | Toggle Word Wrap | Ctrl+Shift+W |
 | Toggle AI Sidebar | Ctrl+Shift+A |
-| Focus Mode | F11 |
+| Full Screen / Focus Mode | F11 (Esc to exit) |
 | Zoom In | Ctrl++ |
 | Zoom Out | Ctrl+- |
 | Reset Zoom | Ctrl+0 |
+| Zoom to Fit Width | Ctrl+Shift+0 |
 
 ## How AI Context Menu Works
 
@@ -268,6 +271,7 @@ note-processor/
 ├── markdown_notepad.py      # Main application (~4200 lines)
 │   ├── ImageExtractor       # Extract images from Office documents
 │   ├── ImageHandler         # Manage image embedding and display
+│   ├── PageView             # Word-style page (sheet) on a desk; owns zoom/page width/margins
 │   ├── MarkdownVisualWidget # Visual markdown rendering
 │   ├── DocumentTab          # Individual tab management
 │   ├── MarkdownNotepad      # Main application window
@@ -323,7 +327,7 @@ The application stores configuration in your home directory:
 
 | File | Purpose |
 |------|---------|
-| `~/.markitdown_notepad_settings.json` | Theme preferences (fonts, colors, sizes) |
+| `~/.markitdown_notepad_settings.json` | Theme preferences (fonts, colors, sizes), desk colour, page size/margins/layout, zoom |
 | `~/.markitdown_ai_config.json` | AI settings, API keys, and **context menu actions** |
 | `~/.markitdown_session.json` | Session state (open tabs, window geometry) |
 | `~/.markitdown_chat_history/` | Per-document chat histories (keyed by file path hash) |

@@ -11,6 +11,7 @@ Features:
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, font, simpledialog, colorchooser
+from tkinter import font as tkfont
 import re
 import os
 import io
@@ -156,10 +157,40 @@ def select_best_font(preferred_fonts, fallback="TkDefaultFont"):
 # Define cross-platform font preferences
 SANS_SERIF_FONTS = ["Segoe UI", "SF Pro Display", "Ubuntu", "DejaVu Sans", "Arial", "Helvetica"]
 MONOSPACE_FONTS = ["Consolas", "SF Mono", "Monaco", "Ubuntu Mono", "DejaVu Sans Mono", "Courier New"]
+VISUAL_FONTS = ["Calibri", "Segoe UI", "SF Pro Display", "Ubuntu", "DejaVu Sans", "Arial", "Helvetica"]
 
 # Font selection will be done after Tkinter root window is created
 SANS_FONT = None
 MONO_FONT = None
+VISUAL_FONT = None
+
+
+def _shade_color(hex_color, amount):
+    """Darken (amount < 0) or lighten (amount > 0) a #rrggbb colour by a 0..1 fraction."""
+    c = (hex_color or '').lstrip('#')
+    if len(c) != 6:
+        return hex_color
+    try:
+        rgb = [int(c[i:i + 2], 16) for i in (0, 2, 4)]
+    except ValueError:
+        return hex_color
+    if amount >= 0:
+        rgb = [int(v + (255 - v) * amount) for v in rgb]
+    else:
+        rgb = [int(v * (1 + amount)) for v in rgb]
+    return '#%02x%02x%02x' % tuple(max(0, min(255, v)) for v in rgb)
+
+
+def _is_dark_color(hex_color):
+    """Return True if a #rrggbb colour is perceptually dark."""
+    c = (hex_color or '').lstrip('#')
+    if len(c) == 6:
+        try:
+            r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+            return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0 < 0.5
+        except ValueError:
+            pass
+    return False
 
 
 # =============================================================================
@@ -788,6 +819,146 @@ class ImageViewerWindow(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
 
 
+class PageView(tk.Frame):
+    """
+    A 'desk' with a fixed-width, centred 'sheet' (Word-style page) on top of it.
+
+    The caller creates a tk.Text whose parent is `self.sheet` and registers it with
+    `attach_text`. Page width, margins and the scrollbar are managed here; zoom scales
+    the page width and margins so wrapping stays identical at every zoom level.
+    """
+
+    PAGE_INCHES = {'Letter': 8.5, 'A4': 8.27, 'Narrow': 7.0, 'Wide': 10.0}
+    MARGIN_INCHES = {'Normal': 1.0, 'Narrow': 0.5, 'Wide': 1.5}
+    GUTTER = 24    # minimum desk space left/right of the sheet (px at 96 dpi)
+    TOP_GAP = 16   # desk space above/below the sheet (px at 96 dpi)
+
+    def __init__(self, parent, desk_bg, page_bg, on_zoom_wheel=None, max_margin_in=None, **kwargs):
+        super().__init__(parent, bg=desk_bg, **kwargs)
+        self.on_zoom_wheel = on_zoom_wheel
+        self.max_margin_in = max_margin_in
+        self.on_resized = None        # callback fired when the text column width changes
+        self.zoom = 1.0
+        self.page_size = 'Letter'
+        self.margin = 'Normal'
+        self.enabled = True
+        self.text = None
+        self.content_width = 600
+        self._last_layout = None
+
+        self.scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL)
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Shadow is created before the sheet so the sheet stacks above it
+        self.shadow = tk.Frame(self, bg=_shade_color(desk_bg, -0.18))
+        self.sheet = tk.Frame(self, bg=page_bg, highlightthickness=1,
+                              highlightbackground=_shade_color(page_bg, -0.12))
+        self.hbar = ttk.Scrollbar(self.sheet, orient=tk.HORIZONTAL)
+
+        self.bind('<Configure>', self._relayout)
+        for w in (self, self.sheet, self.shadow):
+            w.bind('<MouseWheel>', self._wheel)
+            w.bind('<Control-MouseWheel>', self._ctrl_wheel)
+
+    def attach_text(self, text_widget):
+        """Place an already-created Text widget (child of self.sheet) on the page."""
+        self.text = text_widget
+        text_widget.config(relief=tk.FLAT, borderwidth=0, highlightthickness=0,
+                           yscrollcommand=self.scrollbar.set)
+        text_widget.pack(fill=tk.BOTH, expand=True)
+        self.scrollbar.config(command=text_widget.yview)
+        self.hbar.config(command=text_widget.xview)
+
+    def dpi(self):
+        try:
+            return self.winfo_fpixels('1i')
+        except tk.TclError:
+            return 96.0
+
+    def set_hscroll(self, enabled):
+        """Show a horizontal scrollbar inside the sheet (used when word wrap is off)."""
+        if not self.text:
+            return
+        if enabled:
+            self.text.config(xscrollcommand=self.hbar.set)
+            self.hbar.pack(side=tk.BOTTOM, fill=tk.X, before=self.text)
+        else:
+            self.text.config(xscrollcommand='')
+            self.hbar.pack_forget()
+
+    def set_zoom(self, zoom):
+        self.zoom = zoom
+        self._relayout()
+
+    def set_page(self, size=None, margin=None, enabled=None):
+        if size is not None:
+            self.page_size = size
+        if margin is not None:
+            self.margin = margin
+        if enabled is not None:
+            self.enabled = enabled
+        self._relayout()
+
+    def set_colors(self, desk_bg, page_bg):
+        self.config(bg=desk_bg)
+        self.shadow.config(bg=_shade_color(desk_bg, -0.4 if _is_dark_color(desk_bg) else -0.18))
+        border = _shade_color(page_bg, 0.15 if _is_dark_color(page_bg) else -0.12)
+        self.sheet.config(bg=page_bg, highlightbackground=border)
+
+    def max_page_width(self):
+        """Pixel width the sheet would have at the current zoom if the window were unlimited."""
+        return int(self.PAGE_INCHES.get(self.page_size, 8.5) * self.dpi() * self.zoom)
+
+    def fit_zoom(self):
+        """Zoom factor at which the sheet exactly fills the desk (minus gutters)."""
+        dpi = self.dpi()
+        avail = self.winfo_width() - self.scrollbar.winfo_reqwidth() - 2 * int(self.GUTTER * dpi / 96)
+        base = self.PAGE_INCHES.get(self.page_size, 8.5) * dpi
+        return max(0.25, avail / base) if avail > 0 else 1.0
+
+    def _wheel(self, event):
+        if self.text is not None:
+            self.text.yview_scroll(int(-event.delta / 120) * 4, 'units')
+        return 'break'
+
+    def _ctrl_wheel(self, event):
+        if self.on_zoom_wheel:
+            return self.on_zoom_wheel(event)
+        return 'break'
+
+    def _relayout(self, event=None):
+        dw, dh = self.winfo_width(), self.winfo_height()
+        if dw < 60 or dh < 60:
+            return
+        dpi = self.dpi()
+        avail = max(100, dw - self.scrollbar.winfo_reqwidth())
+        if self.enabled:
+            gutter = int(self.GUTTER * dpi / 96)
+            gap = int(self.TOP_GAP * dpi / 96)
+            page_w = max(int(2 * dpi), min(self.max_page_width(), avail - 2 * gutter))
+            x = (avail - page_w) // 2
+            h = max(50, dh - 2 * gap)
+            self.shadow.place(x=x + 3, y=gap + 3, width=page_w, height=h)
+            self.sheet.place(x=x, y=gap, width=page_w, height=h)
+            margin_in = self.MARGIN_INCHES.get(self.margin, 1.0)
+            if self.max_margin_in is not None:
+                margin_in = min(margin_in, self.max_margin_in)
+            pad = max(int(0.15 * dpi), min(int(margin_in * dpi * self.zoom), page_w // 4))
+        else:
+            page_w = avail
+            self.shadow.place_forget()
+            self.sheet.place(x=0, y=0, width=avail, height=dh)
+            pad = int(0.25 * dpi)
+        self.content_width = max(100, page_w - 2 * pad)
+        if self.text is not None:
+            self.text.config(padx=pad, pady=int(pad * 0.6))
+        layout = (page_w, pad)
+        if layout != self._last_layout:
+            self._last_layout = layout
+            if self.on_resized:
+                self.on_resized()
+
+
 class MarkdownVisualWidget(tk.Frame):
     """
     A widget for rendering markdown visually with image support.
@@ -808,38 +979,40 @@ class MarkdownVisualWidget(tk.Frame):
         self.on_content_change = on_content_change  # Callback for content changes
         self._last_rendered_hash = ''
         self.current_theme = None
+        self.zoom = 1.0
+        self._rerender_job = None
+        self._pending_yview = None
+        self._rendered_width = None
+        self._hr_color = "#cbd5e1"
+        self.on_zoom_wheel = None
         self._setup_widget()
     
     def _setup_widget(self):
-        """Setup the visual rendering widget - read-only presentation canvas"""
-        # Main text widget with scrollbar
-        self.text_frame = ttk.Frame(self)
-        self.text_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.scrollbar = ttk.Scrollbar(self.text_frame, orient=tk.VERTICAL)
-        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        """Setup the visual rendering widget - read-only presentation on a page"""
+        self.page_view = PageView(self, desk_bg="#d9dce1", page_bg="#ffffff")
+        self.page_view.pack(fill=tk.BOTH, expand=True)
+        self.page_view.on_resized = self._on_page_resized
         
         self.text_widget = tk.Text(
-            self.text_frame,
+            self.page_view.sheet,
             wrap=tk.WORD,
             font=("Segoe UI", 11),
             padx=40,
             pady=24,
             bg="#ffffff",
             fg="#1a1a1a",
-            relief=tk.FLAT,
-            borderwidth=0,
-            yscrollcommand=self.scrollbar.set,
             cursor="xterm",
             selectbackground="#b3d9ff",
             selectforeground="#000000",
+            inactiveselectbackground="#b3d9ff",
             spacing1=2,  # Space above lines
             spacing2=3,  # Proportional space between wrapped lines  
             spacing3=6,  # Space below lines
             state=tk.DISABLED  # Strictly read-only presentation
         )
-        self.text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.scrollbar.config(command=self.text_widget.yview)
+        self.page_view.attach_text(self.text_widget)
+        # Backwards-compatible alias
+        self.scrollbar = self.page_view.scrollbar
         
         # Setup text tags for styling
         self._setup_text_tags()
@@ -847,9 +1020,6 @@ class MarkdownVisualWidget(tk.Frame):
         # Bind mousewheel and zoom
         self.text_widget.bind("<MouseWheel>", self._on_mousewheel)
         self.text_widget.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
-        
-        # Bind resize configuration for responsive centered reading column
-        self.text_widget.bind("<Configure>", self._on_configure)
 
         # Right-click context menu for selection and copying
         self._setup_context_menu()
@@ -883,27 +1053,76 @@ class MarkdownVisualWidget(tk.Frame):
         self.text_widget.tag_add(tk.SEL, "1.0", tk.END)
         return "break"
 
-    def _on_configure(self, event=None):
-        """Dynamically center reading sheet layout on wide screens"""
-        width = event.width if event else self.winfo_width()
-        if width > 120:
-            max_reading_width = 820
-            if width > max_reading_width + 50:
-                pad = (width - max_reading_width) // 2
-            else:
-                pad = max(24, int(width * 0.04))
-            try:
-                self.text_widget.config(padx=pad)
-            except Exception:
-                pass
+    # --- zoom / page helpers -------------------------------------------------
+
+    def _px(self, pt, scale=1.0):
+        """Font size in pixels (negative = pixels in Tk) for a point size at the current zoom."""
+        return -max(4, round(pt * scale * self.page_view.dpi() / 72.0 * self.zoom))
+
+    def _s(self, n):
+        """Scale a pixel measurement (defined at 96 dpi, 100% zoom) to the current zoom/dpi."""
+        return max(0, int(n * self.page_view.dpi() / 96.0 * self.zoom))
+
+    def content_width_px(self):
+        return self.page_view.content_width
+
+    def set_zoom(self, zoom):
+        """Apply a zoom factor: text styling immediately, embedded widgets after a short debounce."""
+        self.zoom = zoom
+        self.page_view.set_zoom(zoom)
+        self._apply_base_font()
+        self._update_tags_for_theme(self.current_theme or {})
+        self._schedule_rerender()
+
+    def _apply_base_font(self):
+        theme = self.current_theme or {}
+        family = theme.get('visual_font') or VISUAL_FONT or 'Segoe UI'
+        self.text_widget.config(font=(family, self._px(theme.get('visual_font_size', 11))))
+
+    def set_page(self, size=None, margin=None, enabled=None):
+        self.page_view.set_page(size=size, margin=margin, enabled=enabled)
+
+    def _on_page_resized(self):
+        """The text column changed width; rebuild width-dependent content (tables, images, rules)."""
+        width = self.content_width_px()
+        if self._rendered_width is not None and abs(width - self._rendered_width) <= 8:
+            return
+        self._schedule_rerender()
+
+    def _schedule_rerender(self):
+        if not self.content:
+            return
+        if self._rerender_job:
+            self.after_cancel(self._rerender_job)
+        self._rerender_job = self.after(150, self.rerender)
+
+    def rerender(self):
+        """Force a re-render of the current content, keeping the scroll position."""
+        self._rerender_job = None
+        if not self.content:
+            return
+        first = self.text_widget.index('@0,0')  # top visible logical line is stable across zoom/resize
+        self._last_rendered_hash = ''
+        self._pending_yview = first
+        self.set_content(self.content)
+        if self._render_job is None:
+            self._restore_yview()
+
+    def _restore_yview(self):
+        if self._pending_yview is not None:
+            self.text_widget.update_idletasks()
+            self.text_widget.yview(self._pending_yview)
+            self._pending_yview = None
 
     def _on_mousewheel(self, event):
         """Handle mousewheel scrolling"""
-        self.text_widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.text_widget.yview_scroll(int(-1 * (event.delta / 120)) * 4, "units")
         return "break"
     
     def _on_ctrl_mousewheel(self, event):
-        """Handle Ctrl+MouseWheel for zoom (propagate to parent)"""
+        """Handle Ctrl+MouseWheel for zoom"""
+        if self.on_zoom_wheel:
+            return self.on_zoom_wheel(event)
         return
     
     def set_base_path(self, path):
@@ -925,6 +1144,7 @@ class MarkdownVisualWidget(tk.Frame):
             self._render_job = None
         
         self.content = markdown_text
+        self._rendered_width = self.content_width_px()
         
         # Enable text widget temporarily to replace content
         self.text_widget.config(state=tk.NORMAL)
@@ -963,6 +1183,7 @@ class MarkdownVisualWidget(tk.Frame):
         else:
             self._render_job = None
             self.text_widget.config(state=tk.DISABLED)
+            self._restore_yview()
     
     # Inline markdown pattern: captures bold, italic, code, links in order
     _INLINE_RE = re.compile(
@@ -1096,24 +1317,28 @@ class MarkdownVisualWidget(tk.Frame):
             
             # Horizontal rule
             elif line.strip() in ['---', '***', '___']:
-                self.text_widget.insert(tk.END, '─' * 60 + '\n', "hr")
+                self._insert_hr()
             
             # Blockquote
             elif line.startswith('>'):
-                self.text_widget.insert(tk.END, '  │ ', 'blockquote')
+                self.text_widget.insert(tk.END, '▌ ', ('blockquote', 'quote_bar'))
                 self._insert_inline(line[1:].strip(), ('blockquote',))
                 self.text_widget.insert(tk.END, '\n', 'blockquote')
             
-            # List items
+            # List items (nesting by leading whitespace)
             elif re.match(r'^[\*\-\+]\s', line.strip()):
-                self.text_widget.insert(tk.END, '  • ', 'list_item')
-                self._insert_inline(line.strip()[2:], ('list_item',))
-                self.text_widget.insert(tk.END, '\n', 'list_item')
+                depth = self._list_depth(line)
+                bullet = ('•', '◦', '▪', '▪')[depth]
+                tags = ('list_item', f'list_d{depth}')
+                self.text_widget.insert(tk.END, bullet + ' ', tags)
+                self._insert_inline(line.strip()[2:], tags)
+                self.text_widget.insert(tk.END, '\n', tags)
             elif re.match(r'^\d+\.\s', line.strip()):
                 m_li = re.match(r'^(\d+\.\s)', line.strip())
-                self.text_widget.insert(tk.END, '  ' + m_li.group(1), 'list_item')
-                self._insert_inline(line.strip()[m_li.end():], ('list_item',))
-                self.text_widget.insert(tk.END, '\n', 'list_item')
+                tags = ('list_item', f'list_d{self._list_depth(line)}')
+                self.text_widget.insert(tk.END, m_li.group(1), tags)
+                self._insert_inline(line.strip()[m_li.end():], tags)
+                self.text_widget.insert(tk.END, '\n', tags)
             
             # Normal text
             else:
@@ -1123,6 +1348,20 @@ class MarkdownVisualWidget(tk.Frame):
         # Flush any remaining table at end of content
         if in_table and table_rows:
             self._render_table(table_rows)
+
+    @staticmethod
+    def _list_depth(line):
+        """Nesting depth (0-3) of a list item from its leading whitespace."""
+        expanded = line.expandtabs(4)
+        indent = len(expanded) - len(expanded.lstrip(' '))
+        return max(0, min(3, indent // 2))
+
+    def _insert_hr(self):
+        """Insert a thin rule spanning the text column (rebuilt on zoom/resize)."""
+        rule = tk.Frame(self.text_widget, bg=self._hr_color, height=max(1, self._s(1)),
+                        width=self.content_width_px())
+        self.text_widget.window_create(tk.END, window=rule, pady=self._s(8))
+        self.text_widget.insert(tk.END, '\n', 'hr')
     
     def _is_dark(self, hex_color):
         """Helper to determine if a background color is dark"""
@@ -1179,15 +1418,23 @@ class MarkdownVisualWidget(tk.Frame):
         row_alt_bg = "#0f172a" if is_dark else "#f8fafc"
         cell_fg = "#e2e8f0" if is_dark else "#1e293b"
 
-        font_family = self.current_theme.get('visual_font', SANS_FONT) if self.current_theme else SANS_FONT
+        font_family = (self.current_theme.get('visual_font') if self.current_theme else None) or VISUAL_FONT or SANS_FONT
         font_size = self.current_theme.get('visual_font_size', 11) if self.current_theme else 11
+        cell_font = (font_family, self._px(font_size * 0.95))
+        head_font = (font_family, self._px(font_size * 0.95), "bold")
+        pad_x, pad_y = self._s(12), self._s(6)
+
+        # Keep the table inside the text column: wrap long cell text
+        window_pad = self._s(6)
+        avail = self.content_width_px() - 2 * window_pad - 2
+        wrap = max(60, avail // max(1, num_cols) - 2 * pad_x - 2)
 
         table_frame = tk.Frame(self.text_widget, bg=tbl_border, bd=1, relief=tk.SOLID)
 
         # Header row
         for col_idx, h in enumerate(headers):
-            lbl = tk.Label(table_frame, text=h, font=(font_family, font_size, "bold"),
-                           bg=header_bg, fg=header_fg, padx=14, pady=7, anchor="w", justify=tk.LEFT)
+            lbl = tk.Label(table_frame, text=h, font=head_font, wraplength=wrap,
+                           bg=header_bg, fg=header_fg, padx=pad_x, pady=pad_y + 1, anchor="w", justify=tk.LEFT)
             lbl.grid(row=0, column=col_idx, sticky="nsew", padx=1, pady=1)
 
         # Data rows
@@ -1196,15 +1443,15 @@ class MarkdownVisualWidget(tk.Frame):
                 row.append('')
             c_bg = row_alt_bg if (row_idx % 2 == 1) else row_bg
             for col_idx, cell in enumerate(row):
-                lbl = tk.Label(table_frame, text=cell, font=(font_family, font_size),
-                               bg=c_bg, fg=cell_fg, padx=14, pady=6, anchor="w", justify=tk.LEFT)
+                lbl = tk.Label(table_frame, text=cell, font=cell_font, wraplength=wrap,
+                               bg=c_bg, fg=cell_fg, padx=pad_x, pady=pad_y, anchor="w", justify=tk.LEFT)
                 lbl.grid(row=row_idx + 1, column=col_idx, sticky="nsew", padx=1, pady=1)
 
         for col_idx in range(num_cols):
             table_frame.grid_columnconfigure(col_idx, weight=1)
 
         self.text_widget.insert(tk.END, '\n')
-        self.text_widget.window_create(tk.END, window=table_frame, padx=10, pady=8)
+        self.text_widget.window_create(tk.END, window=table_frame, padx=window_pad, pady=self._s(8))
         self.text_widget.insert(tk.END, '\n\n')
     
     def _insert_image_inline(self, img_info):
@@ -1222,28 +1469,41 @@ class MarkdownVisualWidget(tk.Frame):
             
             if display_width or display_height:
                 if display_width and display_height:
-                    max_size = (display_width, display_height)
+                    target_w, target_h = display_width, display_height
                 elif display_width:
-                    ratio = display_width / orig_w
-                    max_size = (display_width, max(1, int(orig_h * ratio)))
+                    target_w = display_width
+                    target_h = max(1, int(orig_h * display_width / orig_w))
                 else:
-                    ratio = display_height / orig_h
-                    max_size = (max(1, int(orig_w * ratio)), display_height)
-                max_size = (min(max_size[0], 1000), min(max_size[1], 800))
+                    target_h = display_height
+                    target_w = max(1, int(orig_w * display_height / orig_h))
+                target_w, target_h = min(target_w, 1000), min(target_h, 800)
             else:
-                # Modern default width (sharp, readable figures up to 550px)
+                # Natural size, capped at 550px at 100% zoom
                 target_w = min(orig_w, 550)
-                ratio = target_w / orig_w
-                max_size = (target_w, max(1, int(orig_h * ratio)))
-            
-            photo = self.image_handler.get_photo_image(image, thumbnail=True, max_size=max_size)
+                target_h = max(1, int(orig_h * target_w / orig_w))
+
+            # Scale with zoom/dpi, then keep the image inside the text column
+            k = self.page_view.dpi() / 96.0 * self.zoom
+            target_w, target_h = max(1, int(target_w * k)), max(1, int(target_h * k))
+            max_w = max(80, self.content_width_px() - 2 * self._s(15))
+            if target_w > max_w:
+                target_h = max(1, int(target_h * max_w / target_w))
+                target_w = max_w
+
+            display = image
+            if (target_w, target_h) != image.size:
+                try:
+                    display = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                except Exception:
+                    display = image
+            photo = self.image_handler.get_photo_image(display, thumbnail=False)
             
             if photo:
                 align_tag = f"image_{align}" if f"image_{align}" in ('image_left', 'image_right', 'image_center') else "image_center"
                 
                 # Center/Align image using line tag
                 self.text_widget.insert(tk.END, '\n')
-                self.text_widget.image_create(tk.END, image=photo, padx=15, pady=8)
+                self.text_widget.image_create(tk.END, image=photo, padx=self._s(15), pady=self._s(8))
                 self.text_widget.insert(tk.END, '\n', align_tag)
                 
                 index = self.text_widget.index(tk.END + "-2c")
@@ -1290,7 +1550,7 @@ class MarkdownVisualWidget(tk.Frame):
         tw = self.text_widget
         bg_col = theme.get('visual_bg', '#ffffff')
         fg_col = theme.get('visual_fg', '#1a1a1a')
-        font_family = theme.get('visual_font', SANS_FONT)
+        font_family = theme.get('visual_font') or VISUAL_FONT or SANS_FONT or "TkDefaultFont"
         font_size = theme.get('visual_font_size', 11)
 
         is_dark = self._is_dark(bg_col)
@@ -1328,39 +1588,55 @@ class MarkdownVisualWidget(tk.Frame):
             hr_fg = "#e2e8f0"
             cap_fg = "#64748b"
 
-        # Heading styles
-        tw.tag_configure("h1", font=(font_family, font_size + 14, "bold"), spacing1=24, spacing3=12, foreground=h1_fg)
-        tw.tag_configure("h2", font=(font_family, font_size + 10, "bold"), spacing1=18, spacing3=10, foreground=h2_fg)
-        tw.tag_configure("h3", font=(font_family, font_size + 6, "bold"), spacing1=14, spacing3=8, foreground=h3_fg)
-        tw.tag_configure("h4", font=(font_family, font_size + 3, "bold"), spacing1=10, spacing3=6, foreground=h4_fg)
-        tw.tag_configure("h5", font=(font_family, font_size + 1, "bold"), spacing1=8, spacing3=4, foreground=h5_fg)
-        tw.tag_configure("h6", font=(font_family, font_size, "bold"), spacing1=6, spacing3=3, foreground=h6_fg)
+        self._hr_color = hr_fg if is_dark else "#cbd5e1"
+        bpx = abs(self._px(font_size))  # body font height in pixels at the current zoom
+        mono = (theme.get('source_font') or MONO_FONT)
+
+        # Heading styles (Word-like scale relative to the body size)
+        heading_specs = (
+            ("h1", 2.0,  24, 10, h1_fg, "bold"),
+            ("h2", 1.6,  18, 8,  h2_fg, "bold"),
+            ("h3", 1.3,  14, 6,  h3_fg, "bold"),
+            ("h4", 1.15, 10, 4,  h4_fg, "bold"),
+            ("h5", 1.0,  8,  3,  h5_fg, "bold"),
+            ("h6", 1.0,  6,  3,  h6_fg, "bold italic"),
+        )
+        for name, mult, sp1, sp3, color, weight in heading_specs:
+            tw.tag_configure(name, font=(font_family, self._px(font_size, mult), *weight.split()),
+                             spacing1=self._s(sp1), spacing3=self._s(sp3), foreground=color)
 
         # Inline styles
-        tw.tag_configure("bold", font=(font_family, font_size, "bold"))
-        tw.tag_configure("italic", font=(font_family, font_size, "italic"))
-        tw.tag_configure("code", font=(MONO_FONT, max(9, font_size - 1)), background=inline_code_bg, foreground=inline_code_fg, relief=tk.FLAT)
-        tw.tag_configure("code_block", font=(MONO_FONT, max(9, font_size - 1)), background=code_bg, foreground=code_fg, 
-                        spacing1=10, spacing3=10, lmargin1=24, lmargin2=24, rmargin=24)
+        tw.tag_configure("bold", font=(font_family, self._px(font_size), "bold"))
+        tw.tag_configure("italic", font=(font_family, self._px(font_size), "italic"))
+        tw.tag_configure("code", font=(mono, self._px(font_size, 0.9)), background=inline_code_bg,
+                         foreground=inline_code_fg, relief=tk.FLAT)
+        tw.tag_configure("code_block", font=(mono, self._px(font_size, 0.9)), background=code_bg, foreground=code_fg,
+                         spacing1=self._s(3), spacing3=self._s(3), lmargin1=self._s(16), lmargin2=self._s(16),
+                         rmargin=self._s(16))
         
         # Block styles
-        tw.tag_configure("blockquote", font=(font_family, font_size, "italic"), foreground=quote_fg, 
-                        lmargin1=32, lmargin2=32, spacing1=6, spacing3=6, background=quote_bg)
-        tw.tag_configure("list_item", lmargin1=24, lmargin2=44, spacing1=2, spacing3=3)
+        tw.tag_configure("blockquote", font=(font_family, self._px(font_size), "italic"), foreground=quote_fg,
+                         lmargin1=self._s(12), lmargin2=self._s(28), rmargin=self._s(12),
+                         spacing1=self._s(4), spacing3=self._s(4), background=quote_bg)
+        tw.tag_configure("quote_bar", foreground=link_fg, font=(font_family, self._px(font_size)))
+        tw.tag_configure("list_item", spacing1=self._s(1), spacing3=self._s(3))
+        for depth in range(4):
+            first = self._s(16 + 22 * depth)
+            tw.tag_configure(f"list_d{depth}", lmargin1=first, lmargin2=first + self._s(16))
         tw.tag_configure("link", foreground=link_fg, underline=True)
-        tw.tag_configure("hr", font=(font_family, 2), foreground=hr_fg, spacing1=16, spacing3=16)
+        tw.tag_configure("hr", font=(font_family, -2), foreground=hr_fg, spacing1=0, spacing3=self._s(4))
 
         # Image alignment and caption styles
-        tw.tag_configure("image_caption", font=(font_family, max(9, font_size - 2), "italic"), foreground=cap_fg,
-                        spacing1=4, spacing3=10, justify="center")
+        tw.tag_configure("image_caption", font=(font_family, self._px(font_size, 0.85), "italic"), foreground=cap_fg,
+                         spacing1=self._s(4), spacing3=self._s(10), justify="center")
         tw.tag_configure("image_center", justify="center")
         tw.tag_configure("image_left", justify="left")
         tw.tag_configure("image_right", justify="right")
-        tw.tag_configure("image_placeholder", font=(font_family, font_size), foreground=cap_fg, 
-                        background=quote_bg, lmargin1=24, spacing1=6, spacing3=6)
+        tw.tag_configure("image_placeholder", font=(font_family, self._px(font_size)), foreground=cap_fg,
+                         background=quote_bg, lmargin1=self._s(24), spacing1=self._s(6), spacing3=self._s(6))
 
-        # Paragraph spacing (proportional reading rhythm)
-        tw.tag_configure("paragraph", spacing1=2, spacing2=3, spacing3=8)
+        # Paragraph spacing (reading rhythm: ~1.2 line height, 8px between paragraphs)
+        tw.tag_configure("paragraph", spacing1=0, spacing2=max(1, int(bpx * 0.2)), spacing3=self._s(8))
 
     def get_content(self):
         """Get the current content"""
@@ -1371,15 +1647,18 @@ class MarkdownVisualWidget(tk.Frame):
         self.current_theme = theme
         bg = theme.get('visual_bg', '#ffffff')
         fg = theme.get('visual_fg', '#1a1a1a')
-        font_family = theme.get('visual_font', 'Segoe UI')
+        font_family = theme.get('visual_font') or VISUAL_FONT or 'Segoe UI'
         font_size = theme.get('visual_font_size', 11)
 
         self.text_widget.config(
             bg=bg,
             fg=fg,
-            font=(font_family, font_size)
+            font=(font_family, self._px(font_size)),
+            insertbackground=fg,
         )
+        self.page_view.set_colors(theme.get('desk_bg', '#d9dce1'), bg)
         self._update_tags_for_theme(theme)
+        self._schedule_rerender()
 
 
 class DocumentTab(ttk.Frame):
@@ -1400,27 +1679,33 @@ class DocumentTab(ttk.Frame):
         self.is_modified = False
         self.current_mode = "source"
         self.word_wrap = True
+        self.zoom = 1.0
         
-        # Source mode editor
+        desk_bg = theme.get('desk_bg', '#d9dce1')
+        
+        # Source mode editor (a Text on a Word-style page)
         self.source_frame = ttk.Frame(self)
-        self.source_editor = scrolledtext.ScrolledText(
-            self.source_frame,
+        self.source_page = PageView(self.source_frame, desk_bg=desk_bg, page_bg=theme['source_bg'],
+                                    max_margin_in=0.75)
+        self.source_editor = tk.Text(
+            self.source_page.sheet,
             wrap=tk.WORD,
-            font=(theme['source_font'], theme['source_font_size']),
+            font=self._source_font(),
             undo=True,
             padx=15,
             pady=12,
             bg=theme['source_bg'],
             fg=theme['source_fg'],
             insertbackground=theme['source_fg'],
+            insertwidth=2,
             selectbackground="#b3d9ff",
             selectforeground="#000000",
-            relief=tk.FLAT,
-            borderwidth=1,
+            inactiveselectbackground="#b3d9ff",
             spacing1=1,
             spacing3=1,
         )
-        self.source_editor.pack(fill=tk.BOTH, expand=True)
+        self.source_page.attach_text(self.source_editor)
+        self.source_page.pack(fill=tk.BOTH, expand=True)
         self._setup_syntax_tags()
         self.source_frame.pack(fill=tk.BOTH, expand=True)
         
@@ -1433,9 +1718,46 @@ class DocumentTab(ttk.Frame):
         )
         self.visual_viewer.pack(fill=tk.BOTH, expand=True)
         self.visual_viewer.apply_theme(theme)
+        self.apply_page_settings()
         
         # Setup modification tracking
         self.source_editor.bind("<<Modified>>", self._on_text_modified)
+
+    # --- page / zoom -----------------------------------------------------------
+
+    def _source_font(self):
+        """Source editor font as (family, -pixels) for the current zoom."""
+        family = self.theme.get('source_font') or MONO_FONT
+        size = self.theme.get('source_font_size', 11)
+        px = max(4, round(size * self.source_page.dpi() / 72.0 * self.zoom))
+        return (family, -px)
+
+    def apply_page_settings(self):
+        """Push page size / margin / layout preferences from the theme to both pages."""
+        size = self.theme.get('page_size', 'Letter')
+        margin = self.theme.get('page_margin', 'Normal')
+        layout = bool(self.theme.get('page_layout', True))
+        self.source_page.set_page(size=size, margin=margin, enabled=layout and self.word_wrap)
+        self.visual_viewer.set_page(size=size, margin=margin, enabled=layout)
+
+    def set_wrap(self, word_wrap):
+        """Word wrap on/off for the source editor (off = full-width page + horizontal scrollbar)."""
+        self.word_wrap = word_wrap
+        self.source_editor.config(wrap=tk.WORD if word_wrap else tk.NONE)
+        self.source_page.set_hscroll(not word_wrap)
+        self.apply_page_settings()
+
+    def set_zoom(self, zoom):
+        """Apply a zoom factor (1.0 = 100%) to both the source page and the visual page."""
+        self.zoom = zoom
+        self.source_page.set_zoom(zoom)
+        self.source_editor.config(font=self._source_font())
+        self._setup_syntax_tags()
+        self.visual_viewer.set_zoom(zoom)
+
+    def apply_desk_color(self, desk_bg):
+        self.source_page.set_colors(desk_bg, self.theme['source_bg'])
+        self.visual_viewer.page_view.set_colors(desk_bg, self.theme.get('visual_bg', '#ffffff'))
     
     def _on_text_modified(self, event=None):
         """Handle text modification"""
@@ -1479,28 +1801,50 @@ class DocumentTab(ttk.Frame):
             bg=theme['source_bg'],
             fg=theme['source_fg'],
             insertbackground=theme['source_fg'],
-            font=(theme['source_font'], theme['source_font_size'])
+            font=self._source_font()
         )
+        self.source_page.set_colors(theme.get('desk_bg', '#d9dce1'), theme['source_bg'])
+        self._setup_syntax_tags()
+        self._apply_syntax_highlighting()
         self.visual_viewer.apply_theme(theme)
+        self.apply_page_settings()
 
     def _setup_syntax_tags(self):
-        """Configure colour/font tags for source-mode syntax highlighting."""
+        """Configure colour/font tags for source-mode syntax highlighting (zoom aware)."""
         sz = self.theme.get('source_font_size', 12)
+        mono = self.theme.get('source_font') or MONO_FONT
+        dpi_k = self.source_page.dpi() / 72.0 * self.zoom
+
+        def px(pt):
+            return -max(4, round(pt * dpi_k))
+
+        k96 = self.source_page.dpi() / 96.0 * self.zoom
+        dark = _is_dark_color(self.theme.get('source_bg', '#ffffff'))
+        if dark:
+            heads = ('#f8fafc', '#e2e8f0', '#cbd5e1', '#cbd5e1')
+            bold_fg, italic_fg, link_fg, quote_fg, hr_fg = '#ff7b72', '#d2a8ff', '#79c0ff', '#9ca3af', '#6b7280'
+            code_bg, code_fg = '#2d2f3a', '#f38ba8'
+        else:
+            heads = ('#1a1a2e', '#16213e', '#1f4068', '#1b1b2f')
+            bold_fg, italic_fg, link_fg, quote_fg, hr_fg = '#d73a49', '#6f42c1', '#0066cc', '#6c757d', '#aaaaaa'
+            code_bg, code_fg = '#f0f0f0', '#c7254e'
         editor = self.source_editor
         # Headers
-        editor.tag_configure('syn_h1', font=(MONO_FONT, sz + 8, 'bold'), foreground='#1a1a2e')
-        editor.tag_configure('syn_h2', font=(MONO_FONT, sz + 5, 'bold'), foreground='#16213e')
-        editor.tag_configure('syn_h3', font=(MONO_FONT, sz + 3, 'bold'), foreground='#1f4068')
-        editor.tag_configure('syn_h4', font=(MONO_FONT, sz + 1, 'bold'), foreground='#1b1b2f')
+        editor.tag_configure('syn_h1', font=(mono, px(sz + 8), 'bold'), foreground=heads[0])
+        editor.tag_configure('syn_h2', font=(mono, px(sz + 5), 'bold'), foreground=heads[1])
+        editor.tag_configure('syn_h3', font=(mono, px(sz + 3), 'bold'), foreground=heads[2])
+        editor.tag_configure('syn_h4', font=(mono, px(sz + 1), 'bold'), foreground=heads[3])
         # Inline
-        editor.tag_configure('syn_bold',        foreground='#d73a49')
-        editor.tag_configure('syn_italic',      foreground='#6f42c1')
-        editor.tag_configure('syn_code_inline', font=(MONO_FONT, sz), background='#f0f0f0', foreground='#c7254e')
-        editor.tag_configure('syn_code_block',  font=(MONO_FONT, sz), background='#282c34', foreground='#abb2bf', lmargin1=20)
-        editor.tag_configure('syn_link',        foreground='#0066cc', underline=True)
-        editor.tag_configure('syn_blockquote',  font=(MONO_FONT, sz, 'italic'), foreground='#6c757d', lmargin1=30)
-        editor.tag_configure('syn_list_marker', font=(MONO_FONT, sz, 'bold'), foreground='#0066cc')
-        editor.tag_configure('syn_hr',          foreground='#aaaaaa')
+        editor.tag_configure('syn_bold',        foreground=bold_fg)
+        editor.tag_configure('syn_italic',      foreground=italic_fg)
+        editor.tag_configure('syn_code_inline', font=(mono, px(sz)), background=code_bg, foreground=code_fg)
+        editor.tag_configure('syn_code_block',  font=(mono, px(sz)), background='#282c34', foreground='#abb2bf',
+                             lmargin1=int(20 * k96))
+        editor.tag_configure('syn_link',        foreground=link_fg, underline=True)
+        editor.tag_configure('syn_blockquote',  font=(mono, px(sz), 'italic'), foreground=quote_fg,
+                             lmargin1=int(30 * k96))
+        editor.tag_configure('syn_list_marker', font=(mono, px(sz), 'bold'), foreground=link_fg)
+        editor.tag_configure('syn_hr',          foreground=hr_fg)
 
     def _apply_syntax_highlighting(self):
         """Apply markdown syntax highlighting tags to the source editor."""
@@ -1661,30 +2005,42 @@ class OutlinePanel(ttk.Frame):
 class MarkdownNotepad(tk.Tk):
     """Main application window"""
     
-    # Default theme settings (using detected system fonts)
+    # Default theme settings. Font entries are resolved in __init__ once a Tk root exists.
     DEFAULT_THEME = {
         'source_bg': '#fefefe',
         'source_fg': '#1a1a1a',
-        'source_font': MONO_FONT,
+        'source_font': None,
         'source_font_size': 11,
         'visual_bg': '#ffffff',
         'visual_fg': '#1a1a1a',
-        'visual_font': SANS_FONT,
+        'visual_font': None,
         'visual_font_size': 11,
+        # Page layout / zoom
+        'desk_bg': '#d9dce1',
+        'page_layout': True,
+        'page_size': 'Letter',
+        'page_margin': 'Normal',
+        'zoom_pct': 100,
     }
+
+    ZOOM_STEPS = [25, 50, 75, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400]
     
     def __init__(self):
         super().__init__()
         
         # Initialize fonts now that Tkinter root exists
-        global SANS_FONT, MONO_FONT
+        global SANS_FONT, MONO_FONT, VISUAL_FONT
         if SANS_FONT is None:
             SANS_FONT = select_best_font(SANS_SERIF_FONTS, "TkDefaultFont")
         if MONO_FONT is None:
             MONO_FONT = select_best_font(MONOSPACE_FONTS, "TkFixedFont")
+        if VISUAL_FONT is None:
+            VISUAL_FONT = select_best_font(VISUAL_FONTS, SANS_FONT)
         
         self.title("MarkItDown Notepad")
-        self.geometry("1000x700")
+        ui_scale = max(1.0, self.winfo_fpixels('1i') / 96.0)
+        self.geometry(f"{int(1280 * ui_scale)}x{int(820 * ui_scale)}")
+        self.minsize(int(760 * ui_scale), int(520 * ui_scale))
         self.configure(bg="#f5f5f5")
         
         # Application state - now tab-based
@@ -1697,14 +2053,11 @@ class MarkdownNotepad(tk.Tk):
         self.session_manager = get_session_manager() if SESSION_MANAGER_AVAILABLE else None
         self._auto_save_job = None
         
-        # Focus mode state
+        # Focus / full-screen mode state
         self.focus_mode_active = False
-        self.focus_overlay = None
-        self.pre_focus_geometry = None
-        self.pre_focus_state = None
-        self.focus_widget = None
-        self.focus_original_parent = None
         self.focus_escape_binding = None
+        self._pre_fs = None
+        self._fs_hint = None
         
         # Recent files
         self.recent_files = []
@@ -1713,7 +2066,14 @@ class MarkdownNotepad(tk.Tk):
         
         # Theme settings
         self.theme = self.DEFAULT_THEME.copy()
+        self.theme['source_font'] = MONO_FONT
+        self.theme['visual_font'] = VISUAL_FONT
         self._load_theme()
+        
+        # Zoom state (global, percent)
+        self.zoom_pct = self._clamp_zoom(self.theme.get('zoom_pct', 100))
+        self._zoom_updating = False
+        self._zoom_save_job = None
         
         # Initialize MarkItDown
         if MARKITDOWN_AVAILABLE:
@@ -1722,6 +2082,9 @@ class MarkdownNotepad(tk.Tk):
             self.md_converter = None
         
         self.live_render_var = tk.BooleanVar(value=self.theme.get('live_render_enabled', True))
+        self.page_layout_var = tk.BooleanVar(value=bool(self.theme.get('page_layout', True)))
+        self.page_size_var = tk.StringVar(value=self.theme.get('page_size', 'Letter'))
+        self.page_margin_var = tk.StringVar(value=self.theme.get('page_margin', 'Normal'))
         self._setup_ui()
         self._setup_bindings()
         self._restore_session()
@@ -1737,8 +2100,13 @@ class MarkdownNotepad(tk.Tk):
             try:
                 with open(settings_path, 'r') as f:
                     saved_theme = json.load(f)
+                if isinstance(saved_theme, dict):
+                    # Ignore empty font names so defaults survive
+                    for key in ('source_font', 'visual_font'):
+                        if not saved_theme.get(key):
+                            saved_theme.pop(key, None)
                     self.theme.update(saved_theme)
-            except:
+            except Exception:
                 pass
     
     def _save_theme(self):
@@ -1830,6 +2198,8 @@ class MarkdownNotepad(tk.Tk):
     
     def _setup_ui(self):
         """Setup the user interface"""
+        self._setup_styles()
+        
         # Menu bar
         self._create_menu()
         
@@ -1870,13 +2240,25 @@ class MarkdownNotepad(tk.Tk):
         self.ai_sidebar_visible = False
         self._setup_ai_sidebar()
         
-        # Status bar
+        # Status bar (packed before the paned area so it is never squeezed out)
         self._create_status_bar()
-        
-        # Font size tracking for zoom
-        self.current_font_size = 11
-        self.min_font_size = 6
-        self.max_font_size = 48
+        self._update_zoom_widgets()
+    
+    def _setup_styles(self):
+        """Configure ttk look & feel (fonts, toolbar buttons, tabs, status bar)"""
+        style = ttk.Style()
+        if style.theme_use() == 'default' and 'clam' in style.theme_names():
+            style.theme_use('clam')
+        for name in ('TkDefaultFont', 'TkMenuFont'):
+            try:
+                tkfont.nametofont(name).configure(family=SANS_FONT, size=10)
+            except Exception:
+                pass
+        style.configure("Toolbar.TButton", padding=(8, 4), width=0)
+        style.configure("Toolbar.Toolbutton", padding=(10, 4))
+        style.configure("TNotebook.Tab", padding=(14, 6))
+        style.configure("Status.TLabel", font=(SANS_FONT, 9))
+        style.configure("Zoom.TButton", padding=(4, 0), width=2)
     
     def _create_menu(self):
         """Create the menu bar"""
@@ -1964,6 +2346,23 @@ class MarkdownNotepad(tk.Tk):
         view_menu.add_command(label="Zoom In", command=self.zoom_in, accelerator="Ctrl++")
         view_menu.add_command(label="Zoom Out", command=self.zoom_out, accelerator="Ctrl+-")
         view_menu.add_command(label="Reset Zoom", command=self.zoom_reset, accelerator="Ctrl+0")
+        view_menu.add_command(label="Zoom to Fit Width", command=self.zoom_fit_width, accelerator="Ctrl+Shift+0")
+        
+        view_menu.add_separator()
+        
+        # Page layout (Word-style sheet on a desk)
+        view_menu.add_checkbutton(label="Page Layout", variable=self.page_layout_var,
+                                  command=self._apply_page_settings)
+        size_menu = tk.Menu(view_menu, tearoff=0)
+        for name in PageView.PAGE_INCHES:
+            size_menu.add_radiobutton(label=name, value=name, variable=self.page_size_var,
+                                      command=self._apply_page_settings)
+        view_menu.add_cascade(label="Page Size", menu=size_menu)
+        margin_menu = tk.Menu(view_menu, tearoff=0)
+        for name in PageView.MARGIN_INCHES:
+            margin_menu.add_radiobutton(label=name, value=name, variable=self.page_margin_var,
+                                        command=self._apply_page_settings)
+        view_menu.add_cascade(label="Page Margins", menu=margin_menu)
         
         view_menu.add_separator()
         
@@ -1980,7 +2379,7 @@ class MarkdownNotepad(tk.Tk):
         view_menu.add_separator()
         
         # Focus Mode
-        view_menu.add_command(label="Focus Mode", command=self._toggle_focus_mode, accelerator="F11")
+        view_menu.add_command(label="Full Screen / Focus Mode", command=self._toggle_focus_mode, accelerator="F11")
         
         view_menu.add_separator()
         
@@ -2029,12 +2428,8 @@ class MarkdownNotepad(tk.Tk):
     def _create_toolbar(self):
         """Create the toolbar"""
         self.toolbar_frame = ttk.Frame(self)
-        self.toolbar_frame.pack(fill=tk.X, padx=5, pady=2)
+        self.toolbar_frame.pack(fill=tk.X, padx=5, pady=(4, 2))
         toolbar = self.toolbar_frame  # Keep local reference for compatibility
-        
-        # Style for buttons
-        style = ttk.Style()
-        style.configure("Toolbar.TButton", padding=5)
         
         # File operations with tooltips
         new_btn = ttk.Button(toolbar, text="New", command=self.new_tab, style="Toolbar.TButton")
@@ -2058,22 +2453,21 @@ class MarkdownNotepad(tk.Tk):
         ToolTip(reflow_btn, "Clean & Reflow Document - Fix soft wraps & hyphens (Ctrl+Shift+R)")
         
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
-        # Mode toggle
-        self.mode_var = tk.StringVar(value="source")
-        ttk.Label(toolbar, text="Mode:").pack(side=tk.LEFT, padx=(5, 2))
         
+        # Mode toggle (segmented Source | Visual)
+        self.mode_var = tk.StringVar(value="source")
         mode_frame = ttk.Frame(toolbar)
         mode_frame.pack(side=tk.LEFT, padx=2)
         
         self.source_btn = ttk.Radiobutton(
-            mode_frame, text="Source", variable=self.mode_var, 
+            mode_frame, text="Source", variable=self.mode_var, style="Toolbar.Toolbutton",
             value="source", command=self._show_source_mode
         )
         self.source_btn.pack(side=tk.LEFT)
         ToolTip(self.source_btn, "Edit raw markdown (Ctrl+1)")
         
         self.visual_btn = ttk.Radiobutton(
-            mode_frame, text="Visual", variable=self.mode_var,
+            mode_frame, text="Visual", variable=self.mode_var, style="Toolbar.Toolbutton",
             value="visual", command=self._show_visual_mode
         )
         self.visual_btn.pack(side=tk.LEFT)
@@ -2081,69 +2475,93 @@ class MarkdownNotepad(tk.Tk):
         
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
         
-        # Format buttons (for source mode) with tooltips
-        bold_btn = ttk.Button(toolbar, text="B", command=lambda: self._insert_format("**", "**"), width=3)
-        bold_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(bold_btn, "Bold (Ctrl+B)")
+        # Format buttons (source mode only) with tooltips
+        self._format_buttons = []
         
-        italic_btn = ttk.Button(toolbar, text="I", command=lambda: self._insert_format("*", "*"), width=3)
-        italic_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(italic_btn, "Italic (Ctrl+I)")
+        def add_format_button(text, command, width, tip):
+            btn = ttk.Button(toolbar, text=text, command=command, width=width)
+            btn.pack(side=tk.LEFT, padx=1)
+            ToolTip(btn, tip)
+            self._format_buttons.append(btn)
         
-        code_btn = ttk.Button(toolbar, text="</>", command=lambda: self._insert_format("`", "`"), width=3)
-        code_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(code_btn, "Inline Code (Ctrl+`)")
-        
-        link_btn = ttk.Button(toolbar, text="Link", command=lambda: self._insert_format("[", "](url)"), width=4)
-        link_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(link_btn, "Insert Link")
-        
-        img_btn = ttk.Button(toolbar, text="Image", command=self.insert_image, width=5)
-        img_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(img_btn, "Insert Image (Ctrl+Shift+I)")
+        add_format_button("B", lambda: self._insert_format("**", "**"), 3, "Bold (Ctrl+B)")
+        add_format_button("I", lambda: self._insert_format("*", "*"), 3, "Italic (Ctrl+I)")
+        add_format_button("</>", lambda: self._insert_format("`", "`"), 3, "Inline Code (Ctrl+`)")
+        add_format_button("Link", lambda: self._insert_format("[", "](url)"), 4, "Insert Link")
+        add_format_button("Image", self.insert_image, 5, "Insert Image (Ctrl+Shift+I)")
         
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
         
         # Theme button
         theme_btn = ttk.Button(toolbar, text="Theme", command=self.open_theme_dialog, style="Toolbar.TButton")
         theme_btn.pack(side=tk.LEFT, padx=2)
-        ToolTip(theme_btn, "Change color theme")
+        ToolTip(theme_btn, "Change color theme, fonts and desk colour")
         
-        # AI sidebar toggle button (on the right side)
+        # Right-hand side: AI sidebar, outline, full screen
         self.ai_sidebar_btn = ttk.Button(toolbar, text="AI Chat", command=self._toggle_ai_sidebar, style="Toolbar.TButton")
         self.ai_sidebar_btn.pack(side=tk.RIGHT, padx=2)
         ToolTip(self.ai_sidebar_btn, "Toggle AI Assistant Sidebar (Ctrl+Shift+A)")
+        
+        fullscreen_btn = ttk.Button(toolbar, text="Full Screen", command=self._toggle_focus_mode, style="Toolbar.TButton")
+        fullscreen_btn.pack(side=tk.RIGHT, padx=2)
+        ToolTip(fullscreen_btn, "Full screen focus mode (F11)")
+        
+        outline_btn = ttk.Button(toolbar, text="Outline", command=self._toggle_outline_panel, style="Toolbar.TButton")
+        outline_btn.pack(side=tk.RIGHT, padx=2)
+        ToolTip(outline_btn, "Toggle Document Outline (Ctrl+Shift+L)")
+    
+    def _set_format_buttons_enabled(self, enabled):
+        """Formatting buttons only make sense in Source mode (Visual mode is read-only)"""
+        for btn in getattr(self, '_format_buttons', []):
+            btn.state(['!disabled'] if enabled else ['disabled'])
     
     def _create_status_bar(self):
         """Create the status bar"""
         self.status_bar = ttk.Frame(self)
-        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM, before=self.outer_paned)
         
-        self.status_label = ttk.Label(self.status_bar, text="Ready")
+        self.status_label = ttk.Label(self.status_bar, text="Ready", style="Status.TLabel")
         self.status_label.pack(side=tk.LEFT, padx=10)
         
-        self.position_label = ttk.Label(self.status_bar, text="Line 1, Col 1")
-        self.position_label.pack(side=tk.RIGHT, padx=10)
+        # Zoom controls (right-aligned): [-] slider [+] 100%
+        self.zoom_label = ttk.Menubutton(self.status_bar, text="100%", width=6)
+        self.zoom_label.pack(side=tk.RIGHT, padx=(2, 8), pady=1)
+        zoom_menu = tk.Menu(self.zoom_label, tearoff=0)
+        for pct in (50, 75, 100, 125, 150, 200):
+            zoom_menu.add_command(label=f"{pct}%", command=lambda p=pct: self._set_zoom(p))
+        zoom_menu.add_separator()
+        zoom_menu.add_command(label="Fit Width", command=self.zoom_fit_width)
+        self.zoom_label.config(menu=zoom_menu)
+        
+        zoom_in_btn = ttk.Button(self.status_bar, text="+", style="Zoom.TButton", command=self.zoom_in)
+        zoom_in_btn.pack(side=tk.RIGHT, pady=1)
+        ToolTip(zoom_in_btn, "Zoom In (Ctrl++)")
+        self.zoom_scale = ttk.Scale(self.status_bar, from_=25, to=300, orient=tk.HORIZONTAL, length=110,
+                                    command=self._on_zoom_scale)
+        self.zoom_scale.pack(side=tk.RIGHT, padx=4)
+        zoom_out_btn = ttk.Button(self.status_bar, text="\u2212", style="Zoom.TButton", command=self.zoom_out)
+        zoom_out_btn.pack(side=tk.RIGHT, pady=1)
+        ToolTip(zoom_out_btn, "Zoom Out (Ctrl+-)")
+        
+        ttk.Separator(self.status_bar, orient=tk.VERTICAL).pack(side=tk.RIGHT, fill=tk.Y, padx=8, pady=3)
+        
+        self.mode_label = ttk.Label(self.status_bar, text="Source Mode", style="Status.TLabel")
+        self.mode_label.pack(side=tk.RIGHT, padx=8)
+        
+        self.wrap_label = ttk.Label(self.status_bar, text="Wrap: On", style="Status.TLabel")
+        self.wrap_label.pack(side=tk.RIGHT, padx=8)
         
         # Word and character count
-        self.word_count_label = ttk.Label(self.status_bar, text="Words: 0 | Chars: 0")
-        self.word_count_label.pack(side=tk.RIGHT, padx=10)
+        self.word_count_label = ttk.Label(self.status_bar, text="Words: 0 | Chars: 0", style="Status.TLabel")
+        self.word_count_label.pack(side=tk.RIGHT, padx=8)
         
-        # Zoom indicator
-        self.zoom_label = ttk.Label(self.status_bar, text="100%")
-        self.zoom_label.pack(side=tk.RIGHT, padx=10)
-        
-        # Wrap indicator
-        self.wrap_label = ttk.Label(self.status_bar, text="Wrap: On")
-        self.wrap_label.pack(side=tk.RIGHT, padx=10)
-        
-        self.mode_label = ttk.Label(self.status_bar, text="Source Mode")
-        self.mode_label.pack(side=tk.RIGHT, padx=10)
+        self.position_label = ttk.Label(self.status_bar, text="Line 1, Col 1", style="Status.TLabel")
+        self.position_label.pack(side=tk.RIGHT, padx=8)
         
         # MarkItDown status
         md_status = "MarkItDown: ✓" if MARKITDOWN_AVAILABLE else "MarkItDown: ✗"
-        self.md_status_label = ttk.Label(self.status_bar, text=md_status)
-        self.md_status_label.pack(side=tk.RIGHT, padx=10)
+        self.md_status_label = ttk.Label(self.status_bar, text=md_status, style="Status.TLabel")
+        self.md_status_label.pack(side=tk.RIGHT, padx=8)
     
     def _setup_bindings(self):
         """Setup keyboard bindings"""
@@ -2177,6 +2595,7 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-equal>", lambda e: self.zoom_in())  # For keyboards without numpad
         self.bind("<Control-minus>", lambda e: self.zoom_out())
         self.bind("<Control-0>", lambda e: self.zoom_reset())
+        self.bind("<Control-parenright>", lambda e: self.zoom_fit_width())  # Ctrl+Shift+0
         
         # AI sidebar toggle
         self.bind("<Control-A>", lambda e: self._toggle_ai_sidebar())  # Ctrl+Shift+A
@@ -2227,7 +2646,7 @@ class MarkdownNotepad(tk.Tk):
             self.outer_paned.forget(self.outline_panel)
             self.outline_visible = False
         else:
-            self.outer_paned.insert(0, self.outline_panel, weight=0, minsize=150)
+            self.outer_paned.insert(0, self.outline_panel, weight=0)
             self.outline_visible = True
             self._schedule_outline_update()
 
@@ -2276,6 +2695,7 @@ class MarkdownNotepad(tk.Tk):
                     
                     # Setup bindings
                     self._setup_tab_bindings(tab)
+                    tab.set_zoom(self.zoom_pct / 100.0)
                     
                     # Restore cursor position
                     try:
@@ -2300,6 +2720,7 @@ class MarkdownNotepad(tk.Tk):
                     if tab_state.current_mode == "visual":
                         tab.visual_frame.pack(fill=tk.BOTH, expand=True)
                         tab.source_frame.pack_forget()
+                        tab.visual_viewer.set_content(tab.get_content())
                     else:
                         tab.source_frame.pack(fill=tk.BOTH, expand=True)
                         tab.visual_frame.pack_forget()
@@ -2811,6 +3232,9 @@ class MarkdownNotepad(tk.Tk):
         
         # Setup bindings for this tab
         self._setup_tab_bindings(tab)
+        tab.set_zoom(self.zoom_pct / 100.0)
+        if not self.word_wrap:
+            tab.set_wrap(False)
         
         tab.visual_viewer.live_render_enabled = self.theme.get('live_render_enabled', True)
         
@@ -2825,9 +3249,12 @@ class MarkdownNotepad(tk.Tk):
     
     def _setup_tab_bindings(self, tab):
         """Setup bindings for a specific tab"""
-        # Mouse wheel zoom
+        # Mouse wheel zoom (text widgets and the desk around the page)
         tab.source_editor.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
         tab.visual_viewer.text_widget.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
+        tab.source_page.on_zoom_wheel = self._on_ctrl_mousewheel
+        tab.visual_viewer.page_view.on_zoom_wheel = self._on_ctrl_mousewheel
+        tab.visual_viewer.on_zoom_wheel = self._on_ctrl_mousewheel
         
         # Position tracking
         tab.source_editor.bind("<KeyRelease>", self._schedule_position_update)
@@ -3017,6 +3444,7 @@ class MarkdownNotepad(tk.Tk):
             mode = self.current_tab.current_mode
             self.mode_var.set(mode)
             self.mode_label.config(text=f"{mode.capitalize()} Mode")
+            self._set_format_buttons_enabled(mode == "source")
     
     def _set_status(self, message):
         """Set status bar message"""
@@ -3029,10 +3457,8 @@ class MarkdownNotepad(tk.Tk):
         self.word_wrap = not self.word_wrap
         self.wrap_var.set(self.word_wrap)
         
-        # Apply to current tab
-        if self.current_tab:
-            wrap_mode = tk.WORD if self.word_wrap else tk.NONE
-            self.current_tab.source_editor.config(wrap=wrap_mode)
+        for tab in self.tabs:
+            tab.set_wrap(self.word_wrap)
         
         # Update status bar
         self.wrap_label.config(text=f"Wrap: {'On' if self.word_wrap else 'Off'}")
@@ -3060,6 +3486,15 @@ class MarkdownNotepad(tk.Tk):
         self.theme['live_render_enabled'] = enabled
         self._save_theme()
     
+    # === Zoom & Page Layout ===
+    
+    @staticmethod
+    def _clamp_zoom(pct):
+        try:
+            return max(25, min(400, int(pct)))
+        except (TypeError, ValueError):
+            return 100
+    
     def _on_ctrl_mousewheel(self, event):
         """Handle Ctrl+MouseWheel for zoom"""
         if event.delta > 0:
@@ -3068,52 +3503,71 @@ class MarkdownNotepad(tk.Tk):
             self.zoom_out()
         return "break"  # Prevent default scrolling
     
+    def _set_zoom(self, pct, save=True):
+        """Set the global zoom (percent) and apply it to every tab."""
+        pct = self._clamp_zoom(pct)
+        self.zoom_pct = pct
+        self.theme['zoom_pct'] = pct
+        for tab in self.tabs:
+            tab.set_zoom(pct / 100.0)
+        self._update_zoom_widgets()
+        if save:
+            if self._zoom_save_job:
+                self.after_cancel(self._zoom_save_job)
+            self._zoom_save_job = self.after(500, self._save_theme)
+    
     def zoom_in(self):
-        """Increase font size"""
-        if self.current_font_size < self.max_font_size:
-            self.current_font_size += 1
-            self._apply_font_size()
-            for tab in self.tabs:
-                tab.theme['source_font_size'] = self.current_font_size
-                tab._setup_syntax_tags()
-                tab._apply_syntax_highlighting()
+        """Move to the next zoom step"""
+        for step in self.ZOOM_STEPS:
+            if step > self.zoom_pct:
+                self._set_zoom(step)
+                return
     
     def zoom_out(self):
-        """Decrease font size"""
-        if self.current_font_size > self.min_font_size:
-            self.current_font_size -= 1
-            self._apply_font_size()
-            for tab in self.tabs:
-                tab.theme['source_font_size'] = self.current_font_size
-                tab._setup_syntax_tags()
-                tab._apply_syntax_highlighting()
+        """Move to the previous zoom step"""
+        for step in reversed(self.ZOOM_STEPS):
+            if step < self.zoom_pct:
+                self._set_zoom(step)
+                return
     
     def zoom_reset(self):
-        """Reset font size to default"""
-        self.current_font_size = self.theme['source_font_size']
-        self._apply_font_size()
-        for tab in self.tabs:
-            tab.theme['source_font_size'] = self.current_font_size
-            tab._setup_syntax_tags()
-            tab._apply_syntax_highlighting()
+        """Reset zoom to 100%"""
+        self._set_zoom(100)
     
-    def _apply_font_size(self):
-        """Apply current font size to all tabs"""
+    def zoom_fit_width(self):
+        """Zoom so the page exactly fills the available width"""
+        if not self.current_tab:
+            return
+        tab = self.current_tab
+        page = tab.source_page if tab.current_mode == "source" else tab.visual_viewer.page_view
+        self._set_zoom(int(page.fit_zoom() * 100))
+    
+    def _update_zoom_widgets(self):
+        """Sync the status-bar zoom controls with the current zoom"""
+        if not hasattr(self, 'zoom_label'):
+            return
+        self._zoom_updating = True
+        try:
+            self.zoom_label.config(text=f"{self.zoom_pct}%")
+            self.zoom_scale.set(self.zoom_pct)
+        finally:
+            self._zoom_updating = False
+    
+    def _on_zoom_scale(self, value):
+        if self._zoom_updating:
+            return
+        pct = int(round(float(value) / 5.0) * 5)
+        if pct != self.zoom_pct:
+            self._set_zoom(pct)
+    
+    def _apply_page_settings(self):
+        """Persist page layout choices from the View menu and push them to every tab"""
+        self.theme['page_layout'] = bool(self.page_layout_var.get())
+        self.theme['page_size'] = self.page_size_var.get()
+        self.theme['page_margin'] = self.page_margin_var.get()
         for tab in self.tabs:
-            # Apply to source editor
-            tab.source_editor.config(font=(self.theme['source_font'], self.current_font_size))
-            
-            # Apply proportionally to visual editor
-            visual_base = self.theme['visual_font_size']
-            scale = self.current_font_size / self.theme['source_font_size']
-            visual_size = max(6, int(visual_base * scale))
-            tab.visual_viewer.text_widget.config(
-                font=(self.theme['visual_font'], visual_size)
-            )
-        
-        # Update status bar with zoom level
-        zoom_pct = int((self.current_font_size / self.theme['source_font_size']) * 100)
-        self.zoom_label.config(text=f"{zoom_pct}%")
+            tab.apply_page_settings()
+        self._save_theme()
     
     def _show_source_mode(self):
         """Switch current tab to source editing mode"""
@@ -3125,6 +3579,7 @@ class MarkdownNotepad(tk.Tk):
         self.current_tab.current_mode = "source"
         self.mode_var.set("source")
         self.mode_label.config(text="Source Mode")
+        self._set_format_buttons_enabled(True)
         self._set_status("Source mode - edit raw markdown")
     
     def _show_visual_mode(self):
@@ -3132,15 +3587,18 @@ class MarkdownNotepad(tk.Tk):
         if not self.current_tab:
             return
             
-        # Update visual view with pristine canonical content from source
-        content = self.current_tab.source_editor.get(1.0, tk.END).rstrip()
-        self.current_tab.visual_viewer.set_content(content)
-        
         self.current_tab.source_frame.pack_forget()
         self.current_tab.visual_frame.pack(fill=tk.BOTH, expand=True)
         self.current_tab.current_mode = "visual"
+        
+        # Lay out the page first so tables/images/rules are sized to the real column width
+        self.update_idletasks()
+        content = self.current_tab.source_editor.get(1.0, tk.END).rstrip()
+        self.current_tab.visual_viewer.set_content(content)
+        
         self.mode_var.set("visual")
         self.mode_label.config(text="Visual Mode")
+        self._set_format_buttons_enabled(False)
         self._set_status("Visual mode - reading presentation view")
     
     def _on_visual_edit(self, content):
@@ -3165,160 +3623,119 @@ class MarkdownNotepad(tk.Tk):
         else:
             self._enter_focus_mode()
     
-    def _enter_focus_mode(self):
-        """Enter distraction-free focus mode"""
+    def _fullscreen_desk_color(self):
+        """Darker desk colour used while in full-screen focus mode."""
+        return _shade_color(self.theme.get('desk_bg', '#d9dce1'), -0.55)
+
+    def _focus_active_editor(self):
         if not self.current_tab:
             return
-        
-        # Store state for restoration
-        self.focus_mode_active = True
-        self.pre_focus_geometry = self.geometry()
-        self.pre_focus_state = self.state()
-        self.focus_mode_type = self.current_tab.current_mode  # "source" or "visual"
-        
-        # Get current content and cursor position
-        if self.focus_mode_type == "source":
-            self.focus_original_content = self.current_tab.source_editor.get(1.0, tk.END)
-            try:
-                self.focus_cursor_pos = self.current_tab.source_editor.index(tk.INSERT)
-            except:
-                self.focus_cursor_pos = "1.0"
+        if self.current_tab.current_mode == "source":
+            self.current_tab.source_editor.focus_set()
         else:
-            self.focus_original_content = self.current_tab.visual_viewer.get_content()
-        
-        # Hide all UI elements
+            self.current_tab.visual_viewer.text_widget.focus_set()
+
+    def _enter_focus_mode(self):
+        """Enter distraction-free full screen: hide all chrome and show the same page widgets on a dark desk."""
+        if self.focus_mode_active or not self.current_tab:
+            return
+        self.focus_mode_active = True
+        self._pre_fs = {
+            'geometry': self.geometry(),
+            'state': self.state(),
+            'outline': self.outline_visible,
+            'ai': self.ai_sidebar_visible,
+        }
+
+        # Hide side panels, then the chrome
+        if self.outline_visible:
+            self._toggle_outline_panel()
+        if self.ai_sidebar_visible:
+            self._toggle_ai_sidebar()
+        self.config(menu="")
         self.toolbar_frame.pack_forget()
         self.status_bar.pack_forget()
-        self.main_paned.pack_forget()
-        self.config(menu="")  # Hide menu bar
-        
-        # Configure root window background to black
-        self.configure(bg="black")
-        
-        # Create the focus overlay
-        self.focus_overlay = tk.Frame(self, bg="black")
-        self.focus_overlay.pack(fill=tk.BOTH, expand=True)
-        
-        # Calculate side widths (each side is 1/6 of screen = total 1/3 for margins)
-        screen_width = self.winfo_screenwidth()
-        side_width = screen_width // 6
-        
-        # Left spacer (black)
-        left_spacer = tk.Frame(self.focus_overlay, bg="black", width=side_width)
-        left_spacer.pack(side=tk.LEFT, fill=tk.Y)
-        left_spacer.pack_propagate(False)
-        
-        # Center content frame
-        self.focus_center = tk.Frame(self.focus_overlay, bg="black")
-        self.focus_center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Right spacer (black)
-        right_spacer = tk.Frame(self.focus_overlay, bg="black", width=side_width)
-        right_spacer.pack(side=tk.RIGHT, fill=tk.Y)
-        right_spacer.pack_propagate(False)
-        
-        # Create a new editor widget for focus mode
-        if self.focus_mode_type == "source":
-            self.focus_editor = scrolledtext.ScrolledText(
-                self.focus_center,
-                wrap=tk.WORD,
-                font=(self.theme['source_font'], self.current_font_size),
-                undo=True,
-                padx=20,
-                pady=15,
-                bg=self.theme['source_bg'],
-                fg=self.theme['source_fg'],
-                insertbackground=self.theme['source_fg'],
-                selectbackground="#b3d9ff",
-                selectforeground="#000000",
-                relief=tk.FLAT,
-                borderwidth=0,
-            )
-            self.focus_editor.pack(fill=tk.BOTH, expand=True)
-            self.focus_editor.insert(1.0, self.focus_original_content.rstrip('\n'))
-            self.focus_editor.mark_set(tk.INSERT, self.focus_cursor_pos)
-            self.focus_editor.see(self.focus_cursor_pos)
-            self.focus_editor.focus_set()
-        else:
-            # Visual mode - create a visual viewer
-            self.focus_editor = MarkdownVisualWidget(
-                self.focus_center,
-                base_path=os.path.dirname(self.current_tab.file_path) if self.current_tab.file_path else os.getcwd(),
-                on_content_change=None
-            )
-            self.focus_editor.pack(fill=tk.BOTH, expand=True)
-            self.focus_editor.apply_theme(self.theme)
-            self.focus_editor.set_content(self.focus_original_content)
-        
-        # Go fullscreen
+        self.outer_paned.pack_configure(padx=0, pady=0)
+
+        # Hide the tab strip but keep the notebook (and every tab widget) intact
+        style = ttk.Style()
+        style.layout('Hidden.TNotebook.Tab', [])
+        style.configure('Hidden.TNotebook', borderwidth=0, tabmargins=0)
+        self.notebook.configure(style='Hidden.TNotebook')
+
+        desk = self._fullscreen_desk_color()
+        self.configure(bg=desk)
+        for tab in self.tabs:
+            tab.apply_desk_color(desk)
+
         self.attributes('-fullscreen', True)
-        
-        # Bind Escape to exit focus mode
-        self.focus_escape_binding = self.bind("<Escape>", lambda e: self._exit_focus_mode())
-    
+        self.focus_escape_binding = self.bind("<Escape>", self._on_fullscreen_escape)
+        self._show_fullscreen_hint()
+        self.after(100, self._focus_active_editor)
+
+    def _on_fullscreen_escape(self, event=None):
+        """Escape leaves full screen, unless a dialog window has the focus."""
+        widget = self.focus_get()
+        if widget is not None and widget.winfo_toplevel() is not self:
+            return
+        self._exit_focus_mode()
+
+    def _show_fullscreen_hint(self):
+        self._hide_fullscreen_hint()
+        self._fs_hint = tk.Label(self, text="Press Esc or F11 to exit full screen", bg="#222222", fg="#f0f0f0",
+                                 font=(SANS_FONT, 10), padx=14, pady=6)
+        self._fs_hint.place(relx=0.5, rely=0.96, anchor='s')
+        self._fs_hint_job = self.after(2500, self._hide_fullscreen_hint)
+
+    def _hide_fullscreen_hint(self):
+        job = getattr(self, '_fs_hint_job', None)
+        if job:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+            self._fs_hint_job = None
+        if self._fs_hint is not None:
+            self._fs_hint.destroy()
+            self._fs_hint = None
+
     def _exit_focus_mode(self):
-        """Exit focus mode and restore normal view"""
+        """Leave full screen and restore the normal window chrome."""
         if not self.focus_mode_active:
             return
-        
-        # Get content from focus editor and sync back
-        if self.focus_mode_type == "source":
-            new_content = self.focus_editor.get(1.0, tk.END).rstrip('\n')
-            cursor_pos = self.focus_editor.index(tk.INSERT)
-            
-            # Update the original editor
-            self.current_tab.source_editor.delete(1.0, tk.END)
-            self.current_tab.source_editor.insert(1.0, new_content)
-            self.current_tab.source_editor.mark_set(tk.INSERT, cursor_pos)
-            self.current_tab.source_editor.see(cursor_pos)
-            
-            # Check if content changed
-            if new_content != self.focus_original_content.rstrip('\n'):
-                self.current_tab.is_modified = True
-                self._update_tab_title(self.current_tab)
-        else:
-            # Visual mode - get content and update
-            new_content = self.focus_editor.get_content()
-            if new_content != self.focus_original_content:
-                self.current_tab.source_editor.delete(1.0, tk.END)
-                self.current_tab.source_editor.insert(1.0, new_content)
-                self.current_tab.visual_viewer.set_content(new_content)
-                self.current_tab.is_modified = True
-                self._update_tab_title(self.current_tab)
-        
-        # Unbind Escape
+        self.focus_mode_active = False
+        self._hide_fullscreen_hint()
+
         if self.focus_escape_binding:
             self.unbind("<Escape>", self.focus_escape_binding)
             self.focus_escape_binding = None
-        
-        # Exit fullscreen
+
         self.attributes('-fullscreen', False)
-        
-        # Destroy the overlay and focus editor
-        if self.focus_overlay:
-            self.focus_overlay.destroy()
-            self.focus_overlay = None
-            self.focus_editor = None
-        
-        # Restore root window background
+
+        # Restore chrome in pack order: toolbar (top), status bar (bottom), then the paned area
         self.configure(bg="#f5f5f5")
-        
-        # Restore UI elements in correct order
         self.config(menu=self.menubar)
-        self.toolbar_frame.pack(fill=tk.X, padx=5, pady=2)
-        self.main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
-        
-        # Restore window state/geometry
-        if self.pre_focus_state == 'zoomed':
+        self.toolbar_frame.pack(fill=tk.X, padx=5, pady=2, before=self.outer_paned)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, before=self.outer_paned)
+        self.outer_paned.pack_configure(padx=5, pady=5)
+        self.notebook.configure(style='TNotebook')
+        for tab in self.tabs:
+            tab.apply_desk_color(self.theme.get('desk_bg', '#d9dce1'))
+
+        pre = self._pre_fs or {}
+        self.update_idletasks()
+        if pre.get('state') == 'zoomed':
             self.state('zoomed')
-        else:
-            self.geometry(self.pre_focus_geometry)
-        
-        # Clear state
-        self.focus_mode_active = False
-        self.focus_center = None
-        
+        elif pre.get('geometry'):
+            self.geometry(pre['geometry'])
+
+        if pre.get('outline') and not self.outline_visible:
+            self._toggle_outline_panel()
+        if pre.get('ai') and not self.ai_sidebar_visible:
+            self._toggle_ai_sidebar()
+        self._pre_fs = None
+
+        self._focus_active_editor()
         self._set_status("Ready")
     
     # === File Operations ===
@@ -3910,21 +4327,13 @@ class MarkdownNotepad(tk.Tk):
     def _apply_theme(self, new_theme):
         """Apply a new theme to the application"""
         self.theme = new_theme
+        self.theme['zoom_pct'] = self.zoom_pct
         self._save_theme()
         
-        # Apply to all tabs
+        # Apply to all tabs (each tab re-styles its source editor, syntax tags and visual page)
         for tab in self.tabs:
-            tab.source_editor.config(
-                bg=self.theme['source_bg'],
-                fg=self.theme['source_fg'],
-                insertbackground=self.theme['source_fg'],
-                font=(self.theme['source_font'], self.theme['source_font_size'])
-            )
-            tab.visual_viewer.apply_theme(self.theme)
-        
-        # Update current font size for zoom
-        self.current_font_size = self.theme['source_font_size']
-        self._apply_font_size()
+            tab.apply_theme(self.theme)
+            tab.set_zoom(self.zoom_pct / 100.0)
         
         self._set_status("Theme applied")
 
@@ -3937,22 +4346,32 @@ class ThemeDialog(tk.Toplevel):
         'Light': {
             'source_bg': '#fefefe', 'source_fg': '#1a1a1a',
             'visual_bg': '#ffffff', 'visual_fg': '#1a1a1a',
+            'desk_bg': '#d9dce1',
+        },
+        'Paper (Word)': {
+            'source_bg': '#ffffff', 'source_fg': '#000000',
+            'visual_bg': '#ffffff', 'visual_fg': '#000000',
+            'desk_bg': '#e6e6e6',
         },
         'Dark': {
             'source_bg': '#1e1e1e', 'source_fg': '#d4d4d4',
             'visual_bg': '#252526', 'visual_fg': '#cccccc',
+            'desk_bg': '#141414',
         },
         'Sepia': {
             'source_bg': '#f4ecd8', 'source_fg': '#5b4636',
             'visual_bg': '#f9f5eb', 'visual_fg': '#5b4636',
+            'desk_bg': '#cdbf9f',
         },
         'Solarized Light': {
             'source_bg': '#fdf6e3', 'source_fg': '#657b83',
             'visual_bg': '#fdf6e3', 'visual_fg': '#657b83',
+            'desk_bg': '#eee8d5',
         },
         'Solarized Dark': {
             'source_bg': '#002b36', 'source_fg': '#839496',
             'visual_bg': '#073642', 'visual_fg': '#93a1a1',
+            'desk_bg': '#001f27',
         },
     }
     
@@ -3963,9 +4382,9 @@ class ThemeDialog(tk.Toplevel):
         self.on_apply = on_apply
         
         self.title("Theme Settings")
-        self.geometry("500x580")
+        self.geometry("520x680")
         self.resizable(True, True)
-        self.minsize(450, 550)  # Set minimum size to prevent UI elements from overlapping
+        self.minsize(470, 650)  # Set minimum size to prevent UI elements from overlapping
         self.transient(parent)
         
         self._setup_ui()
@@ -4070,6 +4489,19 @@ class ThemeDialog(tk.Toplevel):
         vsize_spin = ttk.Spinbox(vfont_frame, from_=8, to=24, width=5, textvariable=self.visual_size_var)
         vsize_spin.pack(side=tk.LEFT, padx=2)
         
+        # Desk (background behind the page)
+        desk_frame = ttk.LabelFrame(main_frame, text="Page Layout", padding=10)
+        desk_frame.pack(fill=tk.X, pady=5)
+        
+        dbg_frame = ttk.Frame(desk_frame)
+        dbg_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(dbg_frame, text="Desk colour:", width=12).pack(side=tk.LEFT)
+        self.desk_bg_var = tk.StringVar(value=self.theme.get('desk_bg', '#d9dce1'))
+        self.desk_bg_preview = tk.Label(dbg_frame, width=3, bg=self.desk_bg_var.get(), relief=tk.SUNKEN)
+        self.desk_bg_preview.pack(side=tk.LEFT, padx=5)
+        ttk.Entry(dbg_frame, textvariable=self.desk_bg_var, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(dbg_frame, text="Choose...", command=lambda: self._choose_color('desk_bg')).pack(side=tk.LEFT, padx=2)
+        
         # Font Detection Section
         detect_frame = ttk.Frame(main_frame)
         detect_frame.pack(fill=tk.X, pady=(10, 0))
@@ -4122,30 +4554,18 @@ class ThemeDialog(tk.Toplevel):
     
     def _choose_color(self, key):
         """Open color chooser for the specified key"""
-        # Get current color
-        if key == 'source_bg':
-            current = self.source_bg_var.get()
-        elif key == 'source_fg':
-            current = self.source_fg_var.get()
-        elif key == 'visual_bg':
-            current = self.visual_bg_var.get()
-        else:
-            current = self.visual_fg_var.get()
-        
-        color = colorchooser.askcolor(color=current, title=f"Choose {key.replace('_', ' ').title()}")
+        targets = {
+            'source_bg': (self.source_bg_var, self.source_bg_preview),
+            'source_fg': (self.source_fg_var, self.source_fg_preview),
+            'visual_bg': (self.visual_bg_var, self.visual_bg_preview),
+            'visual_fg': (self.visual_fg_var, self.visual_fg_preview),
+            'desk_bg': (self.desk_bg_var, self.desk_bg_preview),
+        }
+        var, preview = targets[key]
+        color = colorchooser.askcolor(color=var.get(), title=f"Choose {key.replace('_', ' ').title()}")
         if color[1]:
-            if key == 'source_bg':
-                self.source_bg_var.set(color[1])
-                self.source_bg_preview.config(bg=color[1])
-            elif key == 'source_fg':
-                self.source_fg_var.set(color[1])
-                self.source_fg_preview.config(bg=color[1])
-            elif key == 'visual_bg':
-                self.visual_bg_var.set(color[1])
-                self.visual_bg_preview.config(bg=color[1])
-            else:
-                self.visual_fg_var.set(color[1])
-                self.visual_fg_preview.config(bg=color[1])
+            var.set(color[1])
+            preview.config(bg=color[1])
     
     def _apply_preset(self, preset_name):
         """Apply a preset theme"""
@@ -4159,18 +4579,23 @@ class ThemeDialog(tk.Toplevel):
         self.visual_bg_preview.config(bg=preset['visual_bg'])
         self.visual_fg_var.set(preset['visual_fg'])
         self.visual_fg_preview.config(bg=preset['visual_fg'])
+        if 'desk_bg' in preset:
+            self.desk_bg_var.set(preset['desk_bg'])
+            self.desk_bg_preview.config(bg=preset['desk_bg'])
     
     def _apply(self):
-        """Apply the current settings"""
+        """Apply the current settings (merged into the existing theme so other keys survive)"""
         self.theme = {
+            **self.theme,
             'source_bg': self.source_bg_var.get(),
             'source_fg': self.source_fg_var.get(),
-            'source_font': self.source_font_var.get(),
+            'source_font': self.source_font_var.get() or MONO_FONT,
             'source_font_size': self.source_size_var.get(),
             'visual_bg': self.visual_bg_var.get(),
             'visual_fg': self.visual_fg_var.get(),
-            'visual_font': self.visual_font_var.get(),
+            'visual_font': self.visual_font_var.get() or VISUAL_FONT,
             'visual_font_size': self.visual_size_var.get(),
+            'desk_bg': self.desk_bg_var.get(),
         }
         self.on_apply(self.theme)
         self.destroy()
@@ -4183,14 +4608,16 @@ class ThemeDialog(tk.Toplevel):
         self.source_bg_preview.config(bg=default['source_bg'])
         self.source_fg_var.set(default['source_fg'])
         self.source_fg_preview.config(bg=default['source_fg'])
-        self.source_font_var.set(default['source_font'])
+        self.source_font_var.set(default['source_font'] or MONO_FONT)
         self.source_size_var.set(default['source_font_size'])
         self.visual_bg_var.set(default['visual_bg'])
         self.visual_bg_preview.config(bg=default['visual_bg'])
         self.visual_fg_var.set(default['visual_fg'])
         self.visual_fg_preview.config(bg=default['visual_fg'])
-        self.visual_font_var.set(default['visual_font'])
+        self.visual_font_var.set(default['visual_font'] or VISUAL_FONT)
         self.visual_size_var.set(default['visual_font_size'])
+        self.desk_bg_var.set(default['desk_bg'])
+        self.desk_bg_preview.config(bg=default['desk_bg'])
 
 
 class InsertImageDialog(tk.Toplevel):
@@ -5038,6 +5465,13 @@ class FindDialog(tk.Toplevel):
 
 def main():
     """Main entry point"""
+    if os.name == 'nt':
+        # Crisp text on scaled displays
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
     app = MarkdownNotepad()
     import sys
     if len(sys.argv) > 1:
