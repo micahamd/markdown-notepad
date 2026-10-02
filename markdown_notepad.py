@@ -918,7 +918,9 @@ class PageView(tk.Frame):
 
     def _wheel(self, event):
         if self.text is not None:
-            self.text.yview_scroll(int(-event.delta / 120) * 4, 'units')
+            delta = int(-event.delta / 40) if event.delta else 0
+            if delta:
+                self.text.yview_scroll(delta, 'units')
         return 'break'
 
     def _ctrl_wheel(self, event):
@@ -1116,7 +1118,9 @@ class MarkdownVisualWidget(tk.Frame):
 
     def _on_mousewheel(self, event):
         """Handle mousewheel scrolling"""
-        self.text_widget.yview_scroll(int(-1 * (event.delta / 120)) * 4, "units")
+        delta = int(-event.delta / 40) if event.delta else 0
+        if delta:
+            self.text_widget.yview_scroll(delta, "units")
         return "break"
     
     def _on_ctrl_mousewheel(self, event):
@@ -2041,7 +2045,7 @@ class MarkdownNotepad(tk.Tk):
         ui_scale = max(1.0, self.winfo_fpixels('1i') / 96.0)
         self.geometry(f"{int(1280 * ui_scale)}x{int(820 * ui_scale)}")
         self.minsize(int(760 * ui_scale), int(520 * ui_scale))
-        self.configure(bg="#f5f5f5")
+        self.configure(bg=self.DEFAULT_THEME.get('desk_bg', '#d9dce1'))
         
         # Application state - now tab-based
         self.tabs = []  # List of DocumentTab instances
@@ -2229,11 +2233,10 @@ class MarkdownNotepad(tk.Tk):
         self.notebook = ttk.Notebook(self.content_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
         
-        # Bind tab change event
+        # Configure tab events
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-        
-        # Configure right-click menu for tabs
         self.notebook.bind("<Button-3>", self._show_tab_context_menu)
+        self.notebook.bind("<Button-2>", self._on_tab_middle_click)
         
         # Right pane: AI Sidebar (initially hidden)
         self.ai_sidebar = None
@@ -2247,14 +2250,25 @@ class MarkdownNotepad(tk.Tk):
     def _setup_styles(self):
         """Configure ttk look & feel (fonts, toolbar buttons, tabs, status bar)"""
         style = ttk.Style()
-        if style.theme_use() == 'default' and 'clam' in style.theme_names():
+        if os.name == 'nt' and 'vista' in style.theme_names():
+            try:
+                style.theme_use('vista')
+            except Exception:
+                if 'clam' in style.theme_names():
+                    style.theme_use('clam')
+        elif style.theme_use() == 'default' and 'clam' in style.theme_names():
             style.theme_use('clam')
-        for name in ('TkDefaultFont', 'TkMenuFont'):
+
+        for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont'):
             try:
                 tkfont.nametofont(name).configure(family=SANS_FONT, size=10)
             except Exception:
                 pass
-        style.configure("Toolbar.TButton", padding=(8, 4), width=0)
+
+        if style.theme_use() == 'clam':
+            style.configure('Vertical.TScrollbar', arrowsize=12)
+
+        style.configure("Toolbar.TButton", relief='flat', padding=(6, 3), width=0)
         style.configure("Toolbar.Toolbutton", padding=(10, 4))
         style.configure("TNotebook.Tab", padding=(14, 6))
         style.configure("Status.TLabel", font=(SANS_FONT, 9))
@@ -2532,6 +2546,7 @@ class MarkdownNotepad(tk.Tk):
         zoom_menu.add_separator()
         zoom_menu.add_command(label="Fit Width", command=self.zoom_fit_width)
         self.zoom_label.config(menu=zoom_menu)
+        ToolTip(self.zoom_label, "Zoom level (click for presets, Ctrl+0 to reset)")
         
         zoom_in_btn = ttk.Button(self.status_bar, text="+", style="Zoom.TButton", command=self.zoom_in)
         zoom_in_btn.pack(side=tk.RIGHT, pady=1)
@@ -2539,6 +2554,7 @@ class MarkdownNotepad(tk.Tk):
         self.zoom_scale = ttk.Scale(self.status_bar, from_=25, to=300, orient=tk.HORIZONTAL, length=110,
                                     command=self._on_zoom_scale)
         self.zoom_scale.pack(side=tk.RIGHT, padx=4)
+        ToolTip(self.zoom_scale, "Zoom: 25% – 400% (Ctrl+MouseWheel)")
         zoom_out_btn = ttk.Button(self.status_bar, text="\u2212", style="Zoom.TButton", command=self.zoom_out)
         zoom_out_btn.pack(side=tk.RIGHT, pady=1)
         ToolTip(zoom_out_btn, "Zoom Out (Ctrl+-)")
@@ -2596,6 +2612,7 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-minus>", lambda e: self.zoom_out())
         self.bind("<Control-0>", lambda e: self.zoom_reset())
         self.bind("<Control-parenright>", lambda e: self.zoom_fit_width())  # Ctrl+Shift+0
+        self.bind("<Control-Shift-Key-0>", lambda e: self.zoom_fit_width())
         
         # AI sidebar toggle
         self.bind("<Control-A>", lambda e: self._toggle_ai_sidebar())  # Ctrl+Shift+A
@@ -3338,7 +3355,7 @@ class MarkdownNotepad(tk.Tk):
             tab_id = self.tabs.index(tab)
             name = tab.get_display_name()
             if tab.is_modified:
-                name = f"*{name}"
+                name = f"● {name}"
             self.notebook.tab(tab, text=name)
         except:
             pass
@@ -3372,6 +3389,15 @@ class MarkdownNotepad(tk.Tk):
                 menu.add_command(label="New Tab", command=self.new_tab)
                 menu.tk_popup(event.x_root, event.y_root)
         except:
+            pass
+    
+    def _on_tab_middle_click(self, event):
+        """Middle-click on a tab closes it"""
+        try:
+            clicked_tab_idx = self.notebook.index(f"@{event.x},{event.y}")
+            if 0 <= clicked_tab_idx < len(self.tabs):
+                self.close_tab(self.tabs[clicked_tab_idx])
+        except Exception:
             pass
     
     def _close_other_tabs(self, keep_tab):
@@ -4328,6 +4354,7 @@ class MarkdownNotepad(tk.Tk):
         """Apply a new theme to the application"""
         self.theme = new_theme
         self.theme['zoom_pct'] = self.zoom_pct
+        self.configure(bg=self.theme.get('desk_bg', '#d9dce1'))
         self._save_theme()
         
         # Apply to all tabs (each tab re-styles its source editor, syntax tags and visual page)
