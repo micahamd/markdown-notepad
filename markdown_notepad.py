@@ -1189,11 +1189,13 @@ class MarkdownVisualWidget(tk.Frame):
             self.text_widget.config(state=tk.DISABLED)
             self._restore_yview()
     
-    # Inline markdown pattern: captures bold, italic, code, links in order
+    # Inline markdown pattern: captures bold, italic, highlight, code, links in order
     _INLINE_RE = re.compile(
         r'(\*\*|__)(?P<bold>.+?)\1'        # **bold** or __bold__
         r'|(?<!\*)\*(?!\*)(?P<italic>.+?)(?<!\*)\*(?!\*)'  # *italic*
         r'|(?<!_)_(?!_)(?P<italic2>.+?)(?<!_)_(?!_)'       # _italic_
+        r'|==(?P<highlight>[^=\n]+)=='     # ==highlight==
+        r'|<mark>(?P<mark_text>.*?)</mark>' # <mark>highlight</mark>
         r'|`(?P<code>[^`]+)`'              # `code`
         r'|\[(?P<link_label>[^\]]+)\]\([^\)]+\)'            # [label](url)
     )
@@ -1218,6 +1220,10 @@ class MarkdownVisualWidget(tk.Frame):
                 tw.insert(tk.END, m.group('italic'), base_tags + ('italic',) if base_tags else 'italic')
             elif m.group('italic2') is not None:
                 tw.insert(tk.END, m.group('italic2'), base_tags + ('italic',) if base_tags else 'italic')
+            elif m.group('highlight') is not None:
+                tw.insert(tk.END, m.group('highlight'), base_tags + ('highlight',) if base_tags else 'highlight')
+            elif m.group('mark_text') is not None:
+                tw.insert(tk.END, m.group('mark_text'), base_tags + ('highlight',) if base_tags else 'highlight')
             elif m.group('code') is not None:
                 tw.insert(tk.END, m.group('code'), base_tags + ('code',) if base_tags else 'code')
             elif m.group('link_label') is not None:
@@ -1612,6 +1618,9 @@ class MarkdownVisualWidget(tk.Frame):
         # Inline styles
         tw.tag_configure("bold", font=(font_family, self._px(font_size), "bold"))
         tw.tag_configure("italic", font=(font_family, self._px(font_size), "italic"))
+        hl_bg = "#713f12" if is_dark else "#fef08a"
+        hl_fg = "#fef9c3" if is_dark else "#1a1a1a"
+        tw.tag_configure("highlight", background=hl_bg, foreground=hl_fg)
         tw.tag_configure("code", font=(mono, self._px(font_size, 0.9)), background=inline_code_bg,
                          foreground=inline_code_fg, relief=tk.FLAT)
         tw.tag_configure("code_block", font=(mono, self._px(font_size, 0.9)), background=code_bg, foreground=code_fg,
@@ -1828,10 +1837,12 @@ class DocumentTab(ttk.Frame):
             heads = ('#f8fafc', '#e2e8f0', '#cbd5e1', '#cbd5e1')
             bold_fg, italic_fg, link_fg, quote_fg, hr_fg = '#ff7b72', '#d2a8ff', '#79c0ff', '#9ca3af', '#6b7280'
             code_bg, code_fg = '#2d2f3a', '#f38ba8'
+            hl_bg, hl_fg = '#713f12', '#fef9c3'
         else:
             heads = ('#1a1a2e', '#16213e', '#1f4068', '#1b1b2f')
             bold_fg, italic_fg, link_fg, quote_fg, hr_fg = '#d73a49', '#6f42c1', '#0066cc', '#6c757d', '#aaaaaa'
             code_bg, code_fg = '#f0f0f0', '#c7254e'
+            hl_bg, hl_fg = '#fef08a', '#1a1a1a'
         editor = self.source_editor
         # Headers
         editor.tag_configure('syn_h1', font=(mono, px(sz + 8), 'bold'), foreground=heads[0])
@@ -1841,6 +1852,7 @@ class DocumentTab(ttk.Frame):
         # Inline
         editor.tag_configure('syn_bold',        foreground=bold_fg)
         editor.tag_configure('syn_italic',      foreground=italic_fg)
+        editor.tag_configure('syn_highlight',   background=hl_bg, foreground=hl_fg)
         editor.tag_configure('syn_code_inline', font=(mono, px(sz)), background=code_bg, foreground=code_fg)
         editor.tag_configure('syn_code_block',  font=(mono, px(sz)), background='#282c34', foreground='#abb2bf',
                              lmargin1=int(20 * k96))
@@ -1854,7 +1866,7 @@ class DocumentTab(ttk.Frame):
         """Apply markdown syntax highlighting tags to the source editor."""
         editor = self.source_editor
         for tag in ('syn_h1', 'syn_h2', 'syn_h3', 'syn_h4', 'syn_bold', 'syn_italic',
-                    'syn_code_inline', 'syn_code_block', 'syn_link',
+                    'syn_highlight', 'syn_code_inline', 'syn_code_block', 'syn_link',
                     'syn_blockquote', 'syn_list_marker', 'syn_hr'):
             editor.tag_remove(tag, '1.0', tk.END)
 
@@ -1892,6 +1904,8 @@ class DocumentTab(ttk.Frame):
                 editor.tag_add('syn_bold',    f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', line):
                 editor.tag_add('syn_italic',  f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'==([^=\n]+)==', line):
+                editor.tag_add('syn_highlight', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'`([^`]+)`', line):
                 editor.tag_add('syn_code_inline', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'\[([^\]]+)\]\([^\)]+\)', line):
@@ -2416,6 +2430,7 @@ class MarkdownNotepad(tk.Tk):
         menubar.add_cascade(label="Format", menu=format_menu)
         format_menu.add_command(label="Bold", command=lambda: self._insert_format("**", "**"), accelerator="Ctrl+B")
         format_menu.add_command(label="Italic", command=lambda: self._insert_format("*", "*"), accelerator="Ctrl+I")
+        format_menu.add_command(label="Highlight", command=lambda: self._insert_format("==", "=="), accelerator="Ctrl+Shift+H")
         format_menu.add_command(label="Code", command=lambda: self._insert_format("`", "`"), accelerator="Ctrl+`")
         format_menu.add_separator()
         format_menu.add_command(label="Heading 1", command=lambda: self._insert_line_prefix("# "))
@@ -2500,6 +2515,7 @@ class MarkdownNotepad(tk.Tk):
         
         add_format_button("B", lambda: self._insert_format("**", "**"), 3, "Bold (Ctrl+B)")
         add_format_button("I", lambda: self._insert_format("*", "*"), 3, "Italic (Ctrl+I)")
+        add_format_button("HL", lambda: self._insert_format("==", "=="), 3, "Highlight (Ctrl+Shift+H)")
         add_format_button("</>", lambda: self._insert_format("`", "`"), 3, "Inline Code (Ctrl+`)")
         add_format_button("Link", lambda: self._insert_format("[", "](url)"), 4, "Insert Link")
         add_format_button("Image", self.insert_image, 5, "Insert Image (Ctrl+Shift+I)")
@@ -2581,6 +2597,13 @@ class MarkdownNotepad(tk.Tk):
     
     def _setup_bindings(self):
         """Setup keyboard bindings"""
+        # Neutralize conflicting default Text class bindings (e.g. Ctrl+I inserting tab)
+        try:
+            self.unbind_class("Text", "<Control-Key-i>")
+            self.unbind_class("Text", "<Control-i>")
+        except Exception:
+            pass
+
         self.bind("<Control-n>", lambda e: self.new_tab())
         self.bind("<Control-o>", lambda e: self.open_file())
         self.bind("<Control-O>", lambda e: self.open_with_markitdown())  # Ctrl+Shift+O
@@ -2596,7 +2619,14 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-h>", lambda e: self.find_replace())
         self.bind("<Control-g>", lambda e: self.goto_line())
         self.bind("<Control-b>", lambda e: self._insert_format("**", "**"))
+        self.bind("<Control-B>", lambda e: self._insert_format("**", "**"))
         self.bind("<Control-i>", lambda e: self._insert_format("*", "*"))
+        self.bind("<Control-Key-i>", lambda e: self._insert_format("*", "*"))
+        self.bind("<Control-grave>", lambda e: self._insert_format("`", "`"))
+        self.bind("<Control-H>", lambda e: self._insert_format("==", "=="))
+        self.bind("<Control-Shift-H>", lambda e: self._insert_format("==", "=="))
+        self.bind("<Control-Shift-h>", lambda e: self._insert_format("==", "=="))
+        self.bind("<Control-Shift-Key-H>", lambda e: self._insert_format("==", "=="))
         self.bind("<Control-Key-1>", lambda e: self._show_source_mode())
         self.bind("<Control-Key-2>", lambda e: self._show_visual_mode())
         self.bind("<Control-e>", lambda e: self._toggle_mode())
@@ -2976,6 +3006,13 @@ class MarkdownNotepad(tk.Tk):
         except tk.TclError:
             pass
         
+        # Formatting actions (source mode with selection)
+        if has_selection and self.current_tab and self.current_tab.current_mode == "source":
+            menu.add_separator()
+            menu.add_command(label="Bold", command=lambda: self._insert_format("**", "**"), accelerator="Ctrl+B")
+            menu.add_command(label="Italic", command=lambda: self._insert_format("*", "*"), accelerator="Ctrl+I")
+            menu.add_command(label="Highlight", command=lambda: self._insert_format("==", "=="), accelerator="Ctrl+Shift+H")
+
         # AI-powered actions (only when text is selected and AI is available)
         if has_selection and AI_CHAT_AVAILABLE:
             menu.add_separator()
@@ -3281,6 +3318,20 @@ class MarkdownNotepad(tk.Tk):
         # Right-click context menu on editor
         tab.source_editor.bind("<Button-3>", self._show_editor_context_menu)
         tab.visual_viewer.text_widget.bind("<Button-3>", self._show_editor_context_menu)
+
+        # Formatting keyboard shortcuts (direct on source editor with propagation break)
+        for seq, pfx, sfx in (
+            ("<Control-b>", "**", "**"),
+            ("<Control-B>", "**", "**"),
+            ("<Control-i>", "*", "*"),
+            ("<Control-Key-i>", "*", "*"),
+            ("<Control-grave>", "`", "`"),
+            ("<Control-H>", "==", "=="),
+            ("<Control-Shift-H>", "==", "=="),
+            ("<Control-Shift-h>", "==", "=="),
+            ("<Control-Shift-Key-H>", "==", "=="),
+        ):
+            tab.source_editor.bind(seq, lambda e, p=pfx, s=sfx: self._insert_format(p, s))
     
     def close_tab(self, tab=None):
         """Close a tab"""
@@ -4136,39 +4187,111 @@ class MarkdownNotepad(tk.Tk):
     # === Format Operations ===
     
     def _insert_format(self, prefix, suffix):
-        """Insert formatting around selected text"""
+        """Insert formatting around selected text, or toggle formatting if already applied."""
         if not self.current_tab or self.current_tab.current_mode != "source":
-            return
+            return "break"
         
         editor = self.current_tab.source_editor
+        p_len = len(prefix)
+        s_len = len(suffix)
+        
         try:
-            selected = editor.get(tk.SEL_FIRST, tk.SEL_LAST)
-            editor.delete(tk.SEL_FIRST, tk.SEL_LAST)
-            editor.insert(tk.INSERT, f"{prefix}{selected}{suffix}")
+            first = editor.index(tk.SEL_FIRST)
+            last = editor.index(tk.SEL_LAST)
+            selected = editor.get(first, last)
+            
+            # Case A: Selection itself starts with prefix and ends with suffix (toggle off)
+            is_wrapped_inside = False
+            if prefix == "*" and (selected.startswith("**") or selected.endswith("**")):
+                is_wrapped_inside = False
+            elif len(selected) >= p_len + s_len and selected.startswith(prefix) and selected.endswith(suffix):
+                is_wrapped_inside = True
+
+            if is_wrapped_inside:
+                inner = selected[p_len:-s_len]
+                editor.delete(first, last)
+                editor.insert(first, inner)
+                new_last = f"{first}+{len(inner)}c"
+                editor.tag_add(tk.SEL, first, new_last)
+                editor.mark_set(tk.INSERT, new_last)
+                self.current_tab.is_modified = True
+                self._update_tab_title(self.current_tab)
+                self._schedule_syntax_highlight()
+                return "break"
+
+            # Case B: Prefix and suffix are immediately outside the selection (toggle off)
+            can_unwrap_outside = False
+            before = editor.get(f"{first}-{p_len}c", first)
+            after = editor.get(last, f"{last}+{s_len}c")
+            if before == prefix and after == suffix:
+                can_unwrap_outside = True
+                # Ensure single asterisk italic does not strip from bold (**)
+                if prefix == "*":
+                    char_before = editor.get(f"{first}-{p_len+1}c", f"{first}-{p_len}c")
+                    char_after = editor.get(f"{last}+{s_len}c", f"{last}+{s_len+1}c")
+                    if char_before == "*" or char_after == "*":
+                        can_unwrap_outside = False
+
+            if can_unwrap_outside:
+                editor.delete(last, f"{last}+{s_len}c")
+                editor.delete(f"{first}-{p_len}c", first)
+                new_first = f"{first}-{p_len}c"
+                new_last = f"{new_first}+{len(selected)}c"
+                editor.tag_add(tk.SEL, new_first, new_last)
+                editor.mark_set(tk.INSERT, new_last)
+                self.current_tab.is_modified = True
+                self._update_tab_title(self.current_tab)
+                self._schedule_syntax_highlight()
+                return "break"
+
+            # Case C: Apply formatting around selected text
+            editor.delete(first, last)
+            editor.insert(first, f"{prefix}{selected}{suffix}")
+            new_sel_first = f"{first}+{p_len}c"
+            new_sel_last = f"{first}+{p_len + len(selected)}c"
+            editor.tag_add(tk.SEL, new_sel_first, new_sel_last)
+            editor.mark_set(tk.INSERT, new_sel_last)
+            editor.see(new_sel_last)
+            self.current_tab.is_modified = True
+            self._update_tab_title(self.current_tab)
+            self._schedule_syntax_highlight()
+            return "break"
+
         except tk.TclError:
-            # No selection, just insert the formatting
-            editor.insert(tk.INSERT, f"{prefix}{suffix}")
-            # Move cursor between the markers
-            pos = editor.index(tk.INSERT)
-            line, col = pos.split('.')
-            new_col = int(col) - len(suffix)
-            editor.mark_set(tk.INSERT, f"{line}.{new_col}")
+            # No selection, insert the formatting markers and place cursor in between
+            insert_pos = editor.index(tk.INSERT)
+            editor.insert(insert_pos, f"{prefix}{suffix}")
+            new_pos = f"{insert_pos}+{p_len}c"
+            editor.mark_set(tk.INSERT, new_pos)
+            editor.see(new_pos)
+            self.current_tab.is_modified = True
+            self._update_tab_title(self.current_tab)
+            self._schedule_syntax_highlight()
+            return "break"
     
     def _insert_line_prefix(self, prefix):
         """Insert prefix at the beginning of the current line"""
         if not self.current_tab or self.current_tab.current_mode != "source":
-            return
+            return "break"
         
         editor = self.current_tab.source_editor
         pos = editor.index(tk.INSERT)
         line = pos.split('.')[0]
         editor.insert(f"{line}.0", prefix)
+        self.current_tab.is_modified = True
+        self._update_tab_title(self.current_tab)
+        self._schedule_syntax_highlight()
+        return "break"
     
     def _insert_text(self, text):
         """Insert text at cursor position"""
         if not self.current_tab or self.current_tab.current_mode != "source":
-            return
+            return "break"
         self.current_tab.source_editor.insert(tk.INSERT, text)
+        self.current_tab.is_modified = True
+        self._update_tab_title(self.current_tab)
+        self._schedule_syntax_highlight()
+        return "break"
     
     # === Image Management ===
     
