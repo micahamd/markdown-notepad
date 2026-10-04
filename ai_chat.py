@@ -15,6 +15,10 @@ import shutil
 import subprocess
 import threading
 import queue
+import time
+import difflib
+import webbrowser
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
@@ -351,6 +355,29 @@ class AISettings:
     @temperature.setter
     def temperature(self, value: float):
         self.settings['temperature'] = value
+    
+    @property
+    def chat_font_size(self) -> int:
+        try:
+            return max(8, min(24, int(self.settings.get('chat_font_size', 10))))
+        except (TypeError, ValueError):
+            return 10
+    
+    @chat_font_size.setter
+    def chat_font_size(self, value: int):
+        self.settings['chat_font_size'] = max(8, min(24, int(value)))
+    
+    @property
+    def history_limit(self) -> int:
+        """Number of trailing chat messages sent as context (0 = all)."""
+        try:
+            return max(0, int(self.settings.get('history_limit', 10)))
+        except (TypeError, ValueError):
+            return 10
+    
+    @history_limit.setter
+    def history_limit(self, value: int):
+        self.settings['history_limit'] = max(0, int(value))
     
     @property
     def image_max_size(self) -> tuple:
@@ -3394,53 +3421,145 @@ def get_chat_history_manager() -> ChatHistoryManager:
 # Chat Sidebar Widget
 # =============================================================================
 
-def _insert_inline(widget, text: str):
-    """Insert one line of text into widget with bold/italic/code tags applied."""
-    pattern = re.compile(
-        r'(`[^`]+`)'
-        r'|(\*\*[^*]+\*\*)'
-        r'|(__[^_]+__)'
-        r'|(\*[^*]+\*)'
-        r'|(_[^_]+_)'
-    )
-    pos = 0
-    for m in pattern.finditer(text):
-        if m.start() > pos:
-            widget.insert(tk.END, text[pos:m.start()])
-        raw = m.group(0)
-        if raw.startswith('`'):
-            widget.insert(tk.END, raw[1:-1], 'md_code_inline')
-        elif raw.startswith('**') or raw.startswith('__'):
-            widget.insert(tk.END, raw[2:-2], 'md_bold')
+CHAT_FONT_MIN, CHAT_FONT_MAX, CHAT_FONT_DEFAULT = 8, 24, 10
+_SPINNER_FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+
+# Message separator used by "Edit Chat" mode, e.g.  ──── [user] ────
+_HISTORY_DELIM_RE = re.compile(
+    r'^\s*[─=\-]{3,}\s*\[\s*(user|assistant|system)\s*\]\s*[─=\-]{3,}\s*$', re.IGNORECASE)
+
+
+def serialize_history(messages) -> str:
+    """Render chat messages as one raw-markdown document for Edit Chat mode."""
+    return '\n\n'.join(f'──── [{m.role}] ────\n{m.content}' for m in messages)
+
+
+def parse_history(text: str, original=None) -> List[ChatMessage]:
+    """Parse Edit Chat text back into messages.
+
+    Metadata (timestamp, images) of unchanged messages is preserved by diffing
+    against *original*; edited messages keep the metadata of the message they
+    replaced; brand-new messages receive a fresh timestamp.
+    """
+    blocks = []
+    role, buf = None, []
+
+    def flush():
+        body = '\n'.join(buf).strip('\n').rstrip()
+        if body.strip():
+            blocks.append((role or 'user', body))
+
+    for line in text.split('\n'):
+        m = _HISTORY_DELIM_RE.match(line)
+        if m:
+            flush()
+            role, buf = m.group(1).lower(), []
         else:
-            widget.insert(tk.END, raw[1:-1], 'md_italic')
-        pos = m.end()
-    if pos < len(text):
-        widget.insert(tk.END, text[pos:])
+            buf.append(line)
+    flush()
+
+    orig = list(original or [])
+    a = [(m.role, m.content.strip()) for m in orig]
+    b = [(r, c.strip()) for r, c in blocks]
+    result = [None] * len(blocks)
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            for k in range(i2 - i1):
+                result[j1 + k] = orig[i1 + k]
+        elif tag == 'replace':
+            for k in range(min(i2 - i1, j2 - j1)):
+                o = orig[i1 + k]
+                result[j1 + k] = ChatMessage(role=blocks[j1 + k][0], content=blocks[j1 + k][1],
+                                             images=o.images, timestamp=o.timestamp)
+    for j, (r, c) in enumerate(blocks):
+        if result[j] is None:
+            result[j] = ChatMessage(role=r, content=c)
+    return result
+
+
+def _hex_luminance(hex_color: str) -> float:
+    c = (hex_color or '').lstrip('#')
+    if len(c) == 6:
+        try:
+            r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+            return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+        except ValueError:
+            pass
+    return 1.0
+
+
+def make_chat_palette(theme: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """Derive the chat colour palette (light or dark) from the application theme."""
+    theme = theme or {}
+    bg = theme.get('visual_bg') or '#ffffff'
+    dark = _hex_luminance(bg) < 0.5
+    if dark:
+        pal = dict(
+            dark=True, panel='#181a1f', display_bg=bg, text=theme.get('visual_fg') or '#e6e8ee',
+            muted='#8b93a3', border='#2c303a', input_bg='#20232b', input_fg='#e6e8ee',
+            hdr_user_bg='#22314a', hdr_ai_bg='#1e302a', hdr_sys_bg='#2a2c33',
+            acc_user='#7db4ff', acc_ai='#5fd3a5', acc_sys='#9aa3b2', err='#ff7b72',
+            btn_bg='#2a2e38', btn_fg='#e6e8ee', btn_hover='#363b48',
+            accent='#2563eb', accent_fg='#ffffff', accent_hover='#1d4ed8',
+            code_bg='#0f1115', code_fg='#d6deeb', icode_bg='#2d2f3a', icode_fg='#f38ba8',
+            hl_bg='#713f12', hl_fg='#fef9c3', quote_fg='#a0a8b8', quote_bg='#1d2027',
+            link='#79b8ff', table_bg='#1d2027')
+    else:
+        pal = dict(
+            dark=False, panel='#eef0f3', display_bg=bg, text=theme.get('visual_fg') or '#1a1a1a',
+            muted='#6b7280', border='#d4d8de', input_bg='#ffffff', input_fg='#1a1a1a',
+            hdr_user_bg='#e1ecfb', hdr_ai_bg='#e4f3ea', hdr_sys_bg='#efefef',
+            acc_user='#1d4ed8', acc_ai='#0f7a4a', acc_sys='#525b6a', err='#cc0000',
+            btn_bg='#ffffff', btn_fg='#1a1a1a', btn_hover='#e3e6ea',
+            accent='#2563eb', accent_fg='#ffffff', accent_hover='#1d4ed8',
+            code_bg='#282c34', code_fg='#abb2bf', icode_bg='#eceff3', icode_fg='#c7254e',
+            hl_bg='#fef08a', hl_fg='#1a1a1a', quote_fg='#5b6472', quote_bg='#f3f5f8',
+            link='#0b63ce', table_bg='#f3f5f8')
+    return pal
+
+
+# Inline markdown for the chat renderer (single line; spans never cross lines)
+_CHAT_INLINE_RE = re.compile(
+    r'(?P<code>`[^`\n]+`)'
+    r'|\*\*\*(?P<bi>[^*\n]+?)\*\*\*'
+    r'|\*\*(?!\s)(?P<b>.+?)(?<!\s)\*\*'
+    r'|(?<!\w)__(?!\s)(?P<b2>.+?)(?<!\s)__(?!\w)'
+    r'|(?<!\*)\*(?![\s*])(?P<i>[^*\n]+?)(?<![\s*])\*(?!\*)'
+    r'|(?<!\w)_(?![\s_])(?P<i2>[^_\n]+?)(?<![\s_])_(?!\w)'
+    r'|==(?P<hl>[^=\n]+?)=='
+    r'|\[(?P<ll>[^\]\n]+)\]\((?P<lu>[^)\s]+)\)'
+    r'|(?P<url>https?://[^\s<>)\]]+)'
+)
+_TABLE_ROW_RE = re.compile(r'^\s*\|.*\|\s*$')
+_TABLE_SEP_RE = re.compile(r'^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$')
 
 
 class ChatSidebar(tk.Frame):
     """
     Collapsible AI chat sidebar widget.
-    
-    Integrates with the main application to provide:
-    - Chat input with Enter to send, Ctrl+Enter for newline
-    - Option to include current document content
-    - Option to include chat history
-    - Clear history button
-    - Settings access
+
+    Provides:
+    - Chat input (Shift+Enter / Ctrl+Enter to send)
+    - Options to include the current document and/or chat history
+    - Animated progress indicator, Stop button and line-buffered live markdown rendering
+    - "Edit Chat" mode for editing the raw markdown history
+    - Font size controls and a theme-aware message layout
     - File attachment support
     """
-    
+
+    ROLE_LABELS = {'user': 'You', 'assistant': 'AI', 'system': 'System'}
+
     def __init__(self, parent, get_document_content_callback: Optional[Callable] = None,
                  get_document_images_callback: Optional[Callable] = None,
                  apply_edit_callback: Optional[Callable] = None):
-        super().__init__(parent, bg='#f0f0f0')
-        
+        self._pal = make_chat_palette(None)
+        super().__init__(parent, bg=self._pal['panel'])
+
         self.get_document_content = get_document_content_callback
         self.get_document_images = get_document_images_callback
         self.apply_edit_callback = apply_edit_callback  # Callable(original, replacement, start_idx, end_idx)
-        
+
         # Settings and state
         self.settings = get_ai_settings()
         self.history_manager = get_chat_history_manager()
@@ -3448,30 +3567,51 @@ class ChatSidebar(tk.Frame):
         self.llm_client: Optional[LLMClient] = None
         self.is_generating = False
         self.response_queue = queue.Queue()
-        
-        # Pending selection for "Transfer to Chat" — stores selection context
-        # Dict with keys: 'text', 'start_index', 'end_index' or None
+
+        # Pending selection for "Transfer to Chat" (keys: text, start_index, end_index)
         self.pending_selection: Optional[Dict[str, str]] = None
-        
+
         # Attached files storage: list of dicts with 'path', 'name', 'type', 'content'
         self.attached_files: List[Dict[str, Any]] = []
-        
-        # Streaming / markdown rendering state
-        self._streaming_buffer: str = ''
-        self._streaming_start_index: str = ''
-        
-        # Copy-button message store
-        self._message_texts: list = []
-        
+
+        # Message model (source of truth for display / edit mode / copy buttons)
+        self._messages: List[ChatMessage] = []
+        self._link_counter = 0
+
+        # Generation state
+        self._gen_id = 0
+        self._gen_doc_id: Optional[str] = None
+        self._gen_visible = False
+        self._gen_t0 = 0.0
+        self._cancel = threading.Event()
+        self._spin = 0
+        self._tick_id = None
+        self._pending_active = False
+        self._stream_msg: Optional[ChatMessage] = None
+        self._stream_buf = ''
+        self._stream_text = ''
+        self._stream_state: Dict[str, Any] = {}
+
+        # UI state
+        self._fs = self.settings.chat_font_size
+        self._editing = False
+        self._edit_original = ''
+        self._themed: list = []   # (widget, {option: palette_key})
+        self._font_save_id = None
+
         # Initialize LLM client
         self._init_llm_client()
-        
+
         self._setup_ui()
         self._setup_bindings()
-        
+        self._configure_tags()
+        self._render_all()
+
         # Start response queue processor
         self._process_queue()
-    
+
+    # ------------------------------------------------------------------ setup
+
     def _init_llm_client(self):
         """Initialize or reinitialize the LLM client"""
         new_client = get_llm_client(self.settings)
@@ -3488,164 +3628,983 @@ class ChatSidebar(tk.Frame):
 
     def cleanup(self):
         """Release resources (call when the sidebar is destroyed)."""
+        try:
+            self.commit_edit_mode()
+        except Exception:
+            pass
+        self._cancel.set()
         if isinstance(self.llm_client, CliClient):
             self.llm_client.close_session()
-    
+
+    def _reg(self, widget, **opts):
+        """Register a widget whose options track palette keys, and apply them now."""
+        self._themed.append((widget, opts))
+        self._apply_widget_colors(widget, opts)
+        return widget
+
+    def _apply_widget_colors(self, widget, opts):
+        try:
+            widget.configure(**{k: self._pal[v] for k, v in opts.items()})
+        except tk.TclError:
+            pass
+
+    def _recolor(self):
+        alive = []
+        for widget, opts in self._themed:
+            try:
+                if widget.winfo_exists():
+                    self._apply_widget_colors(widget, opts)
+                    alive.append((widget, opts))
+            except tk.TclError:
+                pass
+        self._themed = alive
+
+    def _flat_button(self, parent, text, command, width=None, accent=False, font_size=9):
+        kw = dict(text=text, command=command, relief=tk.FLAT, bd=0, cursor='hand2',
+                  font=(SANS_FONT, font_size), padx=8, pady=3, takefocus=0)
+        if width:
+            kw['width'] = width
+        btn = tk.Button(parent, **kw)
+        if accent:
+            self._reg(btn, bg='accent', fg='accent_fg', activebackground='accent_hover',
+                      activeforeground='accent_fg', disabledforeground='accent_fg')
+        else:
+            self._reg(btn, bg='btn_bg', fg='btn_fg', activebackground='btn_hover',
+                      activeforeground='btn_fg', disabledforeground='muted')
+        return btn
+
     def _setup_ui(self):
         """Setup the sidebar UI"""
-        # Header
-        header_frame = tk.Frame(self, bg='#e0e0e0')
-        header_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        tk.Label(header_frame, text="AI Assistant", font=(SANS_FONT, 11, 'bold'),
-                 bg='#e0e0e0').pack(side=tk.LEFT, padx=5)
-        
-        # Settings button
-        settings_btn = ttk.Button(header_frame, text="Config", width=6, 
-                                   command=self._open_settings)
-        settings_btn.pack(side=tk.RIGHT, padx=2)
+        P = self._pal
+        self._reg(self, bg='panel')
+
+        # --- Header: title + model badge --------------------------------------
+        header = self._reg(tk.Frame(self), bg='panel')
+        header.pack(fill=tk.X, padx=8, pady=(8, 2))
+        self._reg(tk.Label(header, text="AI Assistant", font=(SANS_FONT, 12, 'bold')),
+                  bg='panel', fg='text').pack(side=tk.LEFT)
+        self.badge_label = self._reg(tk.Label(header, text="", font=(SANS_FONT, 8), anchor=tk.E),
+                                     bg='panel', fg='muted')
+        self.badge_label.pack(side=tk.RIGHT)
+
+        # --- Toolbar: Edit Chat, font size, Clear, Config ---------------------
+        bar = self._reg(tk.Frame(self), bg='panel')
+        bar.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        self.edit_var = tk.BooleanVar(value=False)
+        self.edit_btn = tk.Checkbutton(
+            bar, text="Edit Chat", variable=self.edit_var, command=self._on_edit_toggle,
+            indicatoron=False, relief=tk.FLAT, bd=0, cursor='hand2', takefocus=0,
+            font=(SANS_FONT, 9), padx=8, pady=3)
+        self._reg(self.edit_btn, bg='btn_bg', fg='btn_fg', activebackground='btn_hover',
+                  activeforeground='btn_fg', selectcolor='accent')
+        self.edit_btn.pack(side=tk.LEFT)
+        ToolTip(self.edit_btn, "Toggle raw-markdown editing of this chat's history")
+
+        self.font_minus_btn = self._flat_button(bar, "A\u2212", lambda: self._bump_font(-1), width=3)
+        self.font_minus_btn.pack(side=tk.LEFT, padx=(8, 1))
+        ToolTip(self.font_minus_btn, "Decrease chat text size (Ctrl+Mouse Wheel)")
+        self.font_plus_btn = self._flat_button(bar, "A+", lambda: self._bump_font(1), width=3)
+        self.font_plus_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(self.font_plus_btn, "Increase chat text size (Ctrl+Mouse Wheel)")
+
+        settings_btn = self._flat_button(bar, "Config", self._open_settings)
+        settings_btn.pack(side=tk.RIGHT)
         ToolTip(settings_btn, "Configure AI provider, API keys, and model settings")
-        
-        # Clear history button
-        clear_btn = ttk.Button(header_frame, text="Clear", width=6,
-                                command=self._clear_history)
-        clear_btn.pack(side=tk.RIGHT, padx=2)
-        ToolTip(clear_btn, "Clear chat history for this document")
-        
-        # Chat display area
-        chat_frame = tk.Frame(self, bg='#f0f0f0')
-        chat_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
+        self.clear_btn = self._flat_button(bar, "Clear", self._clear_history)
+        self.clear_btn.pack(side=tk.RIGHT, padx=(0, 4))
+        ToolTip(self.clear_btn, "Clear chat history for this document")
+
+        # --- Display container: chat view <-> raw edit view -------------------
+        self.display_container = self._reg(tk.Frame(self), bg='panel')
+        self.display_container.pack(fill=tk.BOTH, expand=True, padx=8, pady=0)
+
         self.chat_display = scrolledtext.ScrolledText(
-            chat_frame,
-            wrap=tk.WORD,
-            font=(SANS_FONT, 10),
-            bg='#ffffff',
-            fg='#1a1a1a',
-            state=tk.DISABLED,
-            height=15
-        )
+            self.display_container, wrap=tk.WORD, state=tk.DISABLED, height=15,
+            relief=tk.FLAT, bd=0, highlightthickness=1, padx=0, pady=4, cursor='arrow')
+        self._reg(self.chat_display, bg='display_bg', fg='text', highlightbackground='border',
+                  highlightcolor='border', insertbackground='text')
         self.chat_display.pack(fill=tk.BOTH, expand=True)
-        
-        # Configure tags for styling
-        self.chat_display.tag_configure('user', foreground='#0066cc', font=(SANS_FONT, 10, 'bold'))
-        self.chat_display.tag_configure('assistant', foreground='#006600', font=(SANS_FONT, 10, 'bold'))
-        self.chat_display.tag_configure('system', foreground='#666666', font=(SANS_FONT, 9, 'italic'))
-        self.chat_display.tag_configure('error', foreground='#cc0000')
-        self.chat_display.tag_configure('message', font=(SANS_FONT, 10))
-        self.chat_display.tag_configure('md_bold',
-            font=(SANS_FONT, 10, 'bold'), foreground='#1a1a1a')
-        self.chat_display.tag_configure('md_italic',
-            font=(SANS_FONT, 10, 'italic'), foreground='#1a1a1a')
-        self.chat_display.tag_configure('md_code_inline',
-            font=(MONO_FONT, 9), background='#f0f0f0', foreground='#c7254e')
-        self.chat_display.tag_configure('md_code_block',
-            font=(MONO_FONT, 9), background='#282c34', foreground='#abb2bf',
-            lmargin1=10, lmargin2=10, spacing1=4, spacing3=4)
-        self.chat_display.tag_configure('md_h1',
-            font=(SANS_FONT, 14, 'bold'), foreground='#1a1a2e', spacing1=8)
-        self.chat_display.tag_configure('md_h2',
-            font=(SANS_FONT, 12, 'bold'), foreground='#16213e', spacing1=6)
-        self.chat_display.tag_configure('md_h3',
-            font=(SANS_FONT, 11, 'bold'), foreground='#1f4068', spacing1=4)
-        self.chat_display.tag_configure('md_list_item', lmargin1=15, lmargin2=25)
-        self.chat_display.tag_configure('md_blockquote',
-            foreground='#6c757d', font=(SANS_FONT, 10, 'italic'),
-            lmargin1=20, background='#f8f9fa')
-        
-        # Options frame
-        options_frame = tk.Frame(self, bg='#f0f0f0')
-        options_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Include document checkbox
+
+        self.edit_banner = self._reg(tk.Frame(self.display_container), bg='hdr_user_bg')
+        self.edit_banner_label = self._reg(
+            tk.Label(self.edit_banner, text="", font=(SANS_FONT, 8), justify=tk.LEFT,
+                     anchor=tk.W, wraplength=250),
+            bg='hdr_user_bg', fg='text')
+        self.edit_banner_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6, pady=3)
+        self.edit_discard_btn = self._flat_button(self.edit_banner, "Discard", self._discard_edit_mode,
+                                                  font_size=8)
+        self.edit_discard_btn.pack(side=tk.RIGHT, padx=4, pady=3)
+
+        self.edit_text = scrolledtext.ScrolledText(
+            self.display_container, wrap=tk.WORD, undo=True, maxundo=-1, autoseparators=True,
+            relief=tk.FLAT, bd=0, highlightthickness=1, padx=8, pady=6)
+        self._reg(self.edit_text, bg='input_bg', fg='input_fg', highlightbackground='border',
+                  highlightcolor='accent', insertbackground='input_fg')
+
+        # --- Progress bar (indeterminate, shown while generating) -------------
+        self.progress = ttk.Progressbar(self, mode='indeterminate', length=100)
+
+        # --- Options ----------------------------------------------------------
+        self.options_frame = self._reg(tk.Frame(self), bg='panel')
+        self.options_frame.pack(fill=tk.X, padx=8, pady=(6, 0))
+
+        def check(text, var, tip):
+            cb = tk.Checkbutton(self.options_frame, text=text, variable=var, font=(SANS_FONT, 9),
+                                anchor=tk.W, bd=0, highlightthickness=0, takefocus=0)
+            self._reg(cb, bg='panel', fg='text', activebackground='panel', activeforeground='text',
+                      selectcolor='input_bg')
+            ToolTip(cb, tip)
+            return cb
+
         self.include_doc_var = tk.BooleanVar(value=False)
-        self.include_doc_cb = ttk.Checkbutton(
-            options_frame, 
-            text="Include Document",
-            variable=self.include_doc_var
-        )
-        self.include_doc_cb.pack(side=tk.LEFT, padx=(0, 10))
-        ToolTip(self.include_doc_cb, "Send current document content with your message")
-        
-        # Include history checkbox
+        self.include_doc_cb = check("Include Document", self.include_doc_var,
+                                    "Send current document content with your message")
+        self.include_doc_cb.pack(side=tk.LEFT, padx=(0, 8))
         self.include_history_var = tk.BooleanVar(value=True)
-        self.include_history_cb = ttk.Checkbutton(
-            options_frame,
-            text="Include Chat History",
-            variable=self.include_history_var
-        )
+        self.include_history_cb = check("Include Chat History", self.include_history_var,
+                                        "Include previous messages for context")
         self.include_history_cb.pack(side=tk.LEFT)
-        ToolTip(self.include_history_cb, "Include previous messages for context")
-        
-        # Attachments frame (shows attached files)
-        self.attachments_frame = tk.Frame(self, bg='#f0f0f0')
-        self.attachments_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
-        
-        # Attachments label (hidden when no attachments)
-        self.attachments_label = tk.Label(
-            self.attachments_frame, 
-            text="", 
-            bg='#f0f0f0', 
-            fg='#666666',
-            font=('Segoe UI', 9),
-            anchor=tk.W
-        )
+
+        limit_row = self._reg(tk.Frame(self), bg='panel')
+        limit_row.pack(fill=tk.X, padx=8, pady=(0, 2))
+        self._reg(tk.Label(limit_row, text="History sent to the model:", font=(SANS_FONT, 8)),
+                  bg='panel', fg='muted').pack(side=tk.LEFT, padx=(2, 4))
+        self.history_limit_var = tk.StringVar(value=self._limit_to_text(self.settings.history_limit))
+        self.history_limit_cb = ttk.Combobox(limit_row, textvariable=self.history_limit_var, width=5,
+                                             state='readonly',
+                                             values=('2', '4', '6', '10', '20', '40', 'All'))
+        self.history_limit_cb.pack(side=tk.LEFT)
+        self.history_limit_cb.bind('<<ComboboxSelected>>', self._on_history_limit_change)
+        self._reg(tk.Label(limit_row, text="messages", font=(SANS_FONT, 8)),
+                  bg='panel', fg='muted').pack(side=tk.LEFT, padx=4)
+        ToolTip(self.history_limit_cb, "How many of the most recent messages are sent as context")
+
+        # --- Attachments ------------------------------------------------------
+        self.attachments_frame = self._reg(tk.Frame(self), bg='panel')
+        self.attachments_frame.pack(fill=tk.X, padx=8, pady=(0, 2))
+        self.attachments_label = self._reg(
+            tk.Label(self.attachments_frame, text="", font=(SANS_FONT, 9), anchor=tk.W),
+            bg='panel', fg='muted')
         self.attachments_label.pack(fill=tk.X)
-        
-        # Input area
-        input_frame = tk.Frame(self, bg='#f0f0f0')
-        input_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
-        
-        # Button frame for attach and send
-        btn_frame = tk.Frame(input_frame, bg='#f0f0f0')
+
+        # --- Input ------------------------------------------------------------
+        input_frame = self._reg(tk.Frame(self), bg='panel')
+        input_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
+        btn_frame = self._reg(tk.Frame(input_frame), bg='panel')
         btn_frame.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        self.input_text = tk.Text(
-            input_frame,
-            height=3,
-            wrap=tk.WORD,
-            font=('Segoe UI', 10),
-            bg='#ffffff',
-            fg='#1a1a1a'
-        )
+
+        self.input_text = tk.Text(input_frame, height=3, wrap=tk.WORD, relief=tk.FLAT, bd=0,
+                                  highlightthickness=1, padx=8, pady=6, undo=True)
+        self._reg(self.input_text, bg='input_bg', fg='input_fg', highlightbackground='border',
+                  highlightcolor='accent', insertbackground='input_fg')
         self.input_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Attach button
-        self.attach_btn = ttk.Button(btn_frame, text="Attach", command=self._attach_file, width=6)
-        self.attach_btn.pack(side=tk.TOP, padx=(5, 0), pady=2)
+
+        self.input_hint = tk.Label(self.input_text, text="Message\u2026   Shift+Enter to send",
+                                   anchor=tk.W, cursor='xterm')
+        self._reg(self.input_hint, bg='input_bg', fg='muted')
+        self.input_hint.place(x=9, y=6)
+        self.input_hint.bind('<Button-1>', lambda e: self.input_text.focus_set())
+
+        self.attach_btn = self._flat_button(btn_frame, "Attach", self._attach_file, width=6)
+        self.attach_btn.pack(side=tk.TOP, padx=(6, 0), pady=(0, 3))
         ToolTip(self.attach_btn, "Attach image or text file")
-        
-        # Send button
-        self.send_btn = ttk.Button(btn_frame, text="Send", command=self._send_message, width=6)
-        self.send_btn.pack(side=tk.TOP, padx=(5, 0), pady=2)
+        self.send_btn = self._flat_button(btn_frame, "Send", self._send_message, width=6, accent=True)
+        self.send_btn.pack(side=tk.TOP, padx=(6, 0))
         ToolTip(self.send_btn, "Send message (Shift+Enter)")
-        
-        # Selection indicator (shown when text is transferred from editor)
+
+        # --- Selection indicator (shown when text is transferred from editor) --
         self.selection_indicator_frame = tk.Frame(self, bg='#e8f0fe')
-        # Not packed until needed
         self.selection_indicator_label = tk.Label(
             self.selection_indicator_frame, text="", bg='#e8f0fe', fg='#1a73e8',
-            font=(SANS_FONT, 9), anchor=tk.W, cursor='hand2'
-        )
+            font=(SANS_FONT, 9), anchor=tk.W, cursor='hand2')
         self.selection_indicator_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=2)
         self.selection_clear_btn = ttk.Button(
             self.selection_indicator_frame, text="\u2715", width=2,
-            command=self._clear_pending_selection
-        )
+            command=self._clear_pending_selection)
         self.selection_clear_btn.pack(side=tk.RIGHT, padx=(0, 5), pady=2)
 
-        # Status label
-        self.status_label = tk.Label(self, text="Ready", bg='#f0f0f0', fg='#666666',
-                                      font=('Segoe UI', 9))
-        self.status_label.pack(fill=tk.X, padx=5, pady=(0, 5))
-    
+        # --- Status -----------------------------------------------------------
+        self.status_label = self._reg(
+            tk.Label(self, text="Ready", font=(SANS_FONT, 9), anchor=tk.W),
+            bg='panel', fg='muted')
+        self.status_label.pack(fill=tk.X, padx=10, pady=(0, 6))
+
+        self._update_badge()
+        self._apply_input_fonts()
+
     def _setup_bindings(self):
         """Setup keyboard bindings"""
         # Shift+Enter to send, regular Enter for newline
         self.input_text.bind('<Shift-Return>', self._on_shift_enter)
         # Ctrl+Enter also sends for convenience
         self.input_text.bind('<Control-Return>', self._on_shift_enter)
-    
+        for seq in ('<KeyRelease>', '<FocusIn>', '<FocusOut>'):
+            self.input_text.bind(seq, lambda e: self._update_hint(), add='+')
+        for widget in (self.chat_display, self.edit_text, self.input_text):
+            widget.bind('<Control-MouseWheel>', self._on_ctrl_wheel)
+
+    # ---------------------------------------------------------------- theming
+
+    def apply_theme(self, theme: Optional[Dict[str, Any]]):
+        """Re-style the chat from the application theme (light/dark aware)."""
+        self._pal = make_chat_palette(theme)
+        self._recolor()
+        self._configure_tags()
+        if not self.is_generating and not self._editing:
+            self._render_all()
+
+    def _configure_tags(self):
+        """(Re)configure all chat text tags for the current palette and font size."""
+        w, P, S = self.chat_display, self._pal, self._fs
+        sans, mono = SANS_FONT, MONO_FONT
+        pad = 12
+
+        def f(size, *style):
+            return (sans, size, *style) if style else (sans, size)
+
+        w.configure(font=f(S))
+        # Base text (all message text carries 'body' for margins / spacing)
+        w.tag_configure('body', font=f(S), foreground=P['text'], lmargin1=pad, lmargin2=pad,
+                        rmargin=pad, spacing1=1, spacing3=2)
+        w.tag_configure('md_blank', font=f(max(4, S // 2)))
+        w.tag_configure('gap', font=f(-6), background=P['display_bg'])
+        # Role header bands (solid, full width)
+        for role, bg_key, acc_key in (('user', 'hdr_user_bg', 'acc_user'),
+                                      ('assistant', 'hdr_ai_bg', 'acc_ai'),
+                                      ('system', 'hdr_sys_bg', 'acc_sys')):
+            w.tag_configure(f'hdr_{role}', font=f(max(7, S - 1), 'bold'), foreground=P[acc_key],
+                            background=P[bg_key], lmargin1=pad, lmargin2=pad, rmargin=pad,
+                            lmargincolor=P[bg_key], rmargincolor=P[bg_key],
+                            spacing1=2, spacing3=2)
+            w.tag_configure(f'hdrtime_{role}', font=f(max(6, S - 2)), foreground=P['muted'],
+                            background=P[bg_key])
+        w.tag_configure('empty', font=f(S), foreground=P['muted'], justify='center',
+                        spacing1=40, lmargin1=20, lmargin2=20, rmargin=20)
+        w.tag_configure('pending', font=f(S, 'italic'), foreground=P['muted'])
+        w.tag_configure('md_tail', font=f(S), foreground=P['text'])
+        w.tag_configure('md_sys', font=f(max(7, S - 1), 'italic'), foreground=P['muted'])
+        w.tag_configure('md_err', font=f(S), foreground=P['err'])
+        # Headings
+        for n, delta in ((1, 5), (2, 3), (3, 1)):
+            w.tag_configure(f'md_h{n}', font=f(S + delta, 'bold'), foreground=P['text'],
+                            spacing1=8 if n == 1 else 6, spacing3=3)
+        # Lists / quotes / rules / tables
+        for d in range(4):
+            first = pad + 6 + d * 18
+            w.tag_configure(f'md_list{d}', lmargin1=first, lmargin2=first + 16, spacing1=1, spacing3=1)
+        w.tag_configure('md_quote', font=f(S, 'italic'), foreground=P['quote_fg'], background=P['quote_bg'],
+                        lmargin1=pad + 8, lmargin2=pad + 8)
+        w.tag_configure('md_hr', foreground=P['muted'], font=f(max(6, S - 3)))
+        w.tag_configure('md_table', font=(mono, max(7, S - 1)), background=P['table_bg'],
+                        foreground=P['text'], lmargin1=pad + 4, lmargin2=pad + 4, spacing1=0, spacing3=0)
+        w.tag_configure('md_table_head', font=(mono, max(7, S - 1), 'bold'))
+        # Code
+        w.tag_configure('md_code_block', font=(mono, max(7, S - 1)), background=P['code_bg'],
+                        foreground=P['code_fg'], lmargin1=pad + 6, lmargin2=pad + 6, rmargin=pad,
+                        spacing1=0, spacing3=0)
+        w.tag_configure('md_code_inline', font=(mono, max(7, S - 1)), background=P['icode_bg'],
+                        foreground=P['icode_fg'])
+        # Inline styles (created last so they take priority over block tags)
+        w.tag_configure('md_bold', font=f(S, 'bold'))
+        w.tag_configure('md_italic', font=f(S, 'italic'))
+        w.tag_configure('md_bolditalic', font=f(S, 'bold', 'italic'))
+        w.tag_configure('md_highlight', background=P['hl_bg'], foreground=P['hl_fg'])
+        w.tag_configure('md_link', foreground=P['link'], underline=True)
+        # Copy buttons embedded in headers
+        for name in w.window_names():
+            try:
+                w.nametowidget(name).configure(font=f(max(7, S - 2)))
+            except (tk.TclError, KeyError):
+                pass
+        self._apply_input_fonts()
+
+    def _apply_input_fonts(self):
+        S = self._fs
+        self.input_text.configure(font=(SANS_FONT, S))
+        self.input_hint.configure(font=(SANS_FONT, S))
+        self.edit_text.configure(font=(MONO_FONT, max(8, S - 1)))
+        self.edit_banner_label.configure(font=(SANS_FONT, max(7, S - 2)))
+
+    def _update_hint(self):
+        empty = not self.input_text.get('1.0', 'end-1c').strip()
+        if empty and self.focus_get() is not self.input_text:
+            self.input_hint.place(x=9, y=6)
+        elif empty:
+            self.input_hint.place(x=9, y=6)
+        else:
+            self.input_hint.place_forget()
+
+    def _update_badge(self):
+        names = {'anthropic': 'Claude', 'gemini': 'Gemini', 'ollama': 'Ollama', 'deepseek': 'DeepSeek',
+                 'cli': 'CLI', 'agy': 'Antigravity', 'antigravity': 'Antigravity'}
+        prov = names.get(self.settings.provider, self.settings.provider)
+        model = '' if self.settings.provider == 'cli' else (self.settings.model or '')
+        self.badge_label.config(text=f"{prov} \u00b7 {model}" if model else prov)
+
+    # ------------------------------------------------------------- font size
+
+    def _bump_font(self, delta: int):
+        self._set_font_size(self._fs + delta)
+
+    def _on_ctrl_wheel(self, event):
+        self._bump_font(1 if event.delta > 0 else -1)
+        return 'break'
+
+    def _set_font_size(self, size: int):
+        size = max(CHAT_FONT_MIN, min(CHAT_FONT_MAX, int(size)))
+        if size == self._fs:
+            return
+        self._fs = size
+        self._configure_tags()
+        self._flash_status(f"Chat text size: {size} pt")
+        # Persist (debounced) without blocking typing/scrolling
+        if self._font_save_id:
+            self.after_cancel(self._font_save_id)
+        self._font_save_id = self.after(600, self._save_font_size)
+
+    def _save_font_size(self):
+        self._font_save_id = None
+        self.settings.chat_font_size = self._fs
+        self.settings.save()
+
+    # -------------------------------------------------------- history options
+
+    @staticmethod
+    def _limit_to_text(limit: int) -> str:
+        return 'All' if limit <= 0 else str(limit)
+
+    def _on_history_limit_change(self, event=None):
+        text = self.history_limit_var.get()
+        self.settings.history_limit = 0 if text == 'All' else int(text)
+        self.settings.save()
+        if self._editing:
+            self._update_edit_banner()
+
+    def _history_for_api(self) -> List[Dict[str, str]]:
+        """Trailing history (user/assistant only) honouring the configured limit."""
+        hist = [m for m in self._messages if m.role in ('user', 'assistant') and m.content.strip()]
+        limit = self.settings.history_limit
+        if limit > 0:
+            hist = hist[-limit:]
+        while hist and hist[0].role != 'user':   # providers require a leading user turn
+            hist.pop(0)
+        return [{"role": m.role, "content": m.content} for m in hist]
+
+    # ------------------------------------------------------- display helpers
+
+    @contextmanager
+    def _writable(self):
+        w = self.chat_display
+        w.configure(state=tk.NORMAL)
+        try:
+            yield w
+        finally:
+            w.configure(state=tk.DISABLED)
+
+    def _flash_status(self, text: str):
+        self.status_label.config(text=text)
+
+        def restore():
+            if not self.is_generating:
+                self.status_label.config(text="Ready")
+        self.after(1800, restore)
+
+    def _copy_message(self, idx: int):
+        if 0 <= idx < len(self._messages):
+            self.clipboard_clear()
+            self.clipboard_append(self._messages[idx].content)
+            self._flash_status("Copied!")
+
+    def _clear_display(self):
+        """Clear the chat display (does not touch stored history)."""
+        with self._writable() as w:
+            w.delete('1.0', tk.END)
+
+    def _render_all(self):
+        """Redraw every stored message from the model (history load, theme, edit exit)."""
+        y = self.chat_display.yview()[0]
+        self._clear_display()
+        if not self._messages:
+            self._draw_empty_state()
+        for idx, msg in enumerate(self._messages):
+            self._draw_message(msg.role, msg.content, msg.timestamp, idx)
+        self.chat_display.update_idletasks()
+        self.chat_display.yview_moveto(1.0 if y > 0.98 or y == 0.0 else y)
+
+    def _draw_empty_state(self):
+        with self._writable() as w:
+            w.insert(tk.END, "Ask about this document, or select text in the editor and use "
+                             "\u201cTransfer to Chat\u201d.\n", ('empty',))
+
+    def _remove_empty_state(self):
+        rng = self.chat_display.tag_ranges('empty')
+        if rng:
+            with self._writable() as w:
+                w.delete(rng[0], rng[1])
+
+    @staticmethod
+    def _format_time(ts: str) -> str:
+        try:
+            return datetime.fromisoformat(ts).strftime('%H:%M')
+        except Exception:
+            return ''
+
+    def _draw_header(self, role: str, ts: str, idx: Optional[int]):
+        """Solid role band: label, time and a Copy button; carries 'msg_start' for streaming."""
+        P = self._pal
+        bg_key = {'user': 'hdr_user_bg', 'assistant': 'hdr_ai_bg'}.get(role, 'hdr_sys_bg')
+        with self._writable() as w:
+            if w.compare('end-1c', '>', '1.0'):
+                w.insert(tk.END, '\n', ('gap',))
+            start = w.index('end-1c')
+            w.insert(tk.END, f"{self.ROLE_LABELS.get(role, role)}")
+            label_end = w.index('end-1c')
+            tstr = self._format_time(ts)
+            if tstr:
+                w.insert(tk.END, f"   {tstr}")
+            time_end = w.index('end-1c')
+            w.insert(tk.END, "  ")
+            if idx is not None and role != 'system':
+                btn = tk.Button(w, text="\u29c9 Copy", relief=tk.FLAT, bd=0, cursor='hand2', takefocus=0,
+                                font=(SANS_FONT, max(7, self._fs - 2)), padx=4, pady=0,
+                                bg=P[bg_key], fg=P['muted'], activebackground=P[bg_key],
+                                activeforeground=P['accent'],
+                                command=lambda i=idx: self._copy_message(i))
+                w.window_create(tk.END, window=btn)
+            w.insert(tk.END, '\n')
+            end = w.index('end-1c')
+            w.tag_add(f'hdr_{role}', start, end)
+            w.tag_add(f'hdrtime_{role}', label_end, time_end)
+
+    def _draw_message(self, role: str, text: str, ts: str, idx: Optional[int]):
+        self._draw_header(role, ts, idx)
+        if role == 'system':
+            with self._writable() as w:
+                tag = 'md_err' if 'error' in text.lower() else 'md_sys'
+                w.insert(tk.END, text + '\n', ('body', tag))
+        else:
+            self._render_markdown(text, buffer_tables=True)
+
+    def _add_chat_message(self, role: str, content: str, streaming: bool = False):
+        """Display a transient note (e.g. errors). Not stored in history."""
+        self._remove_empty_state()
+        self._draw_message(role, content, datetime.now().isoformat(), None)
+        self.chat_display.see(tk.END)
+
+    # -------------------------------------------------------- markdown render
+
+    def _render_markdown(self, text: str, buffer_tables: bool):
+        state: Dict[str, Any] = {'in_code': False, 'table': []}
+        with self._writable():
+            for line in text.split('\n'):
+                self._render_line(line, state, buffer_tables)
+            self._flush_table(state)
+
+    def _render_line(self, line: str, st: Dict[str, Any], buffer_tables: bool = False):
+        """Render one complete markdown line at the end of the display (caller holds _writable)."""
+        w = self.chat_display
+        s = line.strip()
+
+        if buffer_tables and not st['in_code'] and _TABLE_ROW_RE.match(line):
+            st.setdefault('table', []).append(line)
+            return
+        if st.get('table'):
+            self._flush_table(st)
+
+        if s.startswith('```'):
+            st['in_code'] = not st['in_code']
+            return
+        if st['in_code']:
+            w.insert(tk.END, (line if line else ' ') + '\n', ('body', 'md_code_block'))
+            return
+        if not s:
+            w.insert(tk.END, '\n', ('body', 'md_blank'))
+            return
+
+        hm = re.match(r'^(#{1,6})\s+(.*)$', s)
+        if hm:
+            tag = f'md_h{min(len(hm.group(1)), 3)}'
+            self._inline(hm.group(2), ('body', tag), heading=True)
+            w.insert(tk.END, '\n', ('body', tag))
+            return
+        if re.match(r'^(-{3,}|\*{3,}|_{3,})$', s):
+            w.insert(tk.END, '\u2500' * 22 + '\n', ('body', 'md_hr'))
+            return
+        if s.startswith('>'):
+            base = ('body', 'md_quote')
+            self._inline(s.lstrip('>').strip(), base)
+            w.insert(tk.END, '\n', base)
+            return
+        if _TABLE_ROW_RE.match(line):          # streaming: unaligned monospace row
+            if not _TABLE_SEP_RE.match(line):
+                w.insert(tk.END, s + '\n', ('body', 'md_table'))
+            return
+        lm = re.match(r'^(\s*)([-*+]|\d+[.)])\s+(.*)$', line)
+        if lm:
+            expanded = lm.group(1).expandtabs(4)
+            depth = max(0, min(3, len(expanded) // 2))
+            marker = lm.group(2)
+            if marker[0].isdigit():
+                shown = marker
+            else:
+                shown = ('\u2022', '\u25e6', '\u25aa', '\u25aa')[depth]
+            base = ('body', f'md_list{depth}')
+            w.insert(tk.END, shown + ' ', base)
+            self._inline(lm.group(3), base)
+            w.insert(tk.END, '\n', base)
+            return
+
+        base = ('body',)
+        self._inline(line.strip() if line.startswith(' ') else line, base)
+        w.insert(tk.END, '\n', base)
+
+    def _flush_table(self, st: Dict[str, Any]):
+        """Render buffered pipe-table rows as an aligned monospace block."""
+        rows = st.get('table') or []
+        st['table'] = []
+        if not rows:
+            return
+        w = self.chat_display
+        parsed, header_done = [], False
+        for r in rows:
+            if _TABLE_SEP_RE.match(r):
+                header_done = True
+                parsed.append(None)
+                continue
+            cells = [re.sub(r'(\*\*|__|`)', '', c.strip()) for c in r.strip().strip('|').split('|')]
+            parsed.append(cells)
+        data = [c for c in parsed if c is not None]
+        if not data:
+            return
+        ncols = max(len(c) for c in data)
+        widths = [0] * ncols
+        for cells in data:
+            for i, c in enumerate(cells):
+                widths[i] = max(widths[i], len(c))
+        first = True
+        for cells in parsed:
+            if cells is None:
+                rule = '\u2500\u253c\u2500'.join('\u2500' * wd for wd in widths)
+                w.insert(tk.END, '\u2500' + rule + '\u2500\n', ('body', 'md_table'))
+                continue
+            padded = [(cells[i] if i < len(cells) else '').ljust(widths[i]) for i in range(ncols)]
+            tags = ('body', 'md_table', 'md_table_head') if (first and header_done) else ('body', 'md_table')
+            w.insert(tk.END, ' ' + ' \u2502 '.join(padded) + ' \n', tags)
+            first = False
+
+    def _inline(self, text: str, base: tuple, heading: bool = False):
+        """Insert one line of text with inline markdown styling (caller holds _writable)."""
+        w = self.chat_display
+        pos = 0
+
+        def put(s, *extra):
+            if s:
+                w.insert(tk.END, s, base + tuple(extra))
+
+        for m in _CHAT_INLINE_RE.finditer(text):
+            put(text[pos:m.start()])
+            kind = m.lastgroup
+            if m.group('code'):
+                put(m.group('code')[1:-1], 'md_code_inline')
+            elif m.group('bi') is not None:
+                put(m.group('bi'), *(() if heading else ('md_bolditalic',)))
+            elif m.group('b') is not None or m.group('b2') is not None:
+                put(m.group('b') or m.group('b2'), *(() if heading else ('md_bold',)))
+            elif m.group('i') is not None or m.group('i2') is not None:
+                put(m.group('i') or m.group('i2'), *(() if heading else ('md_italic',)))
+            elif m.group('hl') is not None:
+                put(m.group('hl'), 'md_highlight')
+            elif m.group('ll') is not None:
+                self._insert_link(m.group('ll'), m.group('lu'), base)
+            elif m.group('url') is not None:
+                url = m.group('url')
+                trail = ''
+                while url and url[-1] in '.,;:!?':
+                    trail = url[-1] + trail
+                    url = url[:-1]
+                self._insert_link(url, url, base)
+                put(trail)
+            pos = m.end()
+        put(text[pos:])
+
+    def _insert_link(self, label: str, url: str, base: tuple):
+        w = self.chat_display
+        self._link_counter += 1
+        tag = f'lnk{self._link_counter}'
+        w.insert(tk.END, label, base + ('md_link', tag))
+        w.tag_bind(tag, '<Button-1>', lambda e, u=url: webbrowser.open(u))
+        w.tag_bind(tag, '<Enter>', lambda e: w.configure(cursor='hand2'))
+        w.tag_bind(tag, '<Leave>', lambda e: w.configure(cursor='arrow'))
+
+    # ----------------------------------------------------------- send / stream
+
+    def _on_shift_enter(self, event):
+        """Handle Shift+Enter - send message"""
+        if not self.is_generating and not self._editing:
+            self._send_message()
+        return 'break'  # Prevent default newline
+
+    def _provider_ready(self) -> bool:
+        """Validate provider configuration, reporting problems as system notes."""
+        if not self.llm_client:
+            self._init_llm_client()
+            if not self.llm_client:
+                self._add_chat_message("system", "AI not configured. Please set up your API key in Settings.")
+                return False
+        p, s = self.settings.provider, self.settings
+        missing = {
+            'ollama': (not s.ollama_url, "Ollama URL not configured. Please configure in Settings."),
+            'gemini': (not s.gemini_api_key, "Gemini API key not configured. Please add in Settings."),
+            'cli': (not s.cli_command, "CLI command not configured. Please add a CLI command in Settings."),
+            'deepseek': (not s.deepseek_api_key, "DeepSeek API key not configured. Please add in Settings."),
+        }
+        if p in ('agy', 'antigravity'):
+            return True
+        if p in missing:
+            bad, msg = missing[p]
+        else:
+            bad, msg = (not s.api_key), "API key not configured. Please add your API key in Settings."
+        if bad:
+            self._add_chat_message("system", msg)
+            return False
+        return True
+
+    def _send_message(self):
+        """Send message to AI"""
+        if self.is_generating or self._editing:
+            return
+
+        message = self.input_text.get(1.0, tk.END).strip()
+        if not message and not self.attached_files:
+            return
+        if not self._provider_ready():
+            return
+
+        # Immediate debounce and state lock
+        self.is_generating = True
+        self._gen_id += 1
+        gen_id = self._gen_id
+        self._cancel = threading.Event()
+        cancel = self._cancel
+        self._gen_doc_id = self.current_document_id
+        self._gen_visible = True
+        self._gen_t0 = time.time()
+        self._spin = 0
+        self._set_generating_ui(True)
+
+        self.input_text.delete(1.0, tk.END)
+        self._update_hint()
+
+        try:
+            # Build display message (include attachment info)
+            display_msg = message
+            if self.attached_files:
+                names = ', '.join(f['name'] for f in self.attached_files)
+                display_msg = f"{message}\n\U0001f4ce Attached: {names}" if message else f"\U0001f4ce Attached: {names}"
+
+            # History for the API is captured BEFORE the new message is added
+            messages = self._history_for_api() if self.include_history_var.get() else []
+
+            # Show + store the user message
+            self._remove_empty_state()
+            user_msg = ChatMessage(role="user", content=message)
+            self._messages.append(user_msg)
+            self._draw_message("user", display_msg, user_msg.timestamp, len(self._messages) - 1)
+            if self._gen_doc_id:
+                self.history_manager.add_message(user_msg, self._gen_doc_id)
+
+            # Build current message content
+            content_parts: List[str] = []
+            images: List[str] = []
+            if self.include_doc_var.get() and self.get_document_content:
+                doc_content = self.get_document_content()
+                if doc_content:
+                    content_parts.append(f"[Current Document]\n{doc_content}\n[End Document]\n\n")
+            if self.get_document_images and self.include_doc_var.get():
+                for img_data in self.get_document_images()[:3]:  # Limit to 3 images
+                    try:
+                        img = img_data.get('image')
+                        if img and PIL_AVAILABLE:
+                            encoded = self.llm_client.encode_image_for_api(img, self.settings.image_max_size[0])
+                            if encoded:
+                                images.append(encoded)
+                    except Exception:
+                        pass
+            for attachment in self.attached_files:
+                if attachment['type'] == 'image':
+                    images.append(attachment['content'])
+                elif attachment['type'] == 'text':
+                    content_parts.append(
+                        f"\n[Attached File: {attachment['name']}]\n{attachment['content']}\n[End File]\n")
+            self.attached_files.clear()
+            self._update_attachments_display()
+
+            content_parts.append(message)
+            messages.append({"role": "user", "content": "".join(content_parts)})
+
+            # Assistant card with live progress indicator
+            self._start_assistant_stream()
+
+            thread = threading.Thread(target=self._generate_response,
+                                      args=(messages, images, gen_id, cancel), daemon=True)
+            thread.start()
+        except Exception as e:
+            self._reset_generating_state()
+            self.status_label.config(text="Error")
+            self._add_chat_message("system", f"Error: failed to dispatch message: {e}")
+
+    def _generate_response(self, messages: List[Dict], images: List[str], gen_id: int,
+                           cancel: threading.Event):
+        """Generate response in background thread"""
+        try:
+            if self.settings.provider == 'gemini':
+                self.llm_client.api_key = self.settings.gemini_api_key
+            elif self.settings.provider == 'anthropic':
+                self.llm_client.api_key = self.settings.api_key
+            elif self.settings.provider == 'deepseek':
+                self.llm_client.api_key = self.settings.deepseek_api_key
+
+            text = ""
+            gen = self.llm_client.send_message_stream(
+                messages,
+                system_prompt=self.settings.system_prompt,
+                max_tokens=self.settings.max_tokens,
+                temperature=self.settings.temperature,
+                top_p=self.settings.top_p,
+                top_k=self.settings.top_k,
+                images=images if images else None,
+                model=self.settings.model
+            )
+            try:
+                for chunk in gen:
+                    if cancel.is_set():
+                        break
+                    if not chunk:
+                        continue
+                    text += chunk
+                    self.response_queue.put(('chunk', gen_id, chunk))
+            finally:
+                close = getattr(gen, 'close', None)
+                if close:
+                    try:
+                        close()
+                    except Exception:
+                        pass
+            if not cancel.is_set():
+                self.response_queue.put(('done', gen_id, text))
+        except Exception as e:
+            import traceback
+            print(f"[ERROR] _generate_response: {e}\n{traceback.format_exc()}")
+            if not cancel.is_set():
+                self.response_queue.put(('error', gen_id, str(e)))
+
+    def _process_queue(self):
+        """Process response queue (runs on main thread). Chunks are coalesced per tick."""
+        try:
+            chunks: List[str] = []
+            terminal = None
+            while True:
+                kind, gid, payload = self.response_queue.get_nowait()
+                if gid != self._gen_id:
+                    continue                       # stale (stopped / superseded)
+                if kind == 'chunk':
+                    chunks.append(payload)
+                else:
+                    terminal = (kind, payload)
+                    break
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"[ERROR] _process_queue: {e}")
+            chunks, terminal = [], None
+        try:
+            if chunks:
+                self._on_chunk(''.join(chunks))
+            if terminal:
+                kind, payload = terminal
+                if kind == 'done':
+                    self._on_done()
+                elif kind == 'error':
+                    self._on_error(payload)
+        except Exception as e:
+            import traceback
+            print(f"[ERROR] chat UI update: {e}\n{traceback.format_exc()}")
+            self._reset_generating_state()
+        self.after(50, self._process_queue)
+
+    # ----------------------------------------------------- generation UI state
+
+    def _set_generating_ui(self, on: bool):
+        if on:
+            self.send_btn.configure(text="Stop", command=self._stop_generation)
+            self.progress.pack(fill=tk.X, padx=8, pady=(4, 0), before=self.options_frame)
+            self.progress.start(12)
+            self.edit_btn.configure(state=tk.DISABLED)
+            self.clear_btn.configure(state=tk.DISABLED)
+            ToolTip(self.send_btn, "Stop generating")
+            self._tick()
+        else:
+            self.send_btn.configure(text="Send", command=self._send_message, state=tk.NORMAL)
+            ToolTip(self.send_btn, "Send message (Shift+Enter)")
+            self.progress.stop()
+            self.progress.pack_forget()
+            self.edit_btn.configure(state=tk.NORMAL)
+            self.clear_btn.configure(state=tk.NORMAL)
+            if self._tick_id:
+                self.after_cancel(self._tick_id)
+                self._tick_id = None
+
+    def _reset_generating_state(self):
+        self.is_generating = False
+        self._pending_active = False
+        self._set_generating_ui(False)
+
+    def _pending_text(self, frame: str, elapsed: int) -> str:
+        if self.settings.provider in ('agy', 'antigravity', 'cli'):
+            return f"{frame} Waiting for the CLI\u2026 {elapsed}s (this can take a while)"
+        return f"{frame} Thinking\u2026 {elapsed}s"
+
+    def _tick(self):
+        """Animate spinner + elapsed time while a reply is pending (100 ms cadence)."""
+        self._tick_id = None
+        if not self.is_generating:
+            return
+        elapsed = int(time.time() - self._gen_t0)
+        frame = _SPINNER_FRAMES[self._spin % len(_SPINNER_FRAMES)]
+        self._spin += 1
+        self.status_label.config(text=f"{frame} Generating\u2026 {elapsed}s")
+        if self._pending_active and self._gen_visible:
+            w = self.chat_display
+            try:
+                with self._writable():
+                    w.delete('pending_start', 'end-1c')
+                    w.insert(tk.END, self._pending_text(frame, elapsed), ('body', 'pending'))
+            except tk.TclError:
+                self._pending_active = False
+        self._tick_id = self.after(100, self._tick)
+
+    def _start_assistant_stream(self):
+        """Create the assistant card (header + animated pending line) and reset stream state."""
+        self._stream_msg = ChatMessage(role="assistant", content="")
+        self._messages.append(self._stream_msg)
+        idx = len(self._messages) - 1
+        self._stream_buf = ''
+        self._stream_text = ''
+        self._stream_state = {'in_code': False, 'table': []}
+        w = self.chat_display
+        with self._writable():
+            w.mark_set('msg_start', 'end-1c')
+            w.mark_gravity('msg_start', tk.LEFT)
+        self._draw_header("assistant", self._stream_msg.timestamp, idx)
+        with self._writable():
+            w.mark_set('body_start', 'end-1c')
+            w.mark_gravity('body_start', tk.LEFT)
+            w.mark_set('pending_start', 'end-1c')
+            w.mark_gravity('pending_start', tk.LEFT)
+            w.mark_set('tail_start', 'end-1c')
+            w.mark_gravity('tail_start', tk.LEFT)
+            w.insert(tk.END, self._pending_text(_SPINNER_FRAMES[0], 0), ('body', 'pending'))
+        self._pending_active = True
+        w.see(tk.END)
+
+    def _clear_pending(self):
+        if self._pending_active:
+            self._pending_active = False
+            with self._writable() as w:
+                w.delete('pending_start', 'end-1c')
+
+    def _on_chunk(self, text: str):
+        """Render newly received text: complete lines as markdown, unfinished tail raw."""
+        self._stream_text += text
+        if self._stream_msg is not None:
+            self._stream_msg.content = self._stream_text
+        if not self._gen_visible:
+            return
+        w = self.chat_display
+        at_bottom = w.yview()[1] >= 0.98
+        self._stream_buf += text
+        parts = self._stream_buf.split('\n')
+        self._stream_buf = parts[-1]
+        complete = parts[:-1]
+        self._clear_pending()
+        with self._writable():
+            w.delete('tail_start', 'end-1c')
+            for ln in complete:
+                self._render_line(ln, self._stream_state, buffer_tables=False)
+            w.mark_set('tail_start', 'end-1c')
+            if self._stream_buf:
+                w.insert(tk.END, self._stream_buf, ('body', 'md_tail'))
+        if at_bottom:
+            w.see(tk.END)
+
+    def _finalize_stream(self, stopped: bool = False):
+        """Flush the unfinished tail as markdown and persist the reply."""
+        msg = self._stream_msg
+        text = self._stream_text
+        w = self.chat_display
+        if self._gen_visible:
+            self._clear_pending()
+            has_table = bool(re.search(r'^\s*\|.*\|\s*$\n\s*\|?\s*:?-{2,}', text, re.MULTILINE))
+            if not text.strip():
+                # Nothing was produced: drop the empty card
+                with self._writable():
+                    w.delete('msg_start', 'end-1c')
+                if msg in self._messages:
+                    self._messages.remove(msg)
+            elif has_table:
+                with self._writable():
+                    w.delete('body_start', 'end-1c')
+                self._render_markdown(text, buffer_tables=True)
+            else:
+                with self._writable():
+                    w.delete('tail_start', 'end-1c')
+                    if self._stream_buf:
+                        self._render_line(self._stream_buf, self._stream_state, buffer_tables=False)
+                    self._flush_table(self._stream_state)
+        if msg is not None and text.strip():
+            msg.content = text
+            if self._gen_doc_id:
+                self.history_manager.add_message(msg, self._gen_doc_id)
+        self._stream_msg = None
+        self._stream_buf = ''
+
+    def _after_generation(self, status: str):
+        was_visible = self._gen_visible
+        self._reset_generating_state()
+        self.status_label.config(text=status)
+        if not was_visible and self.current_document_id and self.current_document_id == self._gen_doc_id:
+            # User switched away and back mid-generation: reload to show the reply
+            self._messages = list(self.history_manager.get_history(self.current_document_id))
+            self._render_all()
+        elif was_visible:
+            self.chat_display.see(tk.END)
+            if self.pending_selection and status == "Ready":
+                self._show_apply_button()
+        self._gen_visible = False
+
+    def _on_done(self):
+        self._finalize_stream()
+        self._after_generation("Ready")
+
+    def _on_error(self, message: str):
+        self._finalize_stream(stopped=True)
+        if self._gen_visible:
+            self._add_chat_message("system", f"Error: {message}")
+        self._after_generation("Error")
+
+    def _stop_generation(self):
+        """Stop button: keep whatever has been generated so far."""
+        if not self.is_generating:
+            return
+        self._cancel.set()
+        self._gen_id += 1                      # invalidate late results from the worker
+        if isinstance(self.llm_client, CliClient):
+            client = self.llm_client
+            threading.Thread(target=client.close_session, daemon=True).start()
+        self._finalize_stream(stopped=True)
+        self._after_generation("Stopped")
+
     def _attach_file(self):
         """Open file dialog to attach a file"""
         filetypes = [
@@ -3757,418 +4716,119 @@ class ChatSidebar(tk.Frame):
                 self.attachments_label.unbind('<Button-1>')
                 self.attachments_label.config(cursor="")
                 self.status_label.config(text="Attachments cleared")
-    
-    def _on_shift_enter(self, event):
-        """Handle Shift+Enter - send message"""
-        if not self.is_generating:
-            self._send_message()
-        return 'break'  # Prevent default newline
-    
-    def _send_message(self):
-        """Send message to AI"""
-        if self.is_generating:
-            return
-        
-        # Get user message
-        message = self.input_text.get(1.0, tk.END).strip()
-        if not message and not self.attached_files:
-            return
-        
-        # Check if client is available
-        if not self.llm_client:
-            self._init_llm_client()
-            if not self.llm_client:
-                self._add_chat_message("system", "AI not configured. Please set up your API key in Settings.")
-                return
-        
-        # Check configuration based on provider
-        if self.settings.provider == 'ollama':
-            if not self.settings.ollama_url:
-                self._add_chat_message("system", "Ollama URL not configured. Please configure in Settings.")
-                return
-        elif self.settings.provider == 'gemini':
-            if not self.settings.gemini_api_key:
-                self._add_chat_message("system", "Gemini API key not configured. Please add in Settings.")
-                return
-        elif self.settings.provider == 'cli':
-            if not self.settings.cli_command:
-                self._add_chat_message("system", "CLI command not configured. Please add a CLI command in Settings.")
-                return
-        elif self.settings.provider in ('agy', 'antigravity'):
-            pass
-        elif self.settings.provider == 'deepseek':
-            if not self.settings.deepseek_api_key:
-                self._add_chat_message("system", "DeepSeek API key not configured. Please add in Settings.")
-                return
+
+    # ------------------------------------------------------------ Edit Chat
+
+    def _update_edit_banner(self):
+        limit = self.settings.history_limit
+        sent = "all messages are" if limit <= 0 else f"only the last {limit} messages are"
+        self.edit_banner_label.config(
+            text=("Editing raw markdown. Messages are separated by lines like \u2500\u2500\u2500\u2500 [user] "
+                  f"\u2500\u2500\u2500\u2500 or [assistant]; {sent} sent to the model."))
+
+    def _on_edit_toggle(self):
+        if self.edit_var.get():
+            self._enter_edit_mode()
         else:
-            if not self.settings.api_key:
-                self._add_chat_message("system", "API key not configured. Please add your API key in Settings.")
-                return
-        
-        # Immediate debounce and state lock
-        self.is_generating = True
-        self.send_btn.config(state=tk.DISABLED)
-        self.status_label.config(text="Generating...")
-        
-        # Clear input
-        self.input_text.delete(1.0, tk.END)
-        
-        try:
-            # Build display message (include attachment info)
-            display_msg = message
-            if self.attached_files:
-                attachment_names = [f['name'] for f in self.attached_files]
-                display_msg = f"{message}\n📎 Attached: {', '.join(attachment_names)}" if message else f"📎 Attached: {', '.join(attachment_names)}"
-            
-            # Add user message to display
-            self._add_chat_message("user", display_msg)
-            
-            # Prepare messages for API
-            messages = []
-            
-            # Include chat history if enabled
-            if self.include_history_var.get() and self.current_document_id:
-                history = self.history_manager.get_history(self.current_document_id)
-                for msg in history[-10:]:  # Last 10 messages
-                    messages.append({"role": msg.role, "content": msg.content})
-            
-            # Build current message content
-            content_parts = []
-            images = []
-            
-            # Include document content if enabled
-            if self.include_doc_var.get() and self.get_document_content:
-                doc_content = self.get_document_content()
-                if doc_content:
-                    content_parts.append(f"[Current Document]\n{doc_content}\n[End Document]\n\n")
-            
-            # Get images from document if available
-            if self.get_document_images and self.include_doc_var.get():
-                doc_images = self.get_document_images()
-                for img_data in doc_images[:3]:  # Limit to 3 images
-                    try:
-                        img = img_data.get('image')
-                        if img and PIL_AVAILABLE:
-                            encoded = self.llm_client.encode_image_for_api(
-                                img, 
-                                self.settings.image_max_size[0]
-                            )
-                            if encoded:
-                                images.append(encoded)
-                    except:
-                        pass
-            
-            # Process attached files
-            for attachment in self.attached_files:
-                if attachment['type'] == 'image':
-                    images.append(attachment['content'])
-                elif attachment['type'] == 'text':
-                    content_parts.append(f"\n[Attached File: {attachment['name']}]\n{attachment['content']}\n[End File]\n")
-            
-            # Clear attachments after sending
-            self.attached_files.clear()
-            self._update_attachments_display()
-            
-            content_parts.append(message)
-            full_content = "".join(content_parts)
-            
-            messages.append({"role": "user", "content": full_content})
-            
-            # Save user message to history
-            user_msg = ChatMessage(role="user", content=message)
-            if self.current_document_id:
-                self.history_manager.add_message(user_msg, self.current_document_id)
-            
-            # Add placeholder for assistant response
-            self._add_chat_message("assistant", "", streaming=True)
-            
-            # Start generation thread
-            thread = threading.Thread(
-                target=self._generate_response,
-                args=(messages, images),
-                daemon=True
-            )
-            thread.start()
-        except Exception as e:
-            self.is_generating = False
-            self.send_btn.config(state=tk.NORMAL)
-            self.status_label.config(text="Error")
-            self._add_chat_message("system", f"Failed to dispatch message: {str(e)}")
-    
-    def _generate_response(self, messages: List[Dict], images: List[str]):
-        """Generate response in background thread"""
-        try:
-            # Update client settings based on provider
-            if self.settings.provider == 'gemini':
-                self.llm_client.api_key = self.settings.gemini_api_key
-            elif self.settings.provider == 'anthropic':
-                self.llm_client.api_key = self.settings.api_key
-            elif self.settings.provider == 'deepseek':
-                self.llm_client.api_key = self.settings.deepseek_api_key
-            # Ollama and CLI don't need API key updates
+            self._exit_edit_mode(save=True)
 
-            # Stream response with all parameters
-            response_text = ""
-            chunk_count = 0
-            for chunk in self.llm_client.send_message_stream(
-                messages,
-                system_prompt=self.settings.system_prompt,
-                max_tokens=self.settings.max_tokens,
-                temperature=self.settings.temperature,
-                top_p=self.settings.top_p,
-                top_k=self.settings.top_k,
-                images=images if images else None,
-                model=self.settings.model
-            ):
-                chunk_count += 1
-                response_text += chunk
-                self.response_queue.put(('chunk', chunk))
+    def _enter_edit_mode(self):
+        if self.is_generating:
+            self.edit_var.set(False)
+            self._flash_status("Wait for the reply (or press Stop) before editing")
+            return
+        self._editing = True
+        self._edit_original = serialize_history(self._messages)
+        self.edit_text.delete('1.0', tk.END)
+        self.edit_text.insert('1.0', self._edit_original)
+        self.edit_text.edit_reset()
+        self.chat_display.pack_forget()
+        self._update_edit_banner()
+        self.edit_banner.pack(fill=tk.X, pady=(0, 4))
+        self.edit_text.pack(fill=tk.BOTH, expand=True)
+        for btn in (self.send_btn, self.attach_btn, self.clear_btn):
+            btn.configure(state=tk.DISABLED)
+        self.edit_text.focus_set()
+        self.status_label.config(text="Editing chat history")
 
-            # Debug: log if no chunks were received
-            if chunk_count == 0:
-                print(f"[DEBUG] No chunks received from {self.settings.provider} provider")
-            else:
-                print(f"[DEBUG] Received {chunk_count} chunks from {self.settings.provider} provider")
+    def _exit_edit_mode(self, save: bool = True):
+        if not self._editing:
+            return
+        self._editing = False
+        self.edit_var.set(False)
+        new_text = self.edit_text.get('1.0', 'end-1c')
+        self.edit_text.pack_forget()
+        self.edit_banner.pack_forget()
+        self.chat_display.pack(fill=tk.BOTH, expand=True)
+        for btn in (self.send_btn, self.attach_btn, self.clear_btn):
+            btn.configure(state=tk.NORMAL)
+        status = "Ready"
+        if save and new_text.strip() != self._edit_original.strip():
+            new_msgs = parse_history(new_text, self._messages)
+            old_keys = [(m.role, m.content) for m in self._messages]
+            if [(m.role, m.content) for m in new_msgs] != old_keys:
+                self._messages = new_msgs
+                if self.current_document_id:
+                    self.history_manager.save_history(new_msgs, self.current_document_id)
+                status = "Chat history updated"
+        self._render_all()
+        self.status_label.config(text=status)
 
-            # Save assistant message to history
-            assistant_msg = ChatMessage(role="assistant", content=response_text)
-            if self.current_document_id:
-                self.history_manager.add_message(assistant_msg, self.current_document_id)
+    def _discard_edit_mode(self):
+        self._exit_edit_mode(save=False)
 
-            self.response_queue.put(('done', response_text))
+    def commit_edit_mode(self):
+        """Save and leave Edit Chat mode if it is active (document switch, sidebar hide, exit)."""
+        if self._editing:
+            self._exit_edit_mode(save=True)
 
-        except Exception as e:
-            import traceback
-            error_msg = f"{str(e)}\n{traceback.format_exc()}"
-            print(f"[ERROR] _generate_response: {error_msg}")
-            self.response_queue.put(('error', str(e)))
-    
-    def _process_queue(self):
-        """Process response queue (runs on main thread)"""
-        try:
-            while True:
-                msg_type, content = self.response_queue.get_nowait()
-                
-                if msg_type == 'chunk':
-                    self._append_to_last_message(content)
-                elif msg_type == 'done':
-                    self.is_generating = False
-                    self.send_btn.config(state=tk.NORMAL)
-                    self.status_label.config(text="Ready")
-                    completed_text = content if content is not None else self._streaming_buffer
-                    # Re-render last assistant message with markdown formatting
-                    if completed_text:
-                        self.chat_display.config(state=tk.NORMAL)
-                        # Accurately delete the raw streamed chunks
-                        if self.chat_display.get('streaming_start', tk.END).strip():
-                            self.chat_display.delete('streaming_start', tk.END)
-                        self._insert_markdown_text(completed_text)
-                        self._message_texts.append(completed_text)
+    # ------------------------------------------------------------- history
 
-                        # Copy button for streaming message
-                        def _make_copy_streamed(text):
-                            def _do():
-                                self.clipboard_clear()
-                                self.clipboard_append(text)
-                                self.status_label.config(text='Copied!')
-                                self.after(1500, lambda: self.status_label.config(text='Ready'))
-                            return _do
-
-                        btn = tk.Button(
-                            self.chat_display,
-                            text='⧉', font=(SANS_FONT, 8),
-                            relief=tk.FLAT, bd=0,
-                            bg=self.chat_display.cget('bg'), fg='#888888',
-                            activeforeground='#0066cc',
-                            cursor='hand2', padx=2, pady=0,
-                            command=_make_copy_streamed(completed_text)
-                        )
-                        self.chat_display.window_create(tk.END, window=btn, padx=2)
-                        self.chat_display.insert(tk.END, '\n')
-                        self.chat_display.config(state=tk.DISABLED)
-                        self.chat_display.see(tk.END)
-                        self._streaming_buffer = ''
-                    # If we have a pending selection, show Apply to Document button
-                    if self.pending_selection:
-                        self._show_apply_button()
-                elif msg_type == 'error':
-                    self._add_chat_message("system", f"Error: {content}")
-                    self.is_generating = False
-                    self.send_btn.config(state=tk.NORMAL)
-                    self.status_label.config(text="Error")
-        except queue.Empty:
-            pass
-        except Exception as e:
-            print(f"[ERROR] _process_queue: {e}")
-            self.is_generating = False
-            self.send_btn.config(state=tk.NORMAL)
-            self.status_label.config(text="Error")
-        
-        # Schedule next check
-        self.after(50, self._process_queue)
-    
-    def _add_chat_message(self, role: str, content: str, streaming: bool = False):
-        """Add a message to the chat display"""
-        self.chat_display.config(state=tk.NORMAL)
-        
-        # Add separator if not first message, cleaning up any trailing whitespace first
-        current_content = self.chat_display.get(1.0, tk.END).strip()
-        if current_content:
-            last_content_idx = self.chat_display.search(r'\S', tk.END, backwards=True, regexp=True)
-            if last_content_idx:
-                self.chat_display.delete(f"{last_content_idx}+1c", tk.END)
-            self.chat_display.insert(tk.END, "\n\n")
-        
-        # Add role label
-        if role == "user":
-            self.chat_display.insert(tk.END, "You: ", 'user')
-        elif role == "assistant":
-            self.chat_display.insert(tk.END, "AI: ", 'assistant')
-        elif role == "system":
-            self.chat_display.insert(tk.END, "System: ", 'system')
-        
-        # Add content
-        if content:
-            if role == "system" and "Error" in content:
-                self.chat_display.insert(tk.END, content, 'error')
-            else:
-                self.chat_display.insert(tk.END, content, 'message')
-        
-        if role == 'assistant' and streaming:
-            # Use a named Tkinter mark anchored at 'end-1c' (after role label, before terminal newline)
-            self.chat_display.mark_set('streaming_start', 'end-1c')
-            self.chat_display.mark_gravity('streaming_start', tk.LEFT)
-            self._streaming_start_index = 'streaming_start'
-            self._streaming_buffer = ''
-        
-        if not streaming and role in ('user', 'assistant'):
-            self._message_texts.append(content)
-
-            def _make_copy(text):
-                def _do():
-                    self.clipboard_clear()
-                    self.clipboard_append(text)
-                    self.status_label.config(text='Copied!')
-                    self.after(1500, lambda: self.status_label.config(text='Ready'))
-                return _do
-
-            btn = tk.Button(
-                self.chat_display,
-                text='⧉', font=(SANS_FONT, 8),
-                relief=tk.FLAT, bd=0,
-                bg=self.chat_display.cget('bg'), fg='#888888',
-                activeforeground='#0066cc',
-                cursor='hand2', padx=2, pady=0,
-                command=_make_copy(content)
-            )
-            self.chat_display.window_create(tk.END, window=btn, padx=2)
-            self.chat_display.insert(tk.END, '\n')
-        
-        self.chat_display.config(state=tk.DISABLED)
-        self.chat_display.see(tk.END)
-    
-    def _append_to_last_message(self, content: str):
-        """Append content to the last message (for streaming)"""
-        self.chat_display.config(state=tk.NORMAL)
-        self.chat_display.insert(tk.END, content, 'message')
-        self.chat_display.config(state=tk.DISABLED)
-        self.chat_display.see(tk.END)
-    
     def _clear_history(self):
         """Clear chat history for current document"""
+        if self.is_generating:
+            self._flash_status("Wait for the reply (or press Stop) first")
+            return
         if self.current_document_id:
-            if messagebox.askyesno("Clear History", 
-                                    "Clear chat history for this document?",
-                                    parent=self):
+            if messagebox.askyesno("Clear History", "Clear chat history for this document?", parent=self):
                 self.history_manager.clear_history(self.current_document_id)
-                self._clear_display()
+                self._messages = []
+                self._render_all()
                 self.status_label.config(text="History cleared")
         else:
-            self._clear_display()
-    
-    def _insert_markdown_text(self, text: str):
-        """Insert markdown-formatted assistant response into chat_display."""
-        widget  = self.chat_display
-        lines   = text.split('\n')
-        in_code = False
-        code_buf = []
+            self._messages = []
+            self._render_all()
 
-        def flush_code():
-            if code_buf:
-                widget.insert(tk.END, '\n'.join(code_buf) + '\n', 'md_code_block')
-                code_buf.clear()
-
-        for line in lines:
-            if line.strip().startswith('```'):
-                if in_code:
-                    flush_code()
-                    in_code = False
-                else:
-                    in_code = True
-                continue
-
-            if in_code:
-                code_buf.append(line)
-                continue
-
-            hm = re.match(r'^(#{1,3})\s+(.*)', line)
-            if hm:
-                widget.insert(tk.END, hm.group(2) + '\n', f'md_h{len(hm.group(1))}')
-                continue
-
-            if line.startswith('> '):
-                widget.insert(tk.END, line[2:] + '\n', 'md_blockquote')
-                continue
-
-            lm = re.match(r'^(\s*)([-*+]|\d+\.)\s(.*)', line)
-            if lm:
-                prefix = '  • ' if not lm.group(2)[0].isdigit() else f'  {lm.group(2)} '
-                widget.insert(tk.END, prefix, 'md_list_item')
-                _insert_inline(widget, lm.group(3))
-                widget.insert(tk.END, '\n')
-                continue
-
-            _insert_inline(widget, line)
-            widget.insert(tk.END, '\n')
-
-        flush_code()
-
-    def _clear_display(self):
-        """Clear the chat display"""
-        self.chat_display.config(state=tk.NORMAL)
-        self.chat_display.delete(1.0, tk.END)
-        self.chat_display.config(state=tk.DISABLED)
-        self._message_texts.clear()
-    
     def _open_settings(self):
         """Open settings dialog"""
-        dialog = AISettingsDialog(self.winfo_toplevel(), self.settings, 
-                                   on_save=self._on_settings_saved)
-    
+        AISettingsDialog(self.winfo_toplevel(), self.settings, on_save=self._on_settings_saved)
+
     def _on_settings_saved(self):
         """Called when settings are saved"""
         self._init_llm_client()
+        self._update_badge()
+        if self._editing:
+            self._update_edit_banner()
+        self.history_limit_var.set(self._limit_to_text(self.settings.history_limit))
         self.status_label.config(text="Settings saved")
-    
+
     def set_document_id(self, doc_id: Optional[str]):
         """Set current document ID and load its chat history"""
-        # Only reload if document changed
         if doc_id == self.current_document_id:
             return  # Same document, keep current chat display
-        
+        self.commit_edit_mode()
         self.current_document_id = doc_id
-        self._clear_display()
-        
-        # Load history for this document
-        if doc_id:
-            history = self.history_manager.get_history(doc_id)
-            for msg in history:
-                self._add_chat_message(msg.role, msg.content)
-    
+        if self.is_generating:
+            self._gen_visible = False   # reply continues in background and is saved to its own document
+        self._messages = list(self.history_manager.get_history(doc_id)) if doc_id else []
+        self._render_all()
+
     def reload_settings(self):
         """Reload settings (e.g., after settings dialog)"""
         self.settings = get_ai_settings()
         self._init_llm_client()
+        self._update_badge()
+        self.history_limit_var.set(self._limit_to_text(self.settings.history_limit))
 
     # === Transfer to Chat / Selection Methods ===
 
@@ -4179,7 +4839,6 @@ class ChatSidebar(tk.Frame):
             'start_index': start_index,
             'end_index': end_index,
         }
-        # Show indicator
         try:
             start_line = start_index.split('.')[0]
             end_line = end_index.split('.')[0]
@@ -4193,56 +4852,43 @@ class ChatSidebar(tk.Frame):
         if len(text) > 60:
             preview += '\u2026'
         self.selection_indicator_label.config(text=f"\U0001f4cc Selection ({loc}): {preview}")
-        self.selection_indicator_frame.pack(fill=tk.X, padx=5, pady=(0, 3), before=self.status_label)
+        self.selection_indicator_frame.pack(fill=tk.X, padx=8, pady=(0, 3), before=self.status_label)
         # Pre-fill input with quoted selection
         self.input_text.delete('1.0', tk.END)
         quoted = '\n'.join(f'> {l}' for l in text.split('\n'))
         self.input_text.insert('1.0', quoted + '\n\n')
         self.input_text.mark_set(tk.INSERT, tk.END)
         self.input_text.focus_set()
+        self._update_hint()
 
     def _clear_pending_selection(self):
         """Clear pending selection state"""
         self.pending_selection = None
         self.selection_indicator_frame.pack_forget()
-        # Remove any Apply to Document buttons
         self._remove_apply_buttons()
 
     def _show_apply_button(self):
         """Show an 'Apply to Document' button below the last AI message in the chat"""
         if not self.pending_selection or not self.apply_edit_callback:
             return
-
-        # Get the AI response text (last assistant message)
-        # We parse from the chat display
-        full_text = self.chat_display.get('1.0', tk.END)
-        # Find the last "AI: " marker
-        last_ai_idx = full_text.rfind('AI: ')
-        if last_ai_idx < 0:
+        last = next((m for m in reversed(self._messages) if m.role == 'assistant'), None)
+        if last is None or not last.content.strip():
             return
-        response_text = full_text[last_ai_idx + 4:].strip()
-
+        response_text = last.content.strip()
         sel = self.pending_selection
 
-        # Create an inline button in the chat display
-        self.chat_display.config(state=tk.NORMAL)
-        self.chat_display.insert(tk.END, '\n')
-
-        apply_btn = ttk.Button(
-            self.chat_display, text="\u2714 Apply to Document",
-            command=lambda: self._apply_response_to_document(response_text, sel)
-        )
-        self.chat_display.window_create(tk.END, window=apply_btn)
-        self.chat_display.insert(tk.END, '  ')
-
-        discard_btn = ttk.Button(
-            self.chat_display, text="\u2718 Discard",
-            command=self._clear_pending_selection
-        )
-        self.chat_display.window_create(tk.END, window=discard_btn)
-
-        self.chat_display.config(state=tk.DISABLED)
-        self.chat_display.see(tk.END)
+        w = self.chat_display
+        with self._writable():
+            w.insert(tk.END, '\n', ('body',))
+            apply_btn = ttk.Button(
+                w, text="\u2714 Apply to Document",
+                command=lambda: self._apply_response_to_document(response_text, sel))
+            w.window_create(tk.END, window=apply_btn, padx=12)
+            w.insert(tk.END, '  ', ('body',))
+            discard_btn = ttk.Button(w, text="\u2718 Discard", command=self._clear_pending_selection)
+            w.window_create(tk.END, window=discard_btn)
+            w.insert(tk.END, '\n', ('body',))
+        w.see(tk.END)
 
     def _apply_response_to_document(self, response_text: str, selection: Dict):
         """Open the diff panel to apply AI response to document"""
@@ -4257,6 +4903,6 @@ class ChatSidebar(tk.Frame):
 
     def _remove_apply_buttons(self):
         """Remove any embedded Apply/Discard buttons from chat display"""
-        # The buttons are embedded windows; clearing pending selection is enough
-        # since the buttons reference the old selection
+        # The buttons are embedded windows referencing the old selection; they are
+        # dropped on the next redraw. Clearing pending selection is sufficient.
         pass

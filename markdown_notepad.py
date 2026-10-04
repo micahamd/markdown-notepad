@@ -2612,21 +2612,21 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-I>", lambda e: self.insert_image())  # Ctrl+Shift+I
         self.bind("<Control-w>", lambda e: self.close_tab())  # Close tab
         self.bind("<Control-W>", lambda e: self._toggle_word_wrap())  # Ctrl+Shift+W for word wrap
-        self.bind("<Control-z>", lambda e: self.undo())
-        self.bind("<Control-y>", lambda e: self.redo())
-        self.bind("<Control-a>", lambda e: self.select_all())
+        self.bind("<Control-z>", self._doc_shortcut(self.undo))
+        self.bind("<Control-y>", self._doc_shortcut(self.redo))
+        self.bind("<Control-a>", self._doc_shortcut(self.select_all))
         self.bind("<Control-f>", lambda e: self.find_text())
         self.bind("<Control-h>", lambda e: self.find_replace())
         self.bind("<Control-g>", lambda e: self.goto_line())
-        self.bind("<Control-b>", lambda e: self._insert_format("**", "**"))
-        self.bind("<Control-B>", lambda e: self._insert_format("**", "**"))
-        self.bind("<Control-i>", lambda e: self._insert_format("*", "*"))
-        self.bind("<Control-Key-i>", lambda e: self._insert_format("*", "*"))
-        self.bind("<Control-grave>", lambda e: self._insert_format("`", "`"))
-        self.bind("<Control-H>", lambda e: self._insert_format("==", "=="))
-        self.bind("<Control-Shift-H>", lambda e: self._insert_format("==", "=="))
-        self.bind("<Control-Shift-h>", lambda e: self._insert_format("==", "=="))
-        self.bind("<Control-Shift-Key-H>", lambda e: self._insert_format("==", "=="))
+        self.bind("<Control-b>", self._doc_shortcut(lambda: self._insert_format("**", "**")))
+        self.bind("<Control-B>", self._doc_shortcut(lambda: self._insert_format("**", "**")))
+        self.bind("<Control-i>", self._doc_shortcut(lambda: self._insert_format("*", "*")))
+        self.bind("<Control-Key-i>", self._doc_shortcut(lambda: self._insert_format("*", "*")))
+        self.bind("<Control-grave>", self._doc_shortcut(lambda: self._insert_format("`", "`")))
+        self.bind("<Control-H>", self._doc_shortcut(lambda: self._insert_format("==", "==")))
+        self.bind("<Control-Shift-H>", self._doc_shortcut(lambda: self._insert_format("==", "==")))
+        self.bind("<Control-Shift-h>", self._doc_shortcut(lambda: self._insert_format("==", "==")))
+        self.bind("<Control-Shift-Key-H>", self._doc_shortcut(lambda: self._insert_format("==", "==")))
         self.bind("<Control-Key-1>", lambda e: self._show_source_mode())
         self.bind("<Control-Key-2>", lambda e: self._show_visual_mode())
         self.bind("<Control-e>", lambda e: self._toggle_mode())
@@ -2860,6 +2860,30 @@ class MarkdownNotepad(tk.Tk):
             apply_edit_callback=self._on_apply_edit_from_chat
         )
         self.ai_sidebar.pack(fill=tk.BOTH, expand=True)
+        self.ai_sidebar.apply_theme(self.theme)
+
+    def _focus_in_chat(self):
+        """True when keyboard focus is inside the AI chat sidebar."""
+        sb = getattr(self, 'ai_sidebar', None)
+        if sb is None:
+            return False
+        try:
+            w = self.focus_get()
+        except (KeyError, tk.TclError):
+            return False
+        while w is not None:
+            if w is sb:
+                return True
+            w = getattr(w, 'master', None)
+        return False
+
+    def _doc_shortcut(self, func):
+        """Wrap a document-level shortcut so it is ignored while the chat has focus."""
+        def handler(event=None):
+            if self._focus_in_chat():
+                return None
+            return func()
+        return handler
     
     def _toggle_ai_sidebar(self):
         """Toggle AI sidebar visibility"""
@@ -2869,7 +2893,9 @@ class MarkdownNotepad(tk.Tk):
             return
         
         if self.ai_sidebar_visible:
-            # Hide sidebar
+            # Hide sidebar (save any in-progress Edit Chat session first)
+            if self.ai_sidebar:
+                self.ai_sidebar.commit_edit_mode()
             self.main_paned.forget(self.ai_sidebar_frame)
             self.ai_sidebar_visible = False
             self.ai_sidebar_btn.config(text="AI Chat")
@@ -4399,6 +4425,8 @@ class MarkdownNotepad(tk.Tk):
     def quit_app(self):
         """Exit the application"""
         # Save session state before checking for unsaved changes
+        if getattr(self, 'ai_sidebar', None):
+            self.ai_sidebar.commit_edit_mode()
         self._save_session()
         
         # Check all tabs for unsaved changes (only if caching is disabled)
@@ -4484,6 +4512,9 @@ class MarkdownNotepad(tk.Tk):
         for tab in self.tabs:
             tab.apply_theme(self.theme)
             tab.set_zoom(self.zoom_pct / 100.0)
+        
+        if getattr(self, 'ai_sidebar', None):
+            self.ai_sidebar.apply_theme(self.theme)
         
         self._set_status("Theme applied")
 
