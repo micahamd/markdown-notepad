@@ -163,7 +163,88 @@ def _build_css(theme: Optional[Dict] = None, page_settings: Optional[Dict] = Non
     a:hover {{
         text-decoration: underline;
     }}
+    a.internal-link {{
+        color: #2563eb;
+        text-decoration: underline;
+        font-weight: 500;
+    }}
+    .anchor-target {{
+        visibility: hidden;
+        display: inline-block;
+        width: 0;
+        height: 0;
+        overflow: hidden;
+    }}
     """
+
+
+def _clean_bookmark_name(name: str) -> str:
+    """Clean an anchor label for safe use as a Word OpenXML / HTML bookmark identifier."""
+    clean = re.sub(r'[^a-zA-Z0-9_]', '_', (name or '').strip().lower())
+    clean = re.sub(r'_+', '_', clean).strip('_')
+    if not clean or clean[0].isdigit():
+        clean = 'bm_' + clean
+    return clean[:40]
+
+
+def _preprocess_anchors_for_html(text: str) -> str:
+    """Convert [@anchor: point] and [@point] into HTML anchors and links for PDF/HTML export."""
+    def sub_anchor(m):
+        lbl = m.group(1).strip()
+        aid = _clean_bookmark_name(lbl)
+        return f'<a id="{aid}" class="anchor-target"></a>'
+    text = re.sub(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', sub_anchor, text, flags=re.IGNORECASE)
+
+    def sub_ref(m):
+        lbl = m.group(1).strip()
+        aid = _clean_bookmark_name(lbl)
+        return f'<a href="#{aid}" class="internal-link">[@{lbl}]</a>'
+    text = re.sub(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', sub_ref, text, flags=re.IGNORECASE)
+    return text
+
+
+def _add_docx_bookmark(paragraph, name: str, bm_id: int):
+    """Add a Word OpenXML bookmark to a paragraph."""
+    try:
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        bm_start = OxmlElement('w:bookmarkStart')
+        bm_start.set(qn('w:id'), str(bm_id))
+        bm_start.set(qn('w:name'), name)
+        paragraph._p.append(bm_start)
+        bm_end = OxmlElement('w:bookmarkEnd')
+        bm_end.set(qn('w:id'), str(bm_id))
+        paragraph._p.append(bm_end)
+    except Exception:
+        pass
+
+
+def _add_docx_internal_hyperlink(paragraph, text: str, anchor_name: str):
+    """Add an internal Word hyperlink referencing a bookmark."""
+    try:
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        hyperlink = OxmlElement('w:hyperlink')
+        hyperlink.set(qn('w:anchor'), anchor_name)
+        hyperlink.set(qn('w:history'), '1')
+        r = OxmlElement('w:r')
+        rPr = OxmlElement('w:rPr')
+        c = OxmlElement('w:color')
+        c.set(qn('w:val'), '0066CC')
+        rPr.append(c)
+        u = OxmlElement('w:u')
+        u.set(qn('w:val'), 'single')
+        rPr.append(u)
+        r.append(rPr)
+        t = OxmlElement('w:t')
+        t.text = text
+        r.append(t)
+        hyperlink.append(r)
+        paragraph._p.append(hyperlink)
+    except Exception:
+        run = paragraph.add_run(text)
+        run.font.color.rgb = RGBColor(0x00, 0x66, 0xCC)
+        run.underline = True
 
 
 # =============================================================================
@@ -194,7 +275,8 @@ def _markdown_to_html(md_content: str, theme: Optional[Dict] = None,
         },
     }
     
-    html_body = markdown.markdown(md_content, extensions=extensions,
+    processed_md = _preprocess_anchors_for_html(md_content)
+    html_body = markdown.markdown(processed_md, extensions=extensions,
                                    extension_configs=extension_configs)
     
     # Resolve relative image paths to absolute for PDF rendering
@@ -341,6 +423,7 @@ def export_to_docx(md_content: str, output_path: str,
     
     lines = md_content.split('\n')
     i = 0
+    bm_counter = [0]
     
     while i < len(lines):
         line = lines[i]
@@ -362,7 +445,11 @@ def export_to_docx(md_content: str, output_path: str,
         if heading_match:
             level = len(heading_match.group(1))
             text = heading_match.group(2).strip()
-            doc.add_heading(text, level=min(level, 9))
+            h = doc.add_heading(level=min(level, 9))
+            bm_counter[0] += 1
+            bm_name = _clean_bookmark_name(text)
+            _add_docx_bookmark(h, bm_name, bm_counter[0])
+            _add_inline_formatting(h, text, bm_counter)
             i += 1
             continue
         
@@ -401,7 +488,7 @@ def export_to_docx(md_content: str, output_path: str,
             while i < len(lines) and re.match(r'^[\s]*[-*+]\s+', lines[i]):
                 text = re.sub(r'^[\s]*[-*+]\s+', '', lines[i])
                 p = doc.add_paragraph(style='List Bullet')
-                _add_inline_formatting(p, text)
+                _add_inline_formatting(p, text, bm_counter)
                 i += 1
             continue
         
@@ -410,7 +497,7 @@ def export_to_docx(md_content: str, output_path: str,
             while i < len(lines) and re.match(r'^[\s]*\d+\.\s+', lines[i]):
                 text = re.sub(r'^[\s]*\d+\.\s+', '', lines[i])
                 p = doc.add_paragraph(style='List Number')
-                _add_inline_formatting(p, text)
+                _add_inline_formatting(p, text, bm_counter)
                 i += 1
             continue
         
@@ -445,7 +532,7 @@ def export_to_docx(md_content: str, output_path: str,
         
         if para_lines:
             p = doc.add_paragraph()
-            _add_inline_formatting(p, ' '.join(para_lines))
+            _add_inline_formatting(p, ' '.join(para_lines), bm_counter)
     
     doc.save(output_path)
     return True
@@ -504,15 +591,16 @@ def _add_code_block(doc, code: str, language: str = ""):
     shading.append(shd)
 
 
-def _add_inline_formatting(paragraph, text: str):
+def _add_inline_formatting(paragraph, text: str, bm_counter: Optional[List[int]] = None):
     """Parse inline markdown formatting and add runs to a paragraph"""
-    # Pattern for **bold**, *italic*, `code`, [links](url)
     pattern = re.compile(
-        r'(\*\*(.+?)\*\*)'       # bold
-        r'|(\*(.+?)\*)'            # italic
-        r'|(`(.+?)`)'              # inline code
-        r'|(\[([^\]]+)\]\(([^)]+)\))'  # link
-        r'|(~~(.+?)~~)'            # strikethrough
+        r'(\*\*(.+?)\*\*)'       # bold (1, 2)
+        r'|(\*(.+?)\*)'            # italic (3, 4)
+        r'|(`(.+?)`)'              # inline code (5, 6)
+        r'|(\[([^\]]+)\]\(([^)]+)\))'  # link (7, 8, 9)
+        r'|(~~(.+?)~~)'            # strikethrough (10, 11)
+        r'|(\[@(?:anchor|def):\s*([^\]\n]+)\])'  # anchor definition (12, 13)
+        r'|(\[@(?!(?:anchor|def):)([^\]\n]+)\])'  # anchor reference (14, 15)
     )
     
     last_end = 0
@@ -534,12 +622,29 @@ def _add_inline_formatting(paragraph, text: str):
         elif match.group(8):  # link
             link_text = match.group(8)
             link_url = match.group(9)
-            run = paragraph.add_run(f"{link_text} ({link_url})")
-            run.font.color.rgb = RGBColor(0x00, 0x66, 0xCC)
-            run.underline = True
+            if link_url.startswith(('#', '@')):
+                bm_name = _clean_bookmark_name(link_url.lstrip('#@'))
+                _add_docx_internal_hyperlink(paragraph, link_text, bm_name)
+            else:
+                run = paragraph.add_run(f"{link_text} ({link_url})")
+                run.font.color.rgb = RGBColor(0x00, 0x66, 0xCC)
+                run.underline = True
         elif match.group(11):  # strikethrough
             run = paragraph.add_run(match.group(11))
             run.font.strike = True
+        elif match.group(12):  # [@anchor: point]
+            anchor_raw = match.group(13).strip()
+            bm_name = _clean_bookmark_name(anchor_raw)
+            if bm_counter is not None:
+                bm_counter[0] += 1
+                bm_id = bm_counter[0]
+            else:
+                bm_id = 1
+            _add_docx_bookmark(paragraph, bm_name, bm_id)
+        elif match.group(14):  # [@point]
+            ref_raw = match.group(15).strip()
+            bm_name = _clean_bookmark_name(ref_raw)
+            _add_docx_internal_hyperlink(paragraph, f"[@{ref_raw}]", bm_name)
         
         last_end = match.end()
     

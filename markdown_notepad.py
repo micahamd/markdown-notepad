@@ -24,7 +24,15 @@ import queue
 import time
 import json
 import shutil
+import webbrowser
 from pathlib import Path
+
+
+def _normalize_anchor_key(label: str) -> str:
+    """Normalize an anchor or reference label for cross-reference matching."""
+    if not label:
+        return ''
+    return re.sub(r'\s+', ' ', label.strip().lower())
 
 # Try to import PIL for image handling
 try:
@@ -987,6 +995,10 @@ class MarkdownVisualWidget(tk.Frame):
         self._rendered_width = None
         self._hr_color = "#cbd5e1"
         self.on_zoom_wheel = None
+        self._anchor_marks = {}
+        self._heading_marks = {}
+        self._nav_history = []
+        self._link_counter = 0
         self._setup_widget()
     
     def _setup_widget(self):
@@ -1019,9 +1031,11 @@ class MarkdownVisualWidget(tk.Frame):
         # Setup text tags for styling
         self._setup_text_tags()
         
-        # Bind mousewheel and zoom
+        # Bind mousewheel, zoom, and navigation
         self.text_widget.bind("<MouseWheel>", self._on_mousewheel)
         self.text_widget.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
+        self.text_widget.bind("<Alt-Left>", lambda e: self.navigate_back())
+        self.bind("<Alt-Left>", lambda e: self.navigate_back())
 
         # Right-click context menu for selection and copying
         self._setup_context_menu()
@@ -1189,7 +1203,7 @@ class MarkdownVisualWidget(tk.Frame):
             self.text_widget.config(state=tk.DISABLED)
             self._restore_yview()
     
-    # Inline markdown pattern: captures bold, italic, highlight, code, links in order
+    # Inline markdown pattern: captures bold, italic, highlight, code, anchors, links in order
     _INLINE_RE = re.compile(
         r'(\*\*|__)(?P<bold>.+?)\1'        # **bold** or __bold__
         r'|(?<!\*)\*(?!\*)(?P<italic>.+?)(?<!\*)\*(?!\*)'  # *italic*
@@ -1197,7 +1211,9 @@ class MarkdownVisualWidget(tk.Frame):
         r'|==(?P<highlight>[^=\n]+)=='     # ==highlight==
         r'|<mark>(?P<mark_text>.*?)</mark>' # <mark>highlight</mark>
         r'|`(?P<code>[^`]+)`'              # `code`
-        r'|\[(?P<link_label>[^\]]+)\]\([^\)]+\)'            # [label](url)
+        r'|\[@(?:anchor|def):\s*(?P<anchor_name>[^\]\n]+)\]' # [@anchor: point]
+        r'|\[@(?!(?:anchor|def):)(?P<ref_name>[^\]\n]+)\]'   # [@point]
+        r'|\[(?P<link_label>[^\]]+)\]\((?P<link_url>[^\)]+)\)' # [label](url)
     )
 
     def _insert_inline(self, text, base_tags=()):
@@ -1226,8 +1242,41 @@ class MarkdownVisualWidget(tk.Frame):
                 tw.insert(tk.END, m.group('mark_text'), base_tags + ('highlight',) if base_tags else 'highlight')
             elif m.group('code') is not None:
                 tw.insert(tk.END, m.group('code'), base_tags + ('code',) if base_tags else 'code')
+            elif m.group('anchor_name') is not None:
+                raw_anchor = m.group('anchor_name').strip()
+                key = _normalize_anchor_key(raw_anchor)
+                self._link_counter += 1
+                mark_name = f"anc_{self._link_counter}"
+                tw.mark_set(mark_name, "end-1c")
+                tw.mark_gravity(mark_name, tk.LEFT)
+                self._anchor_marks[key] = mark_name
+                anc_tag = f"anc_badge_{self._link_counter}"
+                tw.insert(tk.END, f"⚓ {raw_anchor}", base_tags + ('anchor_badge', anc_tag) if base_tags else ('anchor_badge', anc_tag))
+                tw.tag_bind(anc_tag, "<Button-1>", lambda e, r=raw_anchor: self._copy_anchor_ref(r))
+                tw.tag_bind(anc_tag, "<Enter>", lambda e: tw.config(cursor="hand2"))
+                tw.tag_bind(anc_tag, "<Leave>", lambda e: tw.config(cursor=""))
+            elif m.group('ref_name') is not None:
+                raw_ref = m.group('ref_name').strip()
+                key = _normalize_anchor_key(raw_ref)
+                self._link_counter += 1
+                tag_id = f"link_ref_{self._link_counter}"
+                tw.insert(tk.END, f"[@{raw_ref}]", base_tags + ('link', tag_id) if base_tags else ('link', tag_id))
+                tw.tag_bind(tag_id, "<Button-1>", lambda e, k=key, r=raw_ref: self._jump_to_anchor(k, r))
+                tw.tag_bind(tag_id, "<Enter>", lambda e: tw.config(cursor="hand2"))
+                tw.tag_bind(tag_id, "<Leave>", lambda e: tw.config(cursor=""))
             elif m.group('link_label') is not None:
-                tw.insert(tk.END, m.group('link_label'), base_tags + ('link',) if base_tags else 'link')
+                label = m.group('link_label')
+                url = (m.group('link_url') or '').strip()
+                self._link_counter += 1
+                tag_id = f"link_url_{self._link_counter}"
+                tw.insert(tk.END, label, base_tags + ('link', tag_id) if base_tags else ('link', tag_id))
+                if url.startswith(('#', '@')):
+                    target_key = _normalize_anchor_key(url.lstrip('#@'))
+                    tw.tag_bind(tag_id, "<Button-1>", lambda e, k=target_key, r=label: self._jump_to_anchor(k, r))
+                else:
+                    tw.tag_bind(tag_id, "<Button-1>", lambda e, u=url: self._open_external_link(u))
+                tw.tag_bind(tag_id, "<Enter>", lambda e: tw.config(cursor="hand2"))
+                tw.tag_bind(tag_id, "<Leave>", lambda e: tw.config(cursor=""))
             pos = m.end()
         # Insert any remaining plain text
         if pos < len(text):
@@ -1235,6 +1284,9 @@ class MarkdownVisualWidget(tk.Frame):
 
     def _render_content(self, markdown_text, images, is_chunk=False):
         """Render markdown content efficiently into the single text widget"""
+        self._anchor_marks.clear()
+        self._heading_marks.clear()
+        self._link_counter = 0
         # Build a map of image positions
         image_positions = {img['start']: img for img in images}
         
@@ -1307,21 +1359,27 @@ class MarkdownVisualWidget(tk.Frame):
             
             # Headers
             if line.startswith('######'):
+                self._register_heading(line[6:].strip())
                 self._insert_inline(line[6:].strip(), ('h6',))
                 self.text_widget.insert(tk.END, '\n', 'h6')
             elif line.startswith('#####'):
+                self._register_heading(line[5:].strip())
                 self._insert_inline(line[5:].strip(), ('h5',))
                 self.text_widget.insert(tk.END, '\n', 'h5')
             elif line.startswith('####'):
+                self._register_heading(line[4:].strip())
                 self._insert_inline(line[4:].strip(), ('h4',))
                 self.text_widget.insert(tk.END, '\n', 'h4')
             elif line.startswith('###'):
+                self._register_heading(line[3:].strip())
                 self._insert_inline(line[3:].strip(), ('h3',))
                 self.text_widget.insert(tk.END, '\n', 'h3')
             elif line.startswith('##'):
+                self._register_heading(line[2:].strip())
                 self._insert_inline(line[2:].strip(), ('h2',))
                 self.text_widget.insert(tk.END, '\n', 'h2')
             elif line.startswith('#'):
+                self._register_heading(line[1:].strip())
                 self._insert_inline(line[1:].strip(), ('h1',))
                 self.text_widget.insert(tk.END, '\n', 'h1')
             
@@ -1637,6 +1695,14 @@ class MarkdownVisualWidget(tk.Frame):
             first = self._s(16 + 22 * depth)
             tw.tag_configure(f"list_d{depth}", lmargin1=first, lmargin2=first + self._s(16))
         tw.tag_configure("link", foreground=link_fg, underline=True)
+        # Anchor badge styling
+        anc_bg = "#2e1065" if is_dark else "#ede9fe"
+        anc_fg = "#c4b5fd" if is_dark else "#6d28d9"
+        tw.tag_configure("anchor_badge", font=(font_family, self._px(font_size, 0.85), "bold"),
+                         foreground=anc_fg, background=anc_bg)
+        flash_bg = "#854d0e" if is_dark else "#fef08a"
+        flash_fg = "#fef9c3" if is_dark else "#1a1a1a"
+        tw.tag_configure("flash_target", background=flash_bg, foreground=flash_fg)
         tw.tag_configure("hr", font=(font_family, -2), foreground=hr_fg, spacing1=0, spacing3=self._s(4))
 
         # Image alignment and caption styles
@@ -1672,6 +1738,108 @@ class MarkdownVisualWidget(tk.Frame):
         self.page_view.set_colors(theme.get('desk_bg', '#d9dce1'), bg)
         self._update_tags_for_theme(theme)
         self._schedule_rerender()
+
+    def _register_heading(self, text: str):
+        """Register a heading as an internal jump mark."""
+        clean = text.strip()
+        key = _normalize_anchor_key(clean)
+        if key:
+            mark_name = f"head_{len(self._heading_marks)}"
+            self.text_widget.mark_set(mark_name, "end-1c")
+            self.text_widget.mark_gravity(mark_name, tk.LEFT)
+            self._heading_marks[key] = mark_name
+
+    def _jump_to_anchor(self, key: str, label: str = ""):
+        """Jump smoothly to an anchor or heading target mark."""
+        tw = self.text_widget
+        target_mark = None
+        if key in self._anchor_marks:
+            target_mark = self._anchor_marks[key]
+        elif key in self._heading_marks:
+            target_mark = self._heading_marks[key]
+        else:
+            # Fallback: check without non-alphanumeric chars
+            slug = re.sub(r'[^a-z0-9]', '', key)
+            for k, m in self._anchor_marks.items():
+                if re.sub(r'[^a-z0-9]', '', k) == slug:
+                    target_mark = m
+                    break
+            if not target_mark:
+                for k, m in self._heading_marks.items():
+                    if re.sub(r'[^a-z0-9]', '', k) == slug:
+                        target_mark = m
+                        break
+        
+        if target_mark and target_mark in tw.mark_names():
+            try:
+                curr_idx = tw.index("@0,0")
+                if not self._nav_history or self._nav_history[-1] != curr_idx:
+                    self._nav_history.append(curr_idx)
+                    if len(self._nav_history) > 50:
+                        self._nav_history.pop(0)
+            except Exception:
+                pass
+            
+            tw.see(target_mark)
+            self._flash_target(target_mark)
+            notepad = self._get_notepad()
+            if notepad and hasattr(notepad, '_set_status'):
+                notepad._set_status(f"Jumped to [@anchor: {label}]  (Alt+Left to return)")
+        else:
+            notepad = self._get_notepad()
+            if notepad and hasattr(notepad, '_set_status'):
+                notepad._set_status(f"Anchor '[@anchor: {label}]' not found in document")
+
+    def _flash_target(self, mark_name: str):
+        """Briefly highlight the target anchor/line for visual confirmation."""
+        tw = self.text_widget
+        try:
+            line_start = tw.index(f"{mark_name} linestart")
+            line_end = tw.index(f"{mark_name} lineend+1c")
+            tw.tag_add("flash_target", line_start, line_end)
+            tw.tag_raise("flash_target")
+            self.after(1200, lambda: tw.tag_remove("flash_target", "1.0", tk.END))
+        except tk.TclError:
+            pass
+
+    def _open_external_link(self, url: str):
+        """Open an external web URL or mailto link."""
+        if url.startswith(('http://', 'https://', 'mailto:')):
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+    def _copy_anchor_ref(self, label: str):
+        """Copy the reference shorthand [@label] to clipboard on anchor badge click."""
+        try:
+            ref_text = f"[@{label}]"
+            self.clipboard_clear()
+            self.clipboard_append(ref_text)
+            notepad = self._get_notepad()
+            if notepad and hasattr(notepad, '_set_status'):
+                notepad._set_status(f"Copied '{ref_text}' to clipboard")
+        except Exception:
+            pass
+
+    def navigate_back(self):
+        """Navigate back to the previous jump location (Alt+Left)."""
+        if self._nav_history:
+            prev_idx = self._nav_history.pop()
+            try:
+                self.text_widget.see(prev_idx)
+                notepad = self._get_notepad()
+                if notepad and hasattr(notepad, '_set_status'):
+                    notepad._set_status("Returned to previous location")
+                return "break"
+            except Exception:
+                pass
+        return None
+
+    def _get_notepad(self):
+        """Find the top-level MarkdownNotepad instance if available."""
+        top = self.winfo_toplevel()
+        return top if hasattr(top, '_set_status') else None
 
 
 class DocumentTab(ttk.Frame):
@@ -1733,8 +1901,9 @@ class DocumentTab(ttk.Frame):
         self.visual_viewer.apply_theme(theme)
         self.apply_page_settings()
         
-        # Setup modification tracking
+        # Setup modification tracking and Ctrl+Click navigation
         self.source_editor.bind("<<Modified>>", self._on_text_modified)
+        self.source_editor.bind("<Control-Button-1>", self._on_source_ctrl_click)
 
     # --- page / zoom -----------------------------------------------------------
 
@@ -1857,6 +2026,9 @@ class DocumentTab(ttk.Frame):
         editor.tag_configure('syn_code_block',  font=(mono, px(sz)), background='#282c34', foreground='#abb2bf',
                              lmargin1=int(20 * k96))
         editor.tag_configure('syn_link',        foreground=link_fg, underline=True)
+        anc_fg = '#c084fc' if dark else '#7c3aed'
+        editor.tag_configure('syn_anchor',      foreground=anc_fg, font=(mono, px(sz), 'bold'))
+        editor.tag_configure('syn_flash',       background=hl_bg, foreground=hl_fg)
         editor.tag_configure('syn_blockquote',  font=(mono, px(sz), 'italic'), foreground=quote_fg,
                              lmargin1=int(30 * k96))
         editor.tag_configure('syn_list_marker', font=(mono, px(sz), 'bold'), foreground=link_fg)
@@ -1867,7 +2039,7 @@ class DocumentTab(ttk.Frame):
         editor = self.source_editor
         for tag in ('syn_h1', 'syn_h2', 'syn_h3', 'syn_h4', 'syn_bold', 'syn_italic',
                     'syn_highlight', 'syn_code_inline', 'syn_code_block', 'syn_link',
-                    'syn_blockquote', 'syn_list_marker', 'syn_hr'):
+                    'syn_anchor', 'syn_flash', 'syn_blockquote', 'syn_list_marker', 'syn_hr'):
             editor.tag_remove(tag, '1.0', tk.END)
 
         content = editor.get('1.0', tk.END)
@@ -1908,8 +2080,79 @@ class DocumentTab(ttk.Frame):
                 editor.tag_add('syn_highlight', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'`([^`]+)`', line):
                 editor.tag_add('syn_code_inline', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', line):
+                editor.tag_add('syn_anchor',  f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', line):
+                editor.tag_add('syn_link',    f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'\[([^\]]+)\]\([^\)]+\)', line):
                 editor.tag_add('syn_link',    f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+
+    def _on_source_ctrl_click(self, event):
+        """Handle Ctrl+Click on links or anchor references in source mode to jump to target."""
+        editor = self.source_editor
+        click_idx = editor.index(f"@{event.x},{event.y}")
+        try:
+            line_num, col_num = map(int, click_idx.split('.'))
+        except (ValueError, TypeError):
+            return None
+        line = editor.get(f"{line_num}.0", f"{line_num}.end")
+
+        target_ref = None
+        # Check [@point]
+        for m in re.finditer(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', line):
+            if m.start() <= col_num <= m.end():
+                target_ref = m.group(1).strip()
+                break
+
+        # Check [label](url or #anchor)
+        if not target_ref:
+            for m in re.finditer(r'\[([^\]]+)\]\(([^)]+)\)', line):
+                if m.start() <= col_num <= m.end():
+                    u = m.group(2).strip()
+                    if u.startswith(('#', '@')):
+                        target_ref = u.lstrip('#@').strip()
+                    elif u.startswith(('http://', 'https://', 'mailto:')):
+                        try:
+                            webbrowser.open(u)
+                        except Exception:
+                            pass
+                        return "break"
+                    break
+
+        if target_ref:
+            ref_norm = _normalize_anchor_key(target_ref)
+            content = editor.get("1.0", tk.END)
+            anchor_pat = re.compile(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', re.IGNORECASE)
+            found_idx = None
+            for am in anchor_pat.finditer(content):
+                if _normalize_anchor_key(am.group(1)) == ref_norm:
+                    found_idx = f"1.0 + {am.start()} chars"
+                    break
+
+            # Fallback to heading if not found as explicit anchor
+            if not found_idx:
+                heading_pat = re.compile(r'^#{1,6}\s+(.+)$', re.MULTILINE)
+                for hm in heading_pat.finditer(content):
+                    if _normalize_anchor_key(hm.group(1)) == ref_norm:
+                        found_idx = f"1.0 + {hm.start()} chars"
+                        break
+
+            if found_idx:
+                editor.mark_set(tk.INSERT, found_idx)
+                editor.see(found_idx)
+                line_start = editor.index(f"{found_idx} linestart")
+                line_end = editor.index(f"{found_idx} lineend+1c")
+                editor.tag_add('syn_flash', line_start, line_end)
+                self.after(1200, lambda: editor.tag_remove('syn_flash', '1.0', tk.END))
+                top = self.winfo_toplevel()
+                if hasattr(top, '_set_status'):
+                    top._set_status(f"Jumped to anchor '[@anchor: {target_ref}]'")
+                return "break"
+            else:
+                top = self.winfo_toplevel()
+                if hasattr(top, '_set_status'):
+                    top._set_status(f"Anchor '[@anchor: {target_ref}]' not found in document")
+        return None
 
 
 class OutlinePanel(ttk.Frame):
@@ -2444,6 +2687,8 @@ class MarkdownNotepad(tk.Tk):
         format_menu.add_command(label="Horizontal Rule", command=lambda: self._insert_text("\n---\n"))
         format_menu.add_command(label="Code Block", command=lambda: self._insert_text("\n```\n\n```\n"))
         format_menu.add_command(label="Link", command=lambda: self._insert_format("[", "](url)"))
+        format_menu.add_command(label="Anchor (Bookmark)", command=lambda: self._insert_format("[@anchor: ", "]"))
+        format_menu.add_command(label="Anchor Reference", command=lambda: self._insert_format("[@", "]"))
         format_menu.add_separator()
         format_menu.add_command(label="Insert Image...", command=self.insert_image, accelerator="Ctrl+Shift+I")
         format_menu.add_command(label="Manage Images...", command=self.manage_images)
@@ -2518,6 +2763,7 @@ class MarkdownNotepad(tk.Tk):
         add_format_button("HL", lambda: self._insert_format("==", "=="), 3, "Highlight (Ctrl+Shift+H)")
         add_format_button("</>", lambda: self._insert_format("`", "`"), 3, "Inline Code (Ctrl+`)")
         add_format_button("Link", lambda: self._insert_format("[", "](url)"), 4, "Insert Link")
+        add_format_button("Anchor", lambda: self._insert_format("[@anchor: ", "]"), 6, "Insert Anchor [@anchor: name]")
         add_format_button("Image", self.insert_image, 5, "Insert Image (Ctrl+Shift+I)")
         
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
@@ -2659,6 +2905,10 @@ class MarkdownNotepad(tk.Tk):
         # Focus mode toggle
         self.bind("<F11>", lambda e: self._toggle_focus_mode())
         
+        # Navigation back (Alt+Left)
+        self.bind("<Alt-Left>", lambda e: self._navigate_back())
+        self.bind("<Alt-Key-Left>", lambda e: self._navigate_back())
+        
         # Position update state
         self._position_update_pending = False
         
@@ -2674,6 +2924,12 @@ class MarkdownNotepad(tk.Tk):
         self._syntax_hl_pending = False
         if self.current_tab:
             self.current_tab._apply_syntax_highlighting()
+
+    def _navigate_back(self):
+        """Navigate back to previous jump location in visual mode."""
+        if self.current_tab:
+            return self.current_tab.visual_viewer.navigate_back()
+        return None
 
     def _jump_to_line(self, lineno: int):
         if not self.current_tab:
