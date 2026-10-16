@@ -26,6 +26,7 @@ import json
 import shutil
 import webbrowser
 from pathlib import Path
+from typing import Optional, List, Dict, Tuple, Any, Callable, Set, Union
 
 
 def _normalize_anchor_key(label: str) -> str:

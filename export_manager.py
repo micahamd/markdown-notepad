@@ -11,7 +11,7 @@ import re
 import base64
 import tempfile
 from pathlib import Path
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple, List, Any, Callable, Set, Union
 
 # Try to import markdown
 try:
