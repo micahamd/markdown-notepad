@@ -2159,6 +2159,7 @@ class DocumentTab(ttk.Frame):
         self.current_mode = "source"
         self.word_wrap = True
         self.zoom = 1.0
+        self.snapshots = []
         
         desk_bg = theme.get('desk_bg', '#d9dce1')
         
@@ -3792,6 +3793,9 @@ class MarkdownNotepad(tk.Tk):
         file_menu.add_command(label="Save", command=self.save_file, accelerator="Ctrl+S")
         file_menu.add_command(label="Save As...", command=self.save_file_as, accelerator="Ctrl+Shift+S")
         file_menu.add_separator()
+        file_menu.add_command(label="Save Quick Snapshot (Checkpoint)", command=self.create_quick_snapshot, accelerator="Ctrl+Alt+S")
+        file_menu.add_command(label="Document Snapshots (Checkpoints)...", command=self.open_snapshots_dialog, accelerator="Ctrl+Shift+P")
+        file_menu.add_separator()
         
         # Export submenu
         export_menu = tk.Menu(file_menu, tearoff=0)
@@ -3971,6 +3975,10 @@ class MarkdownNotepad(tk.Tk):
         save_btn.pack(side=tk.LEFT, padx=1)
         ToolTip(save_btn, "Save File (Ctrl+S)")
 
+        snap_btn = ttk.Button(toolbar, text="\U0001f552 Snapshots", command=self.open_snapshots_dialog, style="Toolbar.TButton")
+        snap_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(snap_btn, "Document Snapshots / Checkpoints — Save, compare & restore versions (Ctrl+Alt+S / Ctrl+Shift+P)")
+
         reflow_btn = ttk.Button(toolbar, text="\u21bb Reflow", command=self.clean_current_document, style="Toolbar.TButton")
         reflow_btn.pack(side=tk.LEFT, padx=1)
         ToolTip(reflow_btn, "Clean & Reflow Document — Fix soft wraps & broken lines (Ctrl+Shift+R)")
@@ -4134,6 +4142,10 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-O>", lambda e: self.open_with_markitdown())  # Ctrl+Shift+O
         self.bind("<Control-s>", lambda e: self.save_file())
         self.bind("<Control-S>", lambda e: self.save_file_as())  # Ctrl+Shift+S
+        self.bind("<Control-Alt-s>", self._doc_shortcut(self.create_quick_snapshot))
+        self.bind("<Control-Alt-S>", self._doc_shortcut(self.create_quick_snapshot))
+        self.bind("<Control-P>", self._doc_shortcut(self.open_snapshots_dialog))
+        self.bind("<Control-Shift-P>", self._doc_shortcut(self.open_snapshots_dialog))
         self.bind("<Control-I>", lambda e: self.insert_image())  # Ctrl+Shift+I
         self.bind("<Control-w>", lambda e: self.close_tab())  # Close tab
         self.bind("<Control-W>", lambda e: self._toggle_word_wrap())  # Ctrl+Shift+W for word wrap
@@ -4277,6 +4289,7 @@ class MarkdownNotepad(tk.Tk):
                     tab.set_content(tab_state.content)
                     tab.is_modified = tab_state.is_modified
                     tab.current_mode = tab_state.current_mode
+                    tab.snapshots = list(getattr(tab_state, 'snapshots', []) or [])
                     
                     # Add to notebook
                     tab_name = tab.get_display_name()
@@ -4350,7 +4363,8 @@ class MarkdownNotepad(tk.Tk):
                 cursor_position=tab.source_editor.index(tk.INSERT),
                 scroll_position=tab.source_editor.yview()[0],
                 current_mode=tab.current_mode,
-                is_modified=tab.is_modified
+                is_modified=tab.is_modified,
+                snapshots=getattr(tab, 'snapshots', [])
             )
             self.session_manager.state.tabs.append(tab_state)
         
@@ -4679,50 +4693,89 @@ class MarkdownNotepad(tk.Tk):
                 llm_client=llm_client,
                 settings=ai_settings,
                 messages=messages,
+                theme=self.theme,
             )
         else:
             messagebox.showwarning("Unavailable", "Diff panel module not found.")
 
-    def _apply_diff(self, replacement_text, start_index, end_index, original_text):
-        """Apply a diff replacement to the current document"""
+    def _apply_diff(self, replacement_text, start_index, end_index, original_text, apply_mode="replace"):
+        """Apply a diff replacement or insertion to the current document."""
         if not self.current_tab:
             return
         
         editor = self.current_tab.source_editor
         
-        # Verify the original text is still there (stale check)
-        try:
-            current_text = editor.get(start_index, end_index)
-        except tk.TclError:
-            messagebox.showwarning("Warning", "Could not locate the original text position.")
-            return
-        
-        if current_text != original_text:
-            if not messagebox.askyesno("Text Changed",
-                "The original text has been modified since the suggestion was generated.\n\n"
-                "Apply the replacement anyway?"):
+        if apply_mode == "cursor":
+            insert_pos = editor.index(tk.INSERT)
+            editor.insert(insert_pos, replacement_text)
+            action_desc = f"Inserted at cursor ({len(replacement_text)} chars)"
+        elif apply_mode == "append":
+            existing = editor.get('1.0', 'end-1c')
+            prefix = "\n\n" if existing.strip() else ""
+            editor.insert(tk.END, prefix + replacement_text)
+            action_desc = f"Appended to document ({len(replacement_text)} chars)"
+        elif apply_mode == "full":
+            editor.delete('1.0', tk.END)
+            editor.insert('1.0', replacement_text)
+            action_desc = f"Replaced entire document ({len(replacement_text)} chars)"
+        else:
+            # Default: replace target range
+            start_idx = start_index or '1.0'
+            end_idx = end_index or tk.END
+            try:
+                current_text = editor.get(start_idx, end_idx)
+                if end_idx == tk.END:
+                    current_text = current_text.rstrip('\n')
+            except tk.TclError:
+                messagebox.showwarning("Warning", "Could not locate the original text position.")
                 return
+            
+            if original_text and current_text.rstrip('\n') != original_text.rstrip('\n'):
+                if not messagebox.askyesno("Text Changed",
+                    "The original text has been modified since the suggestion was generated.\n\n"
+                    "Apply the replacement anyway?"):
+                    return
+            
+            editor.delete(start_idx, end_idx)
+            editor.insert(start_idx, replacement_text)
+            action_desc = f"Applied edit ({len(replacement_text)} chars)"
         
-        # Apply the replacement
-        editor.delete(start_index, end_index)
-        editor.insert(start_index, replacement_text)
-        
-        # Mark as modified
+        # Mark as modified and refresh UI state
         self.current_tab.is_modified = True
         self._update_tab_title(self.current_tab)
+        self._schedule_syntax_highlight()
+        self._schedule_outline_update()
         
         # Update visual viewer if in visual mode
         if self.current_tab.current_mode == "visual":
             content = self.current_tab.source_editor.get('1.0', tk.END).rstrip()
             self.current_tab.visual_viewer.set_content(content)
         
-        self._set_status(f"Applied edit ({len(replacement_text)} chars)")
+        self._set_status(action_desc)
 
     def _on_apply_edit_from_chat(self, original_text, replacement_text, start_index, end_index):
-        """Callback from ChatSidebar 'Apply to Document' — opens the diff panel"""
+        """Callback from ChatSidebar 'Apply to Document' or 'Review & Apply' — opens the diff panel."""
+        if not self.current_tab:
+            return
+        
+        default_mode = "replace"
+        if original_text is None or start_index is None:
+            # Check if the user currently has text selected in the active editor
+            editor = self.current_tab.source_editor if self.current_tab.current_mode == "source" else self.current_tab.visual_viewer.text_widget
+            sel_text, sel_start, sel_end = self._get_selection_info(editor)
+            if sel_text and self.current_tab.current_mode == "source":
+                original_text = sel_text
+                start_index = sel_start
+                end_index = sel_end
+                default_mode = "replace"
+            else:
+                original_text = self.current_tab.get_content()
+                start_index = "1.0"
+                end_index = tk.END
+                default_mode = "replace" if original_text.strip() else "cursor"
+        
         if not DIFF_PANEL_AVAILABLE:
-            # Fallback: apply directly
-            self._apply_diff(replacement_text, start_index, end_index, original_text)
+            self._apply_diff(replacement_text, start_index, end_index, original_text, default_mode)
             return
         
         panel = DiffPanel(
@@ -4730,10 +4783,45 @@ class MarkdownNotepad(tk.Tk):
             original_text=original_text,
             start_index=start_index,
             end_index=end_index,
-            action_name="Apply from Chat",
+            action_name="Review & Apply from Chat",
             on_accept=self._apply_diff,
+            theme=self.theme,
+            default_apply_mode=default_mode,
         )
         panel.set_suggestion(replacement_text)
+
+    # === Document Snapshots (Checkpoints) Methods ===
+
+    def create_quick_snapshot(self, name: Optional[str] = None):
+        """Create a named snapshot checkpoint of the current document."""
+        if not self.current_tab:
+            return
+        from datetime import datetime
+        content = self.current_tab.get_content()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        short_time = datetime.now().strftime("%H:%M:%S")
+        if not hasattr(self.current_tab, 'snapshots') or self.current_tab.snapshots is None:
+            self.current_tab.snapshots = []
+        idx = len(self.current_tab.snapshots) + 1
+        snap_name = name.strip() if (name and name.strip()) else f"Checkpoint #{idx} ({short_time})"
+        word_count = len(content.split()) if content.strip() else 0
+        snapshot = {
+            'name': snap_name,
+            'timestamp': now_str,
+            'content': content,
+            'word_count': word_count,
+        }
+        self.current_tab.snapshots.append(snapshot)
+        if self.session_manager and self.session_manager.is_caching_enabled():
+            self._save_session()
+        self._set_status(f"Saved snapshot: '{snap_name}' ({word_count} words)")
+        return snapshot
+
+    def open_snapshots_dialog(self):
+        """Open the Document Snapshots / Checkpoints manager dialog."""
+        if not self.current_tab:
+            return
+        SnapshotDialog(self, self.current_tab)
 
     # === Export Methods ===
 
@@ -7709,6 +7797,253 @@ class MathSymbolDialog(tk.Toplevel):
             else:
                 self.notepad._insert_text(prefix)
             self.notepad.current_tab.source_editor.focus_set()
+
+
+class SnapshotDialog(tk.Toplevel):
+    """
+    Dialog for creating, previewing, comparing (via DiffPanel), and restoring
+    named document snapshots (Git-like version checkpoints).
+    """
+
+    def __init__(self, notepad: 'MarkdownNotepad', tab: 'DocumentTab'):
+        super().__init__(notepad)
+        self.notepad = notepad
+        self.tab = tab
+        if not hasattr(self.tab, 'snapshots') or self.tab.snapshots is None:
+            self.tab.snapshots = []
+
+        self.title(f"Document Snapshots — {self.tab.get_display_name()}")
+        self.geometry("760x520")
+        self.minsize(600, 380)
+        self.transient(notepad)
+
+        self._setup_ui()
+        self._refresh_list()
+
+        # Center on parent
+        self.update_idletasks()
+        x = notepad.winfo_rootx() + (notepad.winfo_width() - self.winfo_width()) // 2
+        y = notepad.winfo_rooty() + (notepad.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.name_entry.focus_set()
+
+    def _setup_ui(self):
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        # Create new snapshot bar
+        top_bar = ttk.LabelFrame(main, text="Create New Checkpoint Snapshot", padding=(8, 6))
+        top_bar.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(top_bar, text="Checkpoint Label:", font=(SANS_FONT, 9)).pack(side=tk.LEFT, padx=(0, 6))
+        self.name_var = tk.StringVar()
+        self.name_entry = ttk.Entry(top_bar, textvariable=self.name_var, font=(SANS_FONT, 9))
+        self.name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.name_entry.bind("<Return>", lambda e: self._on_create())
+
+        ttk.Button(
+            top_bar, text="\u2795 Save Snapshot", command=self._on_create
+        ).pack(side=tk.RIGHT)
+
+        # Paned window: snapshot list on top, content preview on bottom
+        paned = ttk.PanedWindow(main, orient=tk.VERTICAL)
+        paned.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        list_frame = ttk.LabelFrame(paned, text="Saved Snapshots (Newest at Bottom)", padding=4)
+        paned.add(list_frame, weight=1)
+
+        cols = ("idx", "name", "timestamp", "words", "delta")
+        self.tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="browse", height=7)
+        self.tree.heading("idx", text="#")
+        self.tree.heading("name", text="Checkpoint Name")
+        self.tree.heading("timestamp", text="Timestamp")
+        self.tree.heading("words", text="Words")
+        self.tree.heading("delta", text="Delta vs Current")
+
+        self.tree.column("idx", width=40, anchor="center", stretch=False)
+        self.tree.column("name", width=260, anchor="w")
+        self.tree.column("timestamp", width=155, anchor="center", stretch=False)
+        self.tree.column("words", width=75, anchor="e", stretch=False)
+        self.tree.column("delta", width=120, anchor="center", stretch=False)
+
+        vbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vbar.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Double-1>", lambda e: self._on_compare())
+
+        preview_frame = ttk.LabelFrame(paned, text="Snapshot Content Preview", padding=4)
+        paned.add(preview_frame, weight=1)
+
+        bg = self.notepad.theme.get('source_bg', '#ffffff')
+        fg = self.notepad.theme.get('source_fg', '#1a1a1a')
+        self.preview_text = scrolledtext.ScrolledText(
+            preview_frame, wrap=tk.WORD, font=(MONO_FONT, 9),
+            bg=bg, fg=fg, state=tk.DISABLED, relief=tk.FLAT, padx=6, pady=4, height=8
+        )
+        self.preview_text.pack(fill=tk.BOTH, expand=True)
+
+        # Action buttons
+        btn_bar = ttk.Frame(main)
+        btn_bar.pack(fill=tk.X)
+
+        self.compare_btn = ttk.Button(
+            btn_bar, text="\u21c4 Compare & Review in Diff Panel",
+            command=self._on_compare, state=tk.DISABLED
+        )
+        self.compare_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.restore_btn = ttk.Button(
+            btn_bar, text="\u23ea Restore Snapshot",
+            command=self._on_restore, state=tk.DISABLED
+        )
+        self.restore_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.delete_btn = ttk.Button(
+            btn_bar, text="\U0001f5d1 Delete",
+            command=self._on_delete, state=tk.DISABLED
+        )
+        self.delete_btn.pack(side=tk.LEFT)
+
+        ttk.Button(btn_bar, text="Close", command=self.destroy, width=9).pack(side=tk.RIGHT)
+
+    def _refresh_list(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        curr_content = self.tab.get_content()
+        curr_words = len(curr_content.split()) if curr_content.strip() else 0
+
+        for idx, snap in enumerate(self.tab.snapshots):
+            snap_words = snap.get('word_count', len(snap.get('content', '').split()))
+            diff_w = snap_words - curr_words
+            if snap.get('content', '') == curr_content:
+                delta_str = "Identical"
+            elif diff_w > 0:
+                delta_str = f"+{diff_w} words"
+            elif diff_w < 0:
+                delta_str = f"{diff_w} words"
+            else:
+                delta_str = "Modified (0w net)"
+
+            self.tree.insert(
+                "", tk.END, iid=str(idx),
+                values=(idx + 1, snap.get('name', f"Checkpoint #{idx + 1}"),
+                        snap.get('timestamp', ''), snap_words, delta_str)
+            )
+
+        children = self.tree.get_children()
+        if children:
+            last_id = children[-1]
+            self.tree.selection_set(last_id)
+            self.tree.see(last_id)
+            self._on_select()
+        else:
+            self._clear_preview()
+
+    def _clear_preview(self):
+        self.preview_text.config(state=tk.NORMAL)
+        self.preview_text.delete('1.0', tk.END)
+        self.preview_text.config(state=tk.DISABLED)
+        self.compare_btn.config(state=tk.DISABLED)
+        self.restore_btn.config(state=tk.DISABLED)
+        self.delete_btn.config(state=tk.DISABLED)
+
+    def _get_selected_index(self) -> Optional[int]:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        try:
+            idx = int(sel[0])
+            if 0 <= idx < len(self.tab.snapshots):
+                return idx
+        except ValueError:
+            pass
+        return None
+
+    def _on_select(self, event=None):
+        idx = self._get_selected_index()
+        if idx is None:
+            self._clear_preview()
+            return
+        snap = self.tab.snapshots[idx]
+        self.preview_text.config(state=tk.NORMAL)
+        self.preview_text.delete('1.0', tk.END)
+        self.preview_text.insert('1.0', snap.get('content', ''))
+        self.preview_text.config(state=tk.DISABLED)
+        self.compare_btn.config(state=tk.NORMAL)
+        self.restore_btn.config(state=tk.NORMAL)
+        self.delete_btn.config(state=tk.NORMAL)
+
+    def _on_create(self):
+        label = self.name_var.get().strip()
+        self.notepad.create_quick_snapshot(label if label else None)
+        self.name_var.set("")
+        self._refresh_list()
+
+    def _on_compare(self):
+        """Open DiffPanel comparing current document (Original) with the selected snapshot (Suggested)."""
+        idx = self._get_selected_index()
+        if idx is None or not DIFF_PANEL_AVAILABLE:
+            return
+        snap = self.tab.snapshots[idx]
+        snap_name = snap.get('name', f"Checkpoint #{idx + 1}")
+        current_text = self.tab.get_content()
+        snap_text = snap.get('content', '')
+
+        panel = DiffPanel(
+            self.notepad,
+            original_text=current_text,
+            start_index="1.0",
+            end_index=tk.END,
+            action_name=f"Snapshot Comparison: {snap_name}",
+            on_accept=self.notepad._apply_diff,
+            theme=self.notepad.theme,
+            default_apply_mode="full",
+        )
+        panel.set_suggestion(snap_text)
+
+    def _on_restore(self):
+        """Restore the selected snapshot after creating an automatic safety backup checkpoint."""
+        idx = self._get_selected_index()
+        if idx is None:
+            return
+        snap = self.tab.snapshots[idx]
+        snap_name = snap.get('name', f"Checkpoint #{idx + 1}")
+        snap_text = snap.get('content', '')
+        current_text = self.tab.get_content()
+
+        if snap_text == current_text:
+            messagebox.showinfo("Snapshot Identical", "The document already matches this snapshot.", parent=self)
+            return
+
+        if not messagebox.askyesno(
+            "Restore Snapshot",
+            f"Restore document to '{snap_name}'?\n\n"
+            "An automatic backup snapshot of your current text will be saved first.",
+            parent=self
+        ):
+            return
+
+        self.notepad.create_quick_snapshot(f"Auto-backup before restoring '{snap_name}'")
+        self.notepad._apply_diff(snap_text, "1.0", tk.END, current_text, apply_mode="full")
+        self._refresh_list()
+        self.notepad._set_status(f"Restored snapshot: '{snap_name}'")
+
+    def _on_delete(self):
+        idx = self._get_selected_index()
+        if idx is None:
+            return
+        snap = self.tab.snapshots[idx]
+        snap_name = snap.get('name', f"Checkpoint #{idx + 1}")
+        if not messagebox.askyesno("Delete Snapshot", f"Delete snapshot '{snap_name}'?", parent=self):
+            return
+        del self.tab.snapshots[idx]
+        if self.notepad.session_manager and self.notepad.session_manager.is_caching_enabled():
+            self.notepad._save_session()
+        self._refresh_list()
 
 
 def main():

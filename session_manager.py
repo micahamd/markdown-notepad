@@ -23,7 +23,8 @@ class TabState:
         cursor_position: str = "1.0",
         scroll_position: float = 0.0,
         current_mode: str = "source",
-        is_modified: bool = False
+        is_modified: bool = False,
+        snapshots: Optional[List[Dict[str, Any]]] = None
     ):
         self.file_path = file_path
         self.content = content
@@ -31,6 +32,7 @@ class TabState:
         self.scroll_position = scroll_position
         self.current_mode = current_mode
         self.is_modified = is_modified
+        self.snapshots: List[Dict[str, Any]] = snapshots if snapshots is not None else []
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -40,7 +42,8 @@ class TabState:
             'cursor_position': self.cursor_position,
             'scroll_position': self.scroll_position,
             'current_mode': self.current_mode,
-            'is_modified': self.is_modified
+            'is_modified': self.is_modified,
+            'snapshots': self.snapshots
         }
     
     @classmethod
@@ -52,7 +55,8 @@ class TabState:
             cursor_position=data.get('cursor_position', '1.0'),
             scroll_position=data.get('scroll_position', 0.0),
             current_mode=data.get('current_mode', 'source'),
-            is_modified=data.get('is_modified', False)
+            is_modified=data.get('is_modified', False),
+            snapshots=data.get('snapshots', [])
         )
     
     def get_document_hash(self) -> str:

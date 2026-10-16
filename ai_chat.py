@@ -4072,6 +4072,16 @@ class ChatSidebar(tk.Frame):
                                 activeforeground=P['accent'],
                                 command=lambda i=idx: self._copy_message(i))
                 w.window_create(tk.END, window=btn)
+                if role == 'assistant' and self.apply_edit_callback:
+                    w.insert(tk.END, " ")
+                    rev_btn = tk.Button(
+                        w, text="\u21c4 Review & Apply", relief=tk.FLAT, bd=0, cursor='hand2', takefocus=0,
+                        font=(SANS_FONT, max(7, self._fs - 2)), padx=4, pady=0,
+                        bg=P[bg_key], fg=P['accent'], activebackground=P[bg_key],
+                        activeforeground=P['fg'],
+                        command=lambda i=idx: self._review_and_apply_message(i)
+                    )
+                    w.window_create(tk.END, window=rev_btn)
             w.insert(tk.END, '\n')
             end = w.index('end-1c')
             w.tag_add(f'hdr_{role}', start, end)
@@ -4867,6 +4877,15 @@ class ChatSidebar(tk.Frame):
         self.selection_indicator_frame.pack_forget()
         self._remove_apply_buttons()
 
+    def _review_and_apply_message(self, idx: int):
+        """Open DiffPanel to review and selectively apply any assistant message to the document."""
+        if not self.apply_edit_callback or idx is None or idx < 0 or idx >= len(self._messages):
+            return
+        msg = self._messages[idx]
+        if not msg.content or not msg.content.strip():
+            return
+        self._apply_response_to_document(msg.content.strip(), self.pending_selection)
+
     def _show_apply_button(self):
         """Show an 'Apply to Document' button below the last AI message in the chat"""
         if not self.pending_selection or not self.apply_edit_callback:
@@ -4881,7 +4900,7 @@ class ChatSidebar(tk.Frame):
         with self._writable():
             w.insert(tk.END, '\n', ('body',))
             apply_btn = ttk.Button(
-                w, text="\u2714 Apply to Document",
+                w, text="\u2714 Review & Apply to Document",
                 command=lambda: self._apply_response_to_document(response_text, sel))
             w.window_create(tk.END, window=apply_btn, padx=12)
             w.insert(tk.END, '  ', ('body',))
@@ -4890,15 +4909,23 @@ class ChatSidebar(tk.Frame):
             w.insert(tk.END, '\n', ('body',))
         w.see(tk.END)
 
-    def _apply_response_to_document(self, response_text: str, selection: Dict):
+    def _apply_response_to_document(self, response_text: str, selection: Optional[Dict] = None):
         """Open the diff panel to apply AI response to document"""
         if self.apply_edit_callback:
-            self.apply_edit_callback(
-                selection['text'],
-                response_text,
-                selection['start_index'],
-                selection['end_index']
-            )
+            if selection:
+                self.apply_edit_callback(
+                    selection['text'],
+                    response_text,
+                    selection['start_index'],
+                    selection['end_index']
+                )
+            else:
+                self.apply_edit_callback(
+                    None,
+                    response_text,
+                    None,
+                    None
+                )
         self._clear_pending_selection()
 
     def _remove_apply_buttons(self):
@@ -4906,3 +4933,4 @@ class ChatSidebar(tk.Frame):
         # The buttons are embedded windows referencing the old selection; they are
         # dropped on the next redraw. Clearing pending selection is sufficient.
         pass
+
