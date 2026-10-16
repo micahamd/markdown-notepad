@@ -2971,25 +2971,66 @@ class DocumentTab(ttk.Frame):
 
 
 class OutlinePanel(ttk.Frame):
-    """Collapsible document outline — heading tree with click-to-navigate."""
+    """Multi-faceted Document Navigator — filterable by All, Headings, Anchors, Media/Tables, and Footnotes."""
 
     LEVEL_FG = {
         1: '#1a1a2e', 2: '#16213e', 3: '#1f4068',
         4: '#555555', 5: '#777777', 6: '#999999',
     }
+    DARK_LEVEL_FG = {
+        1: '#f8fafc', 2: '#e2e8f0', 3: '#cbd5e1',
+        4: '#94a3b8', 5: '#64748b', 6: '#64748b',
+    }
+
+    CATEGORIES = (
+        ('all', 'All'),
+        ('headings', '§ H'),
+        ('anchors', '⚓ Anc'),
+        ('media', '⊞ Media'),
+        ('footnotes', 'ᵃ Fn'),
+    )
 
     def __init__(self, parent, on_heading_click=None, **kwargs):
         super().__init__(parent, **kwargs)
         self._on_heading_click = on_heading_click
-        self._linenos = []
+        self._item_linenos = {}
+        self._last_content = ""
         self._update_job = None
+        self.category_var = tk.StringVar(value='all')
+        self.filter_var = tk.StringVar(value='')
         self._setup_ui()
 
     def _setup_ui(self):
         header = ttk.Frame(self)
-        header.pack(fill=tk.X)
-        ttk.Label(header, text='Outline', font=(SANS_FONT, 10, 'bold')).pack(
-            side=tk.LEFT, padx=8, pady=(6, 4))
+        header.pack(fill=tk.X, padx=4, pady=(6, 2))
+        ttk.Label(header, text='Navigator', font=(SANS_FONT, 10, 'bold')).pack(side=tk.LEFT, padx=4)
+
+        # Category filter bar
+        cat_bar = ttk.Frame(self)
+        cat_bar.pack(fill=tk.X, padx=4, pady=(0, 3))
+        for key, label in self.CATEGORIES:
+            rb = ttk.Radiobutton(
+                cat_bar,
+                text=label,
+                value=key,
+                variable=self.category_var,
+                style='Toolbar.Toolbutton',
+                command=self._refresh_from_cache,
+            )
+            rb.pack(side=tk.LEFT, padx=1, expand=True, fill=tk.X)
+
+        # Live filter search entry
+        filter_row = ttk.Frame(self)
+        filter_row.pack(fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Label(filter_row, text='🔍', font=(SANS_FONT, 9)).pack(side=tk.LEFT, padx=(0, 3))
+        self.filter_entry = ttk.Entry(filter_row, textvariable=self.filter_var)
+        self.filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        clear_btn = ttk.Button(
+            filter_row, text='✕', width=2, style='Toolbar.TButton',
+            command=lambda: (self.filter_var.set(''), self._refresh_from_cache())
+        )
+        clear_btn.pack(side=tk.RIGHT, padx=(2, 0))
+        self.filter_var.trace_add('write', lambda *_: self._refresh_from_cache())
 
         tree_frame = ttk.Frame(self)
         tree_frame.pack(fill=tk.BOTH, expand=True)
@@ -3002,80 +3043,445 @@ class OutlinePanel(ttk.Frame):
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.config(command=self.tree.yview)
 
+        self._configure_tags(is_dark=False)
+        self.tree.bind('<<TreeviewSelect>>', self._on_select)
+
+    def _configure_tags(self, is_dark=False):
+        fg_map = self.DARK_LEVEL_FG if is_dark else self.LEVEL_FG
         for lvl in range(1, 7):
             self.tree.tag_configure(
                 f'h{lvl}',
-                foreground=self.LEVEL_FG.get(lvl, '#999999'),
+                foreground=fg_map.get(lvl, '#999999'),
                 font=(SANS_FONT, max(11 - lvl + 1, 9),
                       'bold' if lvl <= 3 else 'normal')
             )
-        self.tree.tag_configure('empty', foreground='#aaaaaa',
-                                 font=(SANS_FONT, 9, 'italic'))
+        self.tree.tag_configure(
+            'anchor',
+            foreground='#c4b5fd' if is_dark else '#6d28d9',
+            font=(SANS_FONT, 9, 'bold')
+        )
+        self.tree.tag_configure(
+            'ref',
+            foreground='#93c5fd' if is_dark else '#2563eb',
+            font=(SANS_FONT, 9)
+        )
+        self.tree.tag_configure(
+            'media',
+            foreground='#5eead4' if is_dark else '#0f766e',
+            font=(SANS_FONT, 9)
+        )
+        self.tree.tag_configure(
+            'footnote',
+            foreground='#fcd34d' if is_dark else '#b45309',
+            font=(SANS_FONT, 9)
+        )
+        self.tree.tag_configure(
+            'empty',
+            foreground='#94a3b8' if is_dark else '#aaaaaa',
+            font=(SANS_FONT, 9, 'italic')
+        )
 
-        self.tree.bind('<<TreeviewSelect>>', self._on_select)
+    def apply_theme(self, theme: dict):
+        """Synchronize navigator colors with active theme."""
+        bg = theme.get('source_bg', '#ffffff')
+        is_dark = _is_dark_color(bg)
+        self._configure_tags(is_dark=is_dark)
 
     def schedule_update(self, content: str):
-        """Debounced rebuild (500 ms)."""
+        """Debounced rebuild (400 ms)."""
+        self._last_content = content
         if self._update_job:
             self.after_cancel(self._update_job)
-        self._update_job = self.after(500, lambda: self.update(content))
+        self._update_job = self.after(400, lambda: self.update(content))
+
+    def _refresh_from_cache(self):
+        self.update(self._last_content)
 
     def update(self, content: str):
-        """Immediately rebuild the outline tree from document content."""
+        """Immediately rebuild the navigator tree from document content."""
         self._update_job = None
+        self._last_content = content or ""
         self.tree.delete(*self.tree.get_children())
-        self._linenos = []
+        self._item_linenos.clear()
 
-        headings = []
+        cat = self.category_var.get()
+        query = self.filter_var.get().strip().lower()
+
+        items = []  # (lineno, category, tag, level_or_0, label)
         in_code_block = False
-        for lineno, line in enumerate(content.split('\n'), 1):
-            if line.strip().startswith('```'):
+        in_table = False
+        table_start_line = 0
+        table_rows_count = 0
+        table_cols_count = 0
+
+        lines = self._last_content.split('\n')
+        for lineno, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped.startswith('```'):
+                if in_table:
+                    items.append((table_start_line, 'media', 'media', 0, f"⊞ Table ({table_rows_count}×{table_cols_count})  [L{table_start_line}]"))
+                    in_table = False
                 in_code_block = not in_code_block
                 continue
             if in_code_block:
                 continue
-            m = re.match(r'^(#{1,6})\s+(.+)', line)
-            if m:
-                headings.append((lineno, len(m.group(1)), m.group(2).strip()))
 
-        if not headings:
-            self.tree.insert('', tk.END, text='(no headings)', tags=('empty',))
-            self._linenos.append(None)
+            # Tables
+            if '|' in line and stripped.startswith('|'):
+                cells = [c.strip() for c in stripped.strip('|').split('|')]
+                if not in_table:
+                    in_table = True
+                    table_start_line = lineno
+                    table_rows_count = 1
+                    table_cols_count = len(cells)
+                else:
+                    if not all(re.match(r'^:?-+:?$', c) for c in cells if c):
+                        table_rows_count += 1
+                    table_cols_count = max(table_cols_count, len(cells))
+            else:
+                if in_table:
+                    items.append((table_start_line, 'media', 'media', 0, f"⊞ Table ({table_rows_count}×{table_cols_count})  [L{table_start_line}]"))
+                    in_table = False
+
+            # Headings
+            m_h = re.match(r'^(#{1,6})\s+(.+)', line)
+            if m_h:
+                lvl = len(m_h.group(1))
+                text = m_h.group(2).strip()
+                items.append((lineno, 'headings', f'h{lvl}', lvl, f"{'#' * lvl} {text}"))
+
+            # Anchors & References
+            for m_anc in re.finditer(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', line, re.IGNORECASE):
+                anc = m_anc.group(1).strip()
+                items.append((lineno, 'anchors', 'anchor', 0, f"⚓ {anc}  [L{lineno}]"))
+            for m_ref in re.finditer(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', line, re.IGNORECASE):
+                ref = m_ref.group(1).strip()
+                items.append((lineno, 'anchors', 'ref', 0, f"↗ [@{ref}]  [L{lineno}]"))
+
+            # Images & Display Math
+            for m_img in re.finditer(r'!\[([^\]]*)\]\(([^)]+)\)', line):
+                alt = m_img.group(1).strip() or os.path.basename(m_img.group(2).strip()) or "image"
+                items.append((lineno, 'media', 'media', 0, f"🖼 Image: {alt}  [L{lineno}]"))
+            if stripped.startswith('$$'):
+                items.append((lineno, 'media', 'media', 0, f"∑ Math Block  [L{lineno}]"))
+
+            # Footnotes
+            m_fndef = re.match(r'^\[\^([^\]]+)\]:\s*(.+)$', stripped)
+            if m_fndef:
+                fid = m_fndef.group(1).strip()
+                fbody = m_fndef.group(2).strip()
+                preview = (fbody[:28] + '…') if len(fbody) > 28 else fbody
+                items.append((lineno, 'footnotes', 'footnote', 0, f"ᵃ [^{fid}]: {preview}"))
+            else:
+                for m_fnref in re.finditer(r'\[\^([^\]\n]+)\](?!:)', line):
+                    fid = m_fnref.group(1).strip()
+                    items.append((lineno, 'footnotes', 'ref', 0, f"ᵃ Cite [^{fid}]  [L{lineno}]"))
+
+        if in_table:
+            items.append((table_start_line, 'media', 'media', 0, f"⊞ Table ({table_rows_count}×{table_cols_count})  [L{table_start_line}]"))
+
+        # Filter by category and search query
+        filtered = [
+            it for it in items
+            if (cat == 'all' or it[1] == cat) and (not query or query in it[4].lower())
+        ]
+
+        if not filtered:
+            self.tree.insert('', tk.END, text='(no matching items)', tags=('empty',))
             return
 
-        stack = []
-        for lineno, level, text in headings:
-            while stack and stack[-1][0] >= level:
-                stack.pop()
-            indent = '  ' * (level - 1)
-            label  = f'{indent}{"#" * level} {text}'
-            parent_iid = stack[-1][1] if stack else ''
-            iid = self.tree.insert(parent_iid, tk.END, text=label,
-                                   tags=(f'h{level}',), open=True)
-            stack.append((level, iid))
-            self._linenos.append(lineno)
+        # Hierarchical tree when showing Headings (or All without search filter)
+        if cat == 'headings' and not query:
+            stack = []
+            for lineno, _, tag, level, label in filtered:
+                while stack and stack[-1][0] >= level:
+                    stack.pop()
+                indent = '  ' * (level - 1)
+                parent_iid = stack[-1][1] if stack else ''
+                iid = self.tree.insert(parent_iid, tk.END, text=f"{indent}{label}",
+                                       tags=(tag,), open=True)
+                stack.append((level, iid))
+                self._item_linenos[iid] = lineno
+        else:
+            for lineno, item_cat, tag, level, label in filtered:
+                indent = '  ' * max(0, level - 1) if item_cat == 'headings' else ''
+                iid = self.tree.insert('', tk.END, text=f"{indent}{label}", tags=(tag,), open=True)
+                self._item_linenos[iid] = lineno
 
     def _on_select(self, event=None):
         sel = self.tree.selection()
         if not sel:
             return
-        all_items = self._dfs_items()
-        try:
-            idx = all_items.index(sel[0])
-            lineno = self._linenos[idx]
-            if lineno and self._on_heading_click:
-                self._on_heading_click(lineno)
-        except (ValueError, IndexError):
-            pass
+        lineno = self._item_linenos.get(sel[0])
+        if lineno and self._on_heading_click:
+            self._on_heading_click(lineno)
 
-    def _dfs_items(self):
-        result = []
-        def recurse(parent=''):
-            for child in self.tree.get_children(parent):
-                result.append(child)
-                recurse(child)
-        recurse()
-        return result
+
+class DockedFindReplaceBar(ttk.Frame):
+    """Non-blocking docked Find & Replace bar at the top of the editor area.
+    Operates seamlessly across both Source Mode and Visual Mode with live match
+    highlighting, match counter, case/regex toggles, and Replace / Replace All.
+    """
+
+    def __init__(self, parent, notepad, **kwargs):
+        super().__init__(parent, padding=(6, 4), **kwargs)
+        self.notepad = notepad
+        self.is_visible = False
+        self.replace_visible = False
+        self.find_var = tk.StringVar()
+        self.replace_var = tk.StringVar()
+        self.case_var = tk.BooleanVar(value=False)
+        self.regex_var = tk.BooleanVar(value=False)
+        self._matches = []  # List of (start_idx, end_idx)
+        self._active_idx = -1
+        self._setup_ui()
+
+    def _setup_ui(self):
+        # Row 1: Find controls
+        self.find_row = ttk.Frame(self)
+        self.find_row.pack(fill=tk.X, pady=1)
+
+        ttk.Label(self.find_row, text="Find:", width=8).pack(side=tk.LEFT)
+        self.find_entry = ttk.Entry(self.find_row, textvariable=self.find_var, width=28)
+        self.find_entry.pack(side=tk.LEFT, padx=(0, 4))
+
+        prev_btn = ttk.Button(self.find_row, text="▲", width=3, style="Toolbar.TButton", command=self.find_prev)
+        prev_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(prev_btn, "Previous Match (Shift+Enter)")
+
+        next_btn = ttk.Button(self.find_row, text="▼", width=3, style="Toolbar.TButton", command=self.find_next)
+        next_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(next_btn, "Next Match (Enter / F3)")
+
+        case_cb = ttk.Checkbutton(self.find_row, text="Aa", variable=self.case_var,
+                                  style="Toolbar.Toolbutton", command=self._on_query_change)
+        case_cb.pack(side=tk.LEFT, padx=2)
+        ToolTip(case_cb, "Match Case")
+
+        regex_cb = ttk.Checkbutton(self.find_row, text=".*", variable=self.regex_var,
+                                   style="Toolbar.Toolbutton", command=self._on_query_change)
+        regex_cb.pack(side=tk.LEFT, padx=2)
+        ToolTip(regex_cb, "Use Regular Expressions")
+
+        self.toggle_rep_btn = ttk.Button(
+            self.find_row, text="⇄ Replace", width=9, style="Toolbar.TButton",
+            command=self.toggle_replace_row
+        )
+        self.toggle_rep_btn.pack(side=tk.LEFT, padx=4)
+
+        self.count_label = ttk.Label(self.find_row, text="", foreground="#64748b", font=(SANS_FONT, 9))
+        self.count_label.pack(side=tk.LEFT, padx=8)
+
+        close_btn = ttk.Button(self.find_row, text="✕", width=3, style="Toolbar.TButton", command=self.hide)
+        close_btn.pack(side=tk.RIGHT, padx=2)
+        ToolTip(close_btn, "Close Find Bar (Esc)")
+
+        # Row 2: Replace controls (packed when replace_visible is True)
+        self.replace_row = ttk.Frame(self)
+        ttk.Label(self.replace_row, text="Replace:", width=8).pack(side=tk.LEFT)
+        self.replace_entry = ttk.Entry(self.replace_row, textvariable=self.replace_var, width=28)
+        self.replace_entry.pack(side=tk.LEFT, padx=(0, 4))
+
+        rep_btn = ttk.Button(self.replace_row, text="Replace", width=9, style="Toolbar.TButton", command=self.replace_one)
+        rep_btn.pack(side=tk.LEFT, padx=2)
+
+        rep_all_btn = ttk.Button(self.replace_row, text="Replace All", width=10, style="Toolbar.TButton", command=self.replace_all)
+        rep_all_btn.pack(side=tk.LEFT, padx=2)
+
+        # Bindings
+        self.find_var.trace_add("write", lambda *_: self._on_query_change())
+        self.find_entry.bind("<Return>", lambda e: self.find_next())
+        self.find_entry.bind("<Shift-Return>", lambda e: self.find_prev())
+        self.find_entry.bind("<Escape>", lambda e: self.hide())
+        self.replace_entry.bind("<Return>", lambda e: self.replace_one())
+        self.replace_entry.bind("<Escape>", lambda e: self.hide())
+
+    def _active_text_widget(self):
+        tab = self.notepad.current_tab
+        if not tab:
+            return None
+        if tab.current_mode == "visual":
+            return tab.visual_viewer.text_widget
+        return tab.source_editor
+
+    def _ensure_highlight_tags(self, widget):
+        if not widget:
+            return
+        dark = _is_dark_color(self.notepad.theme.get('source_bg', '#ffffff'))
+        match_bg = "#78350f" if dark else "#fde68a"
+        match_fg = "#fef3c7" if dark else "#1e293b"
+        active_bg = "#ea580c" if dark else "#f97316"
+        active_fg = "#ffffff"
+        widget.tag_configure("find_match", background=match_bg, foreground=match_fg)
+        widget.tag_configure("find_active", background=active_bg, foreground=active_fg)
+        widget.tag_raise("find_match")
+        widget.tag_raise("find_active")
+
+    def clear_highlights(self):
+        tab = self.notepad.current_tab
+        if not tab:
+            return
+        for w in (tab.source_editor, tab.visual_viewer.text_widget):
+            try:
+                w.tag_remove("find_match", "1.0", tk.END)
+                w.tag_remove("find_active", "1.0", tk.END)
+            except Exception:
+                pass
+
+    def show(self, replace_mode=False):
+        if not self.is_visible:
+            self.pack(before=self.notepad.notebook, fill=tk.X, padx=2, pady=(2, 2))
+            self.is_visible = True
+        if replace_mode and not self.replace_visible:
+            self.replace_row.pack(fill=tk.X, pady=(2, 1))
+            self.replace_visible = True
+        elif not replace_mode and self.replace_visible:
+            self.replace_row.pack_forget()
+            self.replace_visible = False
+
+        # Pre-populate search with selected text if short single-line selection exists
+        w = self._active_text_widget()
+        if w:
+            try:
+                if w.tag_ranges(tk.SEL):
+                    sel = w.get(tk.SEL_FIRST, tk.SEL_LAST)
+                    if sel and '\n' not in sel and len(sel) <= 120:
+                        self.find_var.set(sel)
+            except tk.TclError:
+                pass
+
+        self.find_entry.focus_set()
+        self.find_entry.selection_range(0, tk.END)
+        self._on_query_change()
+
+    def toggle_replace_row(self):
+        if self.replace_visible:
+            self.replace_row.pack_forget()
+            self.replace_visible = False
+        else:
+            self.replace_row.pack(fill=tk.X, pady=(2, 1))
+            self.replace_visible = True
+            self.replace_entry.focus_set()
+
+    def hide(self):
+        self.clear_highlights()
+        if self.is_visible:
+            self.pack_forget()
+            self.is_visible = False
+        self.notepad._focus_active_editor()
+        return "break"
+
+    def _on_query_change(self):
+        self.clear_highlights()
+        self._matches.clear()
+        self._active_idx = -1
+
+        query = self.find_var.get()
+        w = self._active_text_widget()
+        if not query or not w:
+            self.count_label.config(text="")
+            return
+
+        self._ensure_highlight_tags(w)
+        content = w.get("1.0", "end-1c")
+        flags = 0 if self.case_var.get() else re.IGNORECASE
+
+        try:
+            pattern = query if self.regex_var.get() else re.escape(query)
+            compiled = re.compile(pattern, flags)
+        except re.error:
+            self.count_label.config(text="Invalid regex")
+            return
+
+        for m in compiled.finditer(content):
+            if m.start() == m.end():
+                continue
+            s_idx = f"1.0 + {m.start()} chars"
+            e_idx = f"1.0 + {m.end()} chars"
+            self._matches.append((s_idx, e_idx))
+            w.tag_add("find_match", s_idx, e_idx)
+
+        if not self._matches:
+            self.count_label.config(text="No matches")
+            return
+
+        self._active_idx = 0
+        self._highlight_active_match()
+
+    def _highlight_active_match(self):
+        w = self._active_text_widget()
+        if not w or not self._matches or self._active_idx < 0:
+            return
+        w.tag_remove("find_active", "1.0", tk.END)
+        s_idx, e_idx = self._matches[self._active_idx]
+        w.tag_add("find_active", s_idx, e_idx)
+        w.see(s_idx)
+        if w is getattr(self.notepad.current_tab, 'source_editor', None):
+            w.mark_set(tk.INSERT, e_idx)
+        self.count_label.config(text=f"{self._active_idx + 1} of {len(self._matches)}")
+
+    def find_next(self):
+        if not self._matches:
+            self._on_query_change()
+            return "break"
+        self._active_idx = (self._active_idx + 1) % len(self._matches)
+        self._highlight_active_match()
+        return "break"
+
+    def find_prev(self):
+        if not self._matches:
+            self._on_query_change()
+            return "break"
+        self._active_idx = (self._active_idx - 1) % len(self._matches)
+        self._highlight_active_match()
+        return "break"
+
+    def replace_one(self):
+        tab = self.notepad.current_tab
+        if not tab:
+            return "break"
+        if tab.current_mode == "visual":
+            # Switch to source mode or replace directly in canonical source
+            self.replace_all()
+            return "break"
+        if not self._matches or self._active_idx < 0:
+            self._on_query_change()
+            return "break"
+
+        editor = tab.source_editor
+        s_idx, e_idx = self._matches[self._active_idx]
+        rep_text = self.replace_var.get()
+        editor.delete(s_idx, e_idx)
+        editor.insert(s_idx, rep_text)
+        tab.is_modified = True
+        self.notepad._update_tab_title(tab)
+        self.notepad._schedule_syntax_highlight()
+        self._on_query_change()
+        return "break"
+
+    def replace_all(self):
+        tab = self.notepad.current_tab
+        query = self.find_var.get()
+        if not tab or not query:
+            return "break"
+        rep_text = self.replace_var.get()
+        flags = 0 if self.case_var.get() else re.IGNORECASE
+        try:
+            pattern = query if self.regex_var.get() else re.escape(query)
+            compiled = re.compile(pattern, flags)
+        except re.error:
+            return "break"
+
+        content = tab.get_content()
+        new_content, count = compiled.subn(rep_text, content)
+        if count > 0:
+            tab.set_content(new_content)
+            tab.is_modified = True
+            self.notepad._update_tab_title(tab)
+            self.notepad._schedule_syntax_highlight()
+            self.notepad._set_status(f"Replaced {count} occurrence(s)")
+        self._on_query_change()
+        return "break"
 
 
 class MarkdownNotepad(tk.Tk):
@@ -3301,7 +3707,8 @@ class MarkdownNotepad(tk.Tk):
 
         self.outline_panel   = OutlinePanel(self.outer_paned,
                                              on_heading_click=self._jump_to_line,
-                                             width=200)
+                                             width=220)
+        self.outline_panel.apply_theme(self.theme)
         self.outline_visible = False
         # outline_panel is NOT added to outer_paned until first toggle
 
@@ -3312,6 +3719,9 @@ class MarkdownNotepad(tk.Tk):
         # Left pane: Editor content with tabs
         self.content_frame = ttk.Frame(self.main_paned)
         self.main_paned.add(self.content_frame, weight=1)
+
+        # Docked non-blocking Find & Replace bar (packed above notebook when active)
+        self.find_bar = DockedFindReplaceBar(self.content_frame, notepad=self)
         
         # Notebook widget for tabs
         self.notebook = ttk.Notebook(self.content_frame)
@@ -4556,6 +4966,8 @@ class MarkdownNotepad(tk.Tk):
                         self._update_ai_sidebar_context()
                         self._do_syntax_highlight()
                         self._schedule_outline_update()
+                        if getattr(self, 'find_bar', None) and self.find_bar.is_visible:
+                            self.find_bar._on_query_change()
                         break
         except:
             pass
@@ -4858,6 +5270,8 @@ class MarkdownNotepad(tk.Tk):
         self.mode_var.set("source")
         self.mode_label.config(text="Source Mode")
         self._set_format_buttons_enabled(True)
+        if getattr(self, 'find_bar', None) and self.find_bar.is_visible:
+            self.find_bar._on_query_change()
         self._set_status("Source mode - edit raw markdown")
     
     def _show_visual_mode(self):
@@ -4877,6 +5291,8 @@ class MarkdownNotepad(tk.Tk):
         self.mode_var.set("visual")
         self.mode_label.config(text="Visual Mode")
         self._set_format_buttons_enabled(False)
+        if getattr(self, 'find_bar', None) and self.find_bar.is_visible:
+            self.find_bar._on_query_change()
         self._set_status("Visual mode - reading presentation view")
     
     def _on_visual_edit(self, content):
@@ -5381,9 +5797,10 @@ class MarkdownNotepad(tk.Tk):
         self._set_status("Selected text cleaned and reflowed")
     
     def find_text(self):
-        """Open find dialog"""
-        if self.current_tab:
-            FindDialog(self, self.current_tab.source_editor)
+        """Show the non-blocking docked Find bar (works in Source and Visual mode)"""
+        if self.current_tab and getattr(self, 'find_bar', None):
+            self.find_bar.show(replace_mode=False)
+        return "break"
     
     # === Format Operations ===
     
@@ -5638,9 +6055,10 @@ class MarkdownNotepad(tk.Tk):
     # === Search Methods ===
     
     def find_replace(self):
-        """Open find & replace dialog"""
-        if self.current_tab:
-            FindReplaceDialog(self, self.current_tab.source_editor)
+        """Show the non-blocking docked Find & Replace bar"""
+        if self.current_tab and getattr(self, 'find_bar', None):
+            self.find_bar.show(replace_mode=True)
+        return "break"
     
     def goto_line(self):
         """Open go to line dialog"""
@@ -5648,13 +6066,13 @@ class MarkdownNotepad(tk.Tk):
             GoToLineDialog(self, self.current_tab.source_editor)
     
     def _find_next_f3(self):
-        """Find next using F3 (uses last search if available)"""
-        # If there's an active FindReplaceDialog, trigger its find_next
-        for widget in self.winfo_children():
-            if isinstance(widget, FindReplaceDialog):
-                widget.find_next()
-                return
-        # Otherwise open find dialog
+        """Find next using F3 (uses docked find bar)"""
+        if getattr(self, 'find_bar', None):
+            if not self.find_bar.is_visible:
+                self.find_bar.show(replace_mode=False)
+            else:
+                self.find_bar.find_next()
+            return "break"
         self.find_text()
     
     # === Application Methods ===
