@@ -1901,9 +1901,26 @@ class DocumentTab(ttk.Frame):
         self.visual_viewer.apply_theme(theme)
         self.apply_page_settings()
         
-        # Setup modification tracking and Ctrl+Click navigation
+        # Setup modification tracking, Ctrl+Click navigation, autocomplete, and table Tab navigation
+        self._ac_job = None
+        self._ac_popup = None
+        self._ac_listbox = None
+        self._ac_items = []
         self.source_editor.bind("<<Modified>>", self._on_text_modified)
         self.source_editor.bind("<Control-Button-1>", self._on_source_ctrl_click)
+        self.source_editor.bind("<KeyRelease>", self._on_autocomplete_key_release, add='+')
+        self.source_editor.bind("<Down>", self._on_ac_down)
+        self.source_editor.bind("<Up>", self._on_ac_up)
+        self.source_editor.bind("<Return>", self._on_ac_return)
+        self.source_editor.bind("<Escape>", self._on_ac_escape)
+        self.source_editor.bind("<Button-1>", lambda e: self._close_autocomplete(), add='+')
+        self.source_editor.bind("<FocusOut>", lambda e: self.after(150, self._check_ac_focus), add='+')
+        self.source_editor.bind("<Tab>", self._on_source_tab)
+        self.source_editor.bind("<Shift-Tab>", self._on_source_shift_tab)
+        try:
+            self.source_editor.bind("<ISO_Left_Tab>", self._on_source_shift_tab)
+        except tk.TclError:
+            pass
 
     # --- page / zoom -----------------------------------------------------------
 
@@ -2177,6 +2194,428 @@ class DocumentTab(ttk.Frame):
                     editor.yview_scroll(lines_to_scroll, "units")
         except Exception:
             pass
+
+    # --- Cross-Reference Autocomplete ([@ trigger with 1s delay) ---------------
+
+    def _on_autocomplete_key_release(self, event=None):
+        """Schedule or update cross-reference autocomplete popup after 1s delay when typing [@..."""
+        if event and event.keysym in (
+            'Up', 'Down', 'Return', 'Escape', 'Tab', 'ISO_Left_Tab',
+            'Shift_L', 'Shift_R', 'Control_L', 'Control_R', 'Alt_L', 'Alt_R',
+            'Left', 'Right', 'Home', 'End', 'Prior', 'Next'
+        ):
+            return
+
+        if self._ac_job:
+            try:
+                self.after_cancel(self._ac_job)
+            except Exception:
+                pass
+            self._ac_job = None
+
+        if self.current_mode != "source":
+            self._close_autocomplete()
+            return
+
+        line_prefix = self.source_editor.get("insert linestart", tk.INSERT)
+        m = re.search(r'\[@(?!(?:anchor|def):)([^\]\n]*)$', line_prefix)
+        if m:
+            if self._ac_popup and self._ac_popup.winfo_exists():
+                # Already open: filter live as user types
+                self._show_anchor_autocomplete()
+            else:
+                # Wait 1000ms (1 second) before showing popup
+                self._ac_job = self.after(1000, self._show_anchor_autocomplete)
+        else:
+            self._close_autocomplete()
+
+    def _collect_document_targets(self):
+        """Collect all defined [@anchor: ...] targets and # headings in the document."""
+        content = self.source_editor.get("1.0", tk.END)
+        targets = []
+        seen = set()
+
+        # 1. Explicit anchors
+        for m in re.finditer(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', content, re.IGNORECASE):
+            name = m.group(1).strip()
+            norm = _normalize_anchor_key(name)
+            if name and norm not in seen:
+                seen.add(norm)
+                targets.append((f"\u2693 {name}  (Anchor)", name))
+
+        # 2. Document headings (outside code blocks)
+        in_code = False
+        for line in content.split('\n'):
+            if line.strip().startswith('```'):
+                in_code = not in_code
+                continue
+            if in_code:
+                continue
+            hm = re.match(r'^(#{1,6})\s+(.+)', line)
+            if hm:
+                h_text = hm.group(2).strip()
+                norm = _normalize_anchor_key(h_text)
+                if h_text and norm not in seen:
+                    seen.add(norm)
+                    lvl = len(hm.group(1))
+                    targets.append((f"H{lvl}: {h_text}  (Heading)", h_text))
+
+        return targets
+
+    def _show_anchor_autocomplete(self):
+        """Display or refresh the floating cross-reference autocomplete popup."""
+        self._ac_job = None
+        if self.current_mode != "source":
+            self._close_autocomplete()
+            return
+
+        editor = self.source_editor
+        line_prefix = editor.get("insert linestart", tk.INSERT)
+        m = re.search(r'\[@(?!(?:anchor|def):)([^\]\n]*)$', line_prefix)
+        if not m:
+            self._close_autocomplete()
+            return
+
+        query = m.group(1).strip().lower()
+        all_targets = self._collect_document_targets()
+        filtered = [item for item in all_targets if not query or query in item[1].lower()]
+
+        # Always offer an option to define a new anchor at cursor
+        new_label = m.group(1).strip() or "point"
+        filtered.append((f"\u2795 Define new [@anchor: {new_label}]", f"__NEW__:{new_label}"))
+
+        self._ac_items = filtered
+
+        bbox = editor.bbox(tk.INSERT)
+        if not bbox:
+            self._close_autocomplete()
+            return
+        bx, by, bw, bh = bbox
+        x = editor.winfo_rootx() + bx
+        y = editor.winfo_rooty() + by + bh + 4
+
+        bg = self.theme.get('source_bg', '#ffffff')
+        fg = self.theme.get('source_fg', '#1a1a1a')
+        is_dark = _is_dark_color(bg)
+        pop_bg = "#252526" if is_dark else "#ffffff"
+        pop_fg = "#e2e8f0" if is_dark else "#1e293b"
+        sel_bg = "#3b82f6" if is_dark else "#2563eb"
+        border_col = "#475569" if is_dark else "#cbd5e1"
+
+        if not self._ac_popup or not self._ac_popup.winfo_exists():
+            self._ac_popup = tk.Toplevel(self)
+            self._ac_popup.wm_overrideredirect(True)
+            self._ac_popup.attributes("-topmost", True)
+            frame = tk.Frame(self._ac_popup, bg=border_col, bd=1, relief=tk.SOLID)
+            frame.pack(fill=tk.BOTH, expand=True)
+            hdr = tk.Label(
+                frame, text=" Cross-Reference Target (Enter/Click to insert, Esc to close)",
+                font=(SANS_FONT, 8, "bold"), bg= border_col, fg=pop_fg, anchor="w", padx=4, pady=2
+            )
+            hdr.pack(fill=tk.X)
+            self._ac_listbox = tk.Listbox(
+                frame, font=(SANS_FONT, 9), bg=pop_bg, fg=pop_fg,
+                selectbackground=sel_bg, selectforeground="#ffffff",
+                activestyle="none", highlightthickness=0, bd=0,
+                width=42, height=min(8, max(2, len(filtered)))
+            )
+            self._ac_listbox.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+            self._ac_listbox.bind("<ButtonRelease-1>", self._on_ac_click)
+            self._ac_listbox.bind("<Return>", self._on_ac_return)
+            self._ac_listbox.bind("<Escape>", self._on_ac_escape)
+
+        self._ac_listbox. configure(height=min(8, max(2, len(filtered))), bg=pop_bg, fg=pop_fg)
+        self._ac_listbox.delete(0, tk.END)
+        for display_text, _ in filtered:
+            self._ac_listbox.insert(tk.END, f" {display_text}")
+        self._ac_listbox.selection_set(0)
+        self._ac_listbox.activate(0)
+        self._ac_popup.wm_geometry(f"+{x}+{y}")
+
+    def _check_ac_focus(self):
+        if not self._ac_popup or not self._ac_popup.winfo_exists():
+            return
+        try:
+            focused = self.focus_get()
+            if focused is not self.source_editor and focused is not self._ac_listbox:
+                self._close_autocomplete()
+        except Exception:
+            self._close_autocomplete()
+
+    def _close_autocomplete(self):
+        if self._ac_job:
+            try:
+                self.after_cancel(self._ac_job)
+            except Exception:
+                pass
+            self._ac_job = None
+        if self._ac_popup and self._ac_popup.winfo_exists():
+            try:
+                self._ac_popup.destroy()
+            except Exception:
+                pass
+        self._ac_popup = None
+        self._ac_listbox = None
+        self._ac_items = []
+
+    def _on_ac_down(self, event=None):
+        if self._ac_popup and self._ac_popup.winfo_exists() and self._ac_listbox:
+            cur = self._ac_listbox.curselection()
+            idx = (cur[0] + 1) % len(self._ac_items) if cur else 0
+            self._ac_listbox.selection_clear(0, tk.END)
+            self._ac_listbox.selection_set(idx)
+            self._ac_listbox.activate(idx)
+            self._ac_listbox.see(idx)
+            return "break"
+        return None
+
+    def _on_ac_up(self, event=None):
+        if self._ac_popup and self._ac_popup.winfo_exists() and self._ac_listbox:
+            cur = self._ac_listbox.curselection()
+            idx = (cur[0] - 1) % len(self._ac_items) if cur else 0
+            self._ac_listbox.selection_clear(0, tk.END)
+            self._ac_listbox.selection_set(idx)
+            self._ac_listbox.activate(idx)
+            self._ac_listbox.see(idx)
+            return "break"
+        return None
+
+    def _on_ac_return(self, event=None):
+        if self._ac_popup and self._ac_popup.winfo_exists() and self._ac_listbox:
+            self._accept_autocomplete()
+            return "break"
+        return None
+
+    def _on_ac_escape(self, event=None):
+        if self._ac_popup and self._ac_popup.winfo_exists():
+            self._close_autocomplete()
+            return "break"
+        return None
+
+    def _on_ac_click(self, event=None):
+        if self._ac_popup and self._ac_popup.winfo_exists():
+            self._accept_autocomplete()
+            self.source_editor.focus_set()
+
+    def _accept_autocomplete(self):
+        if not self._ac_listbox or not self._ac_items:
+            self._close_autocomplete()
+            return
+        cur = self._ac_listbox.curselection()
+        idx = cur[0] if cur else 0
+        if not (0 <= idx < len(self._ac_items)):
+            self._close_autocomplete()
+            return
+        _, value = self._ac_items[idx]
+        self._close_autocomplete()
+
+        editor = self.source_editor
+        line_prefix = editor.get("insert linestart", tk.INSERT)
+        m = re.search(r'\[@(?!(?:anchor|def):)([^\]\n]*)$', line_prefix)
+        if not m:
+            return
+
+        match_len = len(m.group(0))
+        start_pos = editor.index(f"insert - {match_len}c")
+        end_pos = editor.index(tk.INSERT)
+        # If the character immediately after cursor is a closing bracket, consume it too
+        if editor.get(end_pos, f"{end_pos}+1c") == "]":
+            end_pos = editor.index(f"{end_pos}+1c")
+
+        if value.startswith("__NEW__:"):
+            new_name = value.split(":", 1)[1]
+            replacement = f"[@anchor: {new_name}]"
+        else:
+            replacement = f"[@{value}]"
+
+        editor.delete(start_pos, end_pos)
+        editor.insert(start_pos, replacement)
+        editor.mark_set(tk.INSERT, f"{start_pos}+{len(replacement)}c")
+        self.is_modified = True
+        if self.on_modified:
+            self.on_modified()
+        self._apply_syntax_highlighting()
+
+    # --- Markdown Table Auto-Formatter & Cell Navigation (Tab / Shift+Tab) -----
+
+    def _on_source_tab(self, event=None):
+        """Handle Tab in source editor: accept autocomplete if open, or auto-format/advance in Markdown tables."""
+        if self._ac_popup and self._ac_popup.winfo_exists():
+            self._accept_autocomplete()
+            return "break"
+        if self._handle_table_tab(direction=1):
+            return "break"
+        return None
+
+    def _on_source_shift_tab(self, event=None):
+        """Handle Shift+Tab in source editor: navigate backward and auto-format in Markdown tables."""
+        if self._handle_table_tab(direction=-1):
+            return "break"
+        return None
+
+    @staticmethod
+    def _is_table_line(line: str) -> bool:
+        s = line.strip()
+        return s.startswith('|') and '|' in s[1:]
+
+    @staticmethod
+    def _parse_table_row(line: str):
+        s = line.strip()
+        if s.startswith('|'):
+            s = s[1:]
+        if s.endswith('|'):
+            s = s[:-1]
+        return [cell.strip() for cell in s.split('|')]
+
+    @staticmethod
+    def _is_separator_row(cells) -> bool:
+        return bool(cells) and all(bool(re.match(r'^:?-+:?$', c.strip())) for c in cells if c.strip()) and any(c.strip() for c in cells)
+
+    def _handle_table_tab(self, direction: int = 1) -> bool:
+        """If cursor is inside a Markdown table, auto-pad/align all columns and jump to next/previous cell."""
+        editor = self.source_editor
+        try:
+            insert_idx = editor.index(tk.INSERT)
+            curr_line_no, curr_col_char = map(int, insert_idx.split('.'))
+        except Exception:
+            return False
+
+        curr_line = editor.get(f"{curr_line_no}.0", f"{curr_line_no}.end")
+        if not self._is_table_line(curr_line):
+            return False
+
+        total_lines = int(editor.index("end-1c").split('.')[0])
+        first_line = curr_line_no
+        while first_line > 1 and self._is_table_line(editor.get(f"{first_line - 1}.0", f"{first_line - 1}.end")):
+            first_line -= 1
+        last_line = curr_line_no
+        while last_line < total_lines and self._is_table_line(editor.get(f"{last_line + 1}.0", f"{last_line + 1}.end")):
+            last_line += 1
+
+        raw_lines = [editor.get(f"{ln}.0", f"{ln}.end") for ln in range(first_line, last_line + 1)]
+        parsed_rows = [self._parse_table_row(ln) for ln in raw_lines]
+        num_cols = max((len(r) for r in parsed_rows), default=1)
+        if num_cols < 1:
+            return False
+
+        sep_indices = set()
+        col_alignments = ['left'] * num_cols
+        for r_idx, row in enumerate(parsed_rows):
+            while len(row) < num_cols:
+                row.append('')
+            if self._is_separator_row(row):
+                sep_indices.add(r_idx)
+                for c_idx, cell in enumerate(row):
+                    c_str = cell.strip()
+                    if c_str.startswith(':') and c_str.endswith(':'):
+                        col_alignments[c_idx] = 'center'
+                    elif c_str.endswith(':'):
+                        col_alignments[c_idx] = 'right'
+                    else:
+                        col_alignments[c_idx] = 'left'
+
+        # Determine active cell (rel_row, curr_col)
+        rel_row = curr_line_no - first_line
+        pipes_before = curr_line[:curr_col_char].count('|')
+        curr_col = max(0, min(num_cols - 1, pipes_before - 1))
+
+        # Compute target cell
+        target_row = rel_row
+        target_col = curr_col + direction
+
+        if direction > 0:
+            while target_col >= num_cols or target_row in sep_indices:
+                if target_col >= num_cols:
+                    target_col = 0
+                    target_row += 1
+                if target_row in sep_indices:
+                    target_row += 1
+            if target_row >= len(parsed_rows):
+                parsed_rows.append(['' for _ in range(num_cols)])
+                target_row = len(parsed_rows) - 1
+                target_col = 0
+        else:
+            while target_col < 0 or target_row in sep_indices:
+                if target_col < 0:
+                    if target_row > 0:
+                        target_row -= 1
+                        target_col = num_cols - 1
+                    else:
+                        target_row = 0
+                        target_col = 0
+                        break
+                if target_row in sep_indices:
+                    if target_row > 0:
+                        target_row -= 1
+                    else:
+                        target_row = 0
+                        break
+
+        # Calculate column widths across all non-separator rows
+        col_widths = [3] * num_cols
+        for r_idx, row in enumerate(parsed_rows):
+            if r_idx in sep_indices:
+                continue
+            for c_idx in range(num_cols):
+                col_widths[c_idx] = max(col_widths[c_idx], len(row[c_idx]))
+
+        # Build formatted table lines
+        formatted_lines = []
+        for r_idx, row in enumerate(parsed_rows):
+            cells_out = []
+            if r_idx in sep_indices:
+                for c_idx in range(num_cols):
+                    w = max(3, col_widths[c_idx])
+                    al = col_alignments[c_idx]
+                    if al == 'center':
+                        cells_out.append(':' + '-' * max(1, w - 2) + ':')
+                    elif al == 'right':
+                        cells_out.append('-' * max(1, w - 1) + ':')
+                    else:
+                        cells_out.append(':' + '-' * max(1, w - 1) if row[c_idx].startswith(':') else '-' * w)
+            else:
+                for c_idx in range(num_cols):
+                    w = col_widths[c_idx]
+                    val = row[c_idx]
+                    al = col_alignments[c_idx]
+                    if al == 'center':
+                        cells_out.append(val.center(w))
+                    elif al == 'right':
+                        cells_out.append(val.rjust(w))
+                    else:
+                        cells_out.append(val.ljust(w))
+            formatted_lines.append("| " + " | ".join(cells_out) + " |")
+
+        new_table_text = "\n".join(formatted_lines)
+        editor.delete(f"{first_line}.0", f"{last_line}.end")
+        editor.insert(f"{first_line}.0", new_table_text)
+
+        # Place cursor in target cell and highlight its text if non-empty
+        target_doc_line = first_line + target_row
+        cell_start_col = 2 + sum(col_widths[c] + 3 for c in range(target_col))
+        cell_val = parsed_rows[target_row][target_col]
+        al = col_alignments[target_col]
+        w = col_widths[target_col]
+        if al == 'center':
+            leading_pad = (w - len(cell_val)) // 2
+        elif al == 'right':
+            leading_pad = w - len(cell_val)
+        else:
+            leading_pad = 0
+
+        val_start = f"{target_doc_line}.{cell_start_col + leading_pad}"
+        val_end = f"{target_doc_line}.{cell_start_col + leading_pad + len(cell_val)}"
+        editor.tag_remove(tk.SEL, "1.0", tk.END)
+        if cell_val:
+            editor.tag_add(tk.SEL, val_start, val_end)
+        editor.mark_set(tk.INSERT, val_end)
+        editor.see(val_end)
+
+        self.is_modified = True
+        if self.on_modified:
+            self.on_modified()
+        self._apply_syntax_highlighting()
+        return True
 
 
 class OutlinePanel(ttk.Frame):
