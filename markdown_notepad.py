@@ -2154,6 +2154,30 @@ class DocumentTab(ttk.Frame):
                     top._set_status(f"Anchor '[@anchor: {target_ref}]' not found in document")
         return None
 
+    def center_cursor_vertically(self):
+        """Keep the active cursor line near the vertical center (~45%) of the source editor viewport."""
+        if self.current_mode != "source":
+            return
+        editor = self.source_editor
+        try:
+            bbox = editor.bbox(tk.INSERT)
+            if not bbox:
+                editor.see(tk.INSERT)
+                return
+            _, y, _, line_h = bbox
+            vh = editor.winfo_height()
+            if vh < 80:
+                return
+            target_y = int(vh * 0.45)
+            diff_px = (y + line_h // 2) - target_y
+            threshold = max(20, int(line_h * 1.4))
+            if abs(diff_px) > threshold:
+                lines_to_scroll = int(round(diff_px / max(12, line_h)))
+                if lines_to_scroll != 0:
+                    editor.yview_scroll(lines_to_scroll, "units")
+        except Exception:
+            pass
+
 
 class OutlinePanel(ttk.Frame):
     """Collapsible document outline — heading tree with click-to-navigate."""
@@ -2282,6 +2306,7 @@ class MarkdownNotepad(tk.Tk):
         'page_size': 'Letter',
         'page_margin': 'Normal',
         'zoom_pct': 100,
+        'typewriter_scrolling': False,
     }
 
     ZOOM_STEPS = [25, 50, 75, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400]
@@ -2346,6 +2371,7 @@ class MarkdownNotepad(tk.Tk):
         self.page_layout_var = tk.BooleanVar(value=bool(self.theme.get('page_layout', True)))
         self.page_size_var = tk.StringVar(value=self.theme.get('page_size', 'Letter'))
         self.page_margin_var = tk.StringVar(value=self.theme.get('page_margin', 'Normal'))
+        self.typewriter_var = tk.BooleanVar(value=bool(self.theme.get('typewriter_scrolling', False)))
         self._setup_ui()
         self._setup_bindings()
         self._restore_session()
@@ -2608,6 +2634,12 @@ class MarkdownNotepad(tk.Tk):
         view_menu.add_checkbutton(label="Word Wrap", variable=self.wrap_var, 
                                    command=self._toggle_word_wrap, accelerator="Ctrl+Shift+W")
         
+        # Typewriter scrolling toggle
+        view_menu.add_checkbutton(label="Typewriter Scrolling (Keep Cursor Centered)",
+                                   variable=self.typewriter_var,
+                                   command=self._toggle_typewriter_scrolling,
+                                   accelerator="Ctrl+Shift+T")
+        
         # Large file mode
         self.large_file_var = tk.BooleanVar(value=False)
         view_menu.add_checkbutton(label="Large File Mode (faster)", variable=self.large_file_var,
@@ -2658,7 +2690,7 @@ class MarkdownNotepad(tk.Tk):
         view_menu.add_command(label="AI Sidebar", command=self._toggle_ai_sidebar, accelerator="Ctrl+Shift+A")
         view_menu.add_command(label="AI Settings...", command=self._open_ai_settings)
         view_menu.add_separator()
-        view_menu.add_command(label='Document Outline',
+        view_menu.add_command(label='Document Navigator & Outline',
                               command=self._toggle_outline_panel,
                               accelerator='Ctrl+Shift+L')
         view_menu.add_separator()
@@ -2674,21 +2706,26 @@ class MarkdownNotepad(tk.Tk):
         format_menu.add_command(label="Bold", command=lambda: self._insert_format("**", "**"), accelerator="Ctrl+B")
         format_menu.add_command(label="Italic", command=lambda: self._insert_format("*", "*"), accelerator="Ctrl+I")
         format_menu.add_command(label="Highlight", command=lambda: self._insert_format("==", "=="), accelerator="Ctrl+Shift+H")
-        format_menu.add_command(label="Code", command=lambda: self._insert_format("`", "`"), accelerator="Ctrl+`")
+        format_menu.add_command(label="Inline Code", command=lambda: self._insert_format("`", "`"), accelerator="Ctrl+`")
         format_menu.add_separator()
         format_menu.add_command(label="Heading 1", command=lambda: self._insert_line_prefix("# "))
         format_menu.add_command(label="Heading 2", command=lambda: self._insert_line_prefix("## "))
         format_menu.add_command(label="Heading 3", command=lambda: self._insert_line_prefix("### "))
+        format_menu.add_command(label="Heading 4", command=lambda: self._insert_line_prefix("#### "))
         format_menu.add_separator()
         format_menu.add_command(label="Bullet List", command=lambda: self._insert_line_prefix("- "))
         format_menu.add_command(label="Numbered List", command=lambda: self._insert_line_prefix("1. "))
-        format_menu.add_command(label="Blockquote", command=lambda: self._insert_line_prefix("> "))
+        format_menu.add_command(label="Blockquote", command=lambda: self._insert_line_prefix("> "), accelerator="Ctrl+Shift+Q")
         format_menu.add_separator()
+        format_menu.add_command(label="Insert Table...", command=self.insert_table, accelerator="Alt+T")
+        format_menu.add_command(label="Code Block", command=lambda: self._insert_text("\n```\n\n```\n"), accelerator="Ctrl+Shift+K")
         format_menu.add_command(label="Horizontal Rule", command=lambda: self._insert_text("\n---\n"))
-        format_menu.add_command(label="Code Block", command=lambda: self._insert_text("\n```\n\n```\n"))
-        format_menu.add_command(label="Link", command=lambda: self._insert_format("[", "](url)"))
-        format_menu.add_command(label="Anchor (Bookmark)", command=lambda: self._insert_format("[@anchor: ", "]"))
+        format_menu.add_separator()
+        format_menu.add_command(label="Link", command=lambda: self._insert_format("[", "](url)"), accelerator="Ctrl+K")
+        format_menu.add_command(label="Anchor (Bookmark)", command=lambda: self._insert_format("[@anchor: ", "]"), accelerator="Ctrl+Shift+M")
         format_menu.add_command(label="Anchor Reference", command=lambda: self._insert_format("[@", "]"))
+        format_menu.add_command(label="Insert Footnote", command=self.insert_footnote, accelerator="Ctrl+Shift+F")
+        format_menu.add_command(label="Math & Symbols...", command=self.open_math_symbol_picker, accelerator="Ctrl+Shift+Y")
         format_menu.add_separator()
         format_menu.add_command(label="Insert Image...", command=self.insert_image, accelerator="Ctrl+Shift+I")
         format_menu.add_command(label="Manage Images...", command=self.manage_images)
@@ -2700,91 +2737,120 @@ class MarkdownNotepad(tk.Tk):
         help_menu.add_command(label="MarkItDown Info", command=self.show_markitdown_info)
     
     def _create_toolbar(self):
-        """Create the toolbar"""
+        """Create the main toolbar with grouped icons and shortcut tooltips"""
         self.toolbar_frame = ttk.Frame(self)
         self.toolbar_frame.pack(fill=tk.X, padx=5, pady=(4, 2))
-        toolbar = self.toolbar_frame  # Keep local reference for compatibility
+        toolbar = self.toolbar_frame
         
-        # File operations with tooltips
-        new_btn = ttk.Button(toolbar, text="New", command=self.new_tab, style="Toolbar.TButton")
-        new_btn.pack(side=tk.LEFT, padx=2)
+        # 1. File & Document Workflow Group
+        new_btn = ttk.Button(toolbar, text="\U0001f5cb New", command=self.new_tab, style="Toolbar.TButton")
+        new_btn.pack(side=tk.LEFT, padx=1)
         ToolTip(new_btn, "New Tab (Ctrl+N)")
         
-        open_btn = ttk.Button(toolbar, text="Open", command=self.open_file, style="Toolbar.TButton")
-        open_btn.pack(side=tk.LEFT, padx=2)
+        open_btn = ttk.Button(toolbar, text="\U0001f4c2 Open", command=self.open_file, style="Toolbar.TButton")
+        open_btn.pack(side=tk.LEFT, padx=1)
         ToolTip(open_btn, "Open File (Ctrl+O)")
         
-        convert_btn = ttk.Button(toolbar, text="Convert", command=self.open_with_markitdown, style="Toolbar.TButton")
-        convert_btn.pack(side=tk.LEFT, padx=2)
-        ToolTip(convert_btn, "Open with MarkItDown - Convert PDF, DOCX, etc. (Ctrl+Shift+O)")
+        convert_btn = ttk.Button(toolbar, text="\u26a1 Convert", command=self.open_with_markitdown, style="Toolbar.TButton")
+        convert_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(convert_btn, "Open with MarkItDown — Convert PDF, DOCX, PPTX, EPUB (Ctrl+Shift+O)")
         
-        save_btn = ttk.Button(toolbar, text="Save", command=self.save_file, style="Toolbar.TButton")
-        save_btn.pack(side=tk.LEFT, padx=2)
+        save_btn = ttk.Button(toolbar, text="\U0001f4be Save", command=self.save_file, style="Toolbar.TButton")
+        save_btn.pack(side=tk.LEFT, padx=1)
         ToolTip(save_btn, "Save File (Ctrl+S)")
 
-        reflow_btn = ttk.Button(toolbar, text="Reflow", command=self.clean_current_document, style="Toolbar.TButton")
-        reflow_btn.pack(side=tk.LEFT, padx=2)
-        ToolTip(reflow_btn, "Clean & Reflow Document - Fix soft wraps & hyphens (Ctrl+Shift+R)")
+        reflow_btn = ttk.Button(toolbar, text="\u21bb Reflow", command=self.clean_current_document, style="Toolbar.TButton")
+        reflow_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(reflow_btn, "Clean & Reflow Document — Fix soft wraps & broken lines (Ctrl+Shift+R)")
         
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
         
-        # Mode toggle (segmented Source | Visual)
+        # 2. Mode Toggle Group (segmented Source | Visual)
         self.mode_var = tk.StringVar(value="source")
         mode_frame = ttk.Frame(toolbar)
-        mode_frame.pack(side=tk.LEFT, padx=2)
+        mode_frame.pack(side=tk.LEFT, padx=1)
         
         self.source_btn = ttk.Radiobutton(
             mode_frame, text="Source", variable=self.mode_var, style="Toolbar.Toolbutton",
             value="source", command=self._show_source_mode
         )
         self.source_btn.pack(side=tk.LEFT)
-        ToolTip(self.source_btn, "Edit raw markdown (Ctrl+1)")
+        ToolTip(self.source_btn, "Source Mode — Edit raw Markdown (Ctrl+1)")
         
         self.visual_btn = ttk.Radiobutton(
             mode_frame, text="Visual", variable=self.mode_var, style="Toolbar.Toolbutton",
             value="visual", command=self._show_visual_mode
         )
         self.visual_btn.pack(side=tk.LEFT)
-        ToolTip(self.visual_btn, "Visual rendered view (Ctrl+2)")
+        ToolTip(self.visual_btn, "Visual Mode — Rendered presentation view (Ctrl+2)")
         
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
         
-        # Format buttons (source mode only) with tooltips
+        # 3. Inline Formatting Group (Source Mode)
         self._format_buttons = []
         
         def add_format_button(text, command, width, tip):
-            btn = ttk.Button(toolbar, text=text, command=command, width=width)
+            btn = ttk.Button(toolbar, text=text, command=command, width=width, style="Toolbar.TButton")
             btn.pack(side=tk.LEFT, padx=1)
             ToolTip(btn, tip)
             self._format_buttons.append(btn)
+            return btn
         
-        add_format_button("B", lambda: self._insert_format("**", "**"), 3, "Bold (Ctrl+B)")
-        add_format_button("I", lambda: self._insert_format("*", "*"), 3, "Italic (Ctrl+I)")
-        add_format_button("HL", lambda: self._insert_format("==", "=="), 3, "Highlight (Ctrl+Shift+H)")
-        add_format_button("</>", lambda: self._insert_format("`", "`"), 3, "Inline Code (Ctrl+`)")
-        add_format_button("Link", lambda: self._insert_format("[", "](url)"), 4, "Insert Link")
-        add_format_button("Anchor", lambda: self._insert_format("[@anchor: ", "]"), 6, "Insert Anchor [@anchor: name]")
-        add_format_button("Image", self.insert_image, 5, "Insert Image (Ctrl+Shift+I)")
+        add_format_button("\U0001d401", lambda: self._insert_format("**", "**"), 3, "Bold **text** (Ctrl+B)")
+        add_format_button("\U0001d43c", lambda: self._insert_format("*", "*"), 3, "Italic *text* (Ctrl+I)")
+        add_format_button("\U0001f58d HL", lambda: self._insert_format("==", "=="), 5, "Highlight ==text== (Ctrl+Shift+H)")
+        add_format_button("</>", lambda: self._insert_format("`", "`"), 4, "Inline Code `code` (Ctrl+`)")
         
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
         
-        # Theme button
-        theme_btn = ttk.Button(toolbar, text="Theme", command=self.open_theme_dialog, style="Toolbar.TButton")
-        theme_btn.pack(side=tk.LEFT, padx=2)
-        ToolTip(theme_btn, "Change color theme, fonts and desk colour")
+        # 4. Structural & Block Elements Group (Source Mode)
+        heading_mb = ttk.Menubutton(toolbar, text="H\u25be", width=4, style="Toolbar.TButton")
+        heading_menu = tk.Menu(heading_mb, tearoff=0)
+        heading_menu.add_command(label="H1 — Heading 1 (#)", command=lambda: self._insert_line_prefix("# "))
+        heading_menu.add_command(label="H2 — Heading 2 (##)", command=lambda: self._insert_line_prefix("## "))
+        heading_menu.add_command(label="H3 — Heading 3 (###)", command=lambda: self._insert_line_prefix("### "))
+        heading_menu.add_command(label="H4 — Heading 4 (####)", command=lambda: self._insert_line_prefix("#### "))
+        heading_mb.config(menu=heading_menu)
+        heading_mb.pack(side=tk.LEFT, padx=1)
+        ToolTip(heading_mb, "Insert Section Heading (# to ####)")
+        self._format_buttons.append(heading_mb)
         
-        # Right-hand side: AI sidebar, outline, full screen
-        self.ai_sidebar_btn = ttk.Button(toolbar, text="AI Chat", command=self._toggle_ai_sidebar, style="Toolbar.TButton")
-        self.ai_sidebar_btn.pack(side=tk.RIGHT, padx=2)
+        add_format_button("\u275d Quote", lambda: self._insert_line_prefix("> "), 7, "Blockquote > (Ctrl+Shift+Q)")
+        add_format_button("\u2022 List", lambda: self._insert_line_prefix("- "), 6, "Bullet List (- item)")
+        add_format_button("1. List", lambda: self._insert_line_prefix("1. "), 6, "Numbered List (1. item)")
+        add_format_button("\u229e Table", self.insert_table, 7, "Insert Table — Choose rows, columns & header (Alt+T)")
+        add_format_button("{ }", lambda: self._insert_text("\n```\n\n```\n"), 4, "Fenced Code Block ``` (Ctrl+Shift+K)")
+        add_format_button("\u2015 HR", lambda: self._insert_text("\n---\n"), 5, "Horizontal Divider Rule (---)")
+        
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
+        
+        # 5. Cross-References, Citations, Math & Media Group (Source Mode)
+        add_format_button("\u2693 Anchor", lambda: self._insert_format("[@anchor: ", "]"), 8, "Insert Anchor Target [@anchor: name] (Ctrl+Shift+M)")
+        add_format_button("\U0001f517 Link", lambda: self._insert_format("[", "](url)"), 6, "Insert Link [text](url) (Ctrl+K)")
+        add_format_button("[^] Note", self.insert_footnote, 7, "Insert Footnote Citation [^1] (Ctrl+Shift+F)")
+        add_format_button("\u2211 Math", self.open_math_symbol_picker, 6, "Insert Math & Unicode Symbols (Ctrl+Shift+Y)")
+        add_format_button("\U0001f5bc Image", self.insert_image, 7, "Insert Image (Ctrl+Shift+I)")
+        
+        # 6. Right-hand Utility & Workspace Controls
+        self.ai_sidebar_btn = ttk.Button(toolbar, text="\U0001f4ac AI Chat", command=self._toggle_ai_sidebar, style="Toolbar.TButton")
+        self.ai_sidebar_btn.pack(side=tk.RIGHT, padx=1)
         ToolTip(self.ai_sidebar_btn, "Toggle AI Assistant Sidebar (Ctrl+Shift+A)")
         
-        fullscreen_btn = ttk.Button(toolbar, text="Full Screen", command=self._toggle_focus_mode, style="Toolbar.TButton")
-        fullscreen_btn.pack(side=tk.RIGHT, padx=2)
-        ToolTip(fullscreen_btn, "Full screen focus mode (F11)")
+        fullscreen_btn = ttk.Button(toolbar, text="\u26f6 Full Screen", command=self._toggle_focus_mode, style="Toolbar.TButton")
+        fullscreen_btn.pack(side=tk.RIGHT, padx=1)
+        ToolTip(fullscreen_btn, "Full Screen Focus Mode (F11)")
         
-        outline_btn = ttk.Button(toolbar, text="Outline", command=self._toggle_outline_panel, style="Toolbar.TButton")
-        outline_btn.pack(side=tk.RIGHT, padx=2)
-        ToolTip(outline_btn, "Toggle Document Outline (Ctrl+Shift+L)")
+        outline_btn = ttk.Button(toolbar, text="\U0001f4d1 Navigator", command=self._toggle_outline_panel, style="Toolbar.TButton")
+        outline_btn.pack(side=tk.RIGHT, padx=1)
+        ToolTip(outline_btn, "Toggle Document Navigator & Outline (Ctrl+Shift+L)")
+        
+        theme_btn = ttk.Button(toolbar, text="\U0001f3a8 Theme", command=self.open_theme_dialog, style="Toolbar.TButton")
+        theme_btn.pack(side=tk.RIGHT, padx=1)
+        ToolTip(theme_btn, "Customize Theme, Fonts, Desk & Blockquote Styling")
+        
+        find_btn = ttk.Button(toolbar, text="\U0001f50d Find", command=self.find_text, style="Toolbar.TButton")
+        find_btn.pack(side=tk.RIGHT, padx=1)
+        ToolTip(find_btn, "Find & Replace in Document (Ctrl+F / Ctrl+H)")
     
     def _set_format_buttons_enabled(self, enabled):
         """Formatting buttons only make sense in Source mode (Visual mode is read-only)"""
@@ -2858,6 +2924,8 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-I>", lambda e: self.insert_image())  # Ctrl+Shift+I
         self.bind("<Control-w>", lambda e: self.close_tab())  # Close tab
         self.bind("<Control-W>", lambda e: self._toggle_word_wrap())  # Ctrl+Shift+W for word wrap
+        self.bind("<Control-T>", lambda e: self._toggle_typewriter_scrolling())  # Ctrl+Shift+T
+        self.bind("<Control-Shift-T>", lambda e: self._toggle_typewriter_scrolling())
         self.bind("<Control-z>", self._doc_shortcut(self.undo))
         self.bind("<Control-y>", self._doc_shortcut(self.redo))
         self.bind("<Control-a>", self._doc_shortcut(self.select_all))
@@ -2873,6 +2941,14 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-Shift-H>", self._doc_shortcut(lambda: self._insert_format("==", "==")))
         self.bind("<Control-Shift-h>", self._doc_shortcut(lambda: self._insert_format("==", "==")))
         self.bind("<Control-Shift-Key-H>", self._doc_shortcut(lambda: self._insert_format("==", "==")))
+        self.bind("<Control-k>", self._doc_shortcut(lambda: self._insert_format("[", "](url)")))
+        self.bind("<Control-K>", self._doc_shortcut(lambda: self._insert_text("\n```\n\n```\n")))
+        self.bind("<Control-Q>", self._doc_shortcut(lambda: self._insert_line_prefix("> ")))
+        self.bind("<Control-M>", self._doc_shortcut(lambda: self._insert_format("[@anchor: ", "]")))
+        self.bind("<Control-F>", self._doc_shortcut(self.insert_footnote))
+        self.bind("<Control-Y>", self._doc_shortcut(self.open_math_symbol_picker))
+        self.bind("<Alt-t>", self._doc_shortcut(self.insert_table))
+        self.bind("<Alt-T>", self._doc_shortcut(self.insert_table))
         self.bind("<Control-Key-1>", lambda e: self._show_source_mode())
         self.bind("<Control-Key-2>", lambda e: self._show_visual_mode())
         self.bind("<Control-e>", lambda e: self._toggle_mode())
@@ -3592,10 +3668,14 @@ class MarkdownNotepad(tk.Tk):
         tab.visual_viewer.page_view.on_zoom_wheel = self._on_ctrl_mousewheel
         tab.visual_viewer.on_zoom_wheel = self._on_ctrl_mousewheel
         
-        # Position tracking
+        # Position & selection tracking (both source and visual modes)
         tab.source_editor.bind("<KeyRelease>", self._schedule_position_update)
         tab.source_editor.bind("<KeyRelease>", self._schedule_syntax_highlight, add='+')
-        tab.source_editor.bind("<ButtonRelease>", self._update_position)
+        tab.source_editor.bind("<ButtonRelease>", self._schedule_position_update)
+        tab.source_editor.bind("<<Selection>>", self._schedule_position_update)
+        tab.visual_viewer.text_widget.bind("<ButtonRelease>", self._schedule_position_update)
+        tab.visual_viewer.text_widget.bind("<KeyRelease>", self._schedule_position_update)
+        tab.visual_viewer.text_widget.bind("<<Selection>>", self._schedule_position_update)
         
         # Right-click context menu on editor
         tab.source_editor.bind("<Button-3>", self._show_editor_context_menu)
@@ -3612,6 +3692,8 @@ class MarkdownNotepad(tk.Tk):
             ("<Control-Shift-H>", "==", "=="),
             ("<Control-Shift-h>", "==", "=="),
             ("<Control-Shift-Key-H>", "==", "=="),
+            ("<Control-k>", "[", "](url)"),
+            ("<Control-M>", "[@anchor: ", "]"),
         ):
             tab.source_editor.bind(seq, lambda e, p=pfx, s=sfx: self._insert_format(p, s))
     
@@ -3751,6 +3833,8 @@ class MarkdownNotepad(tk.Tk):
         self._position_update_pending = False
         self._update_position()
         self._update_word_count()
+        if self.typewriter_var.get() and self.current_tab:
+            self.current_tab.center_cursor_vertically()
     
     def _on_modified(self, event=None):
         """Handle text modification - called by tab's source editor"""
@@ -3771,18 +3855,38 @@ class MarkdownNotepad(tk.Tk):
             pass
     
     def _update_word_count(self):
-        """Update word and character count in status bar"""
+        """Update word and character count in status bar, including highlighted selection counts"""
         try:
             if self.current_tab:
                 content = self.current_tab.get_content()
                 char_count = len(content)
-                # Count words (split on whitespace)
                 words = content.split()
                 word_count = len(words)
-                self.word_count_label.config(text=f"Words: {word_count} | Chars: {char_count}")
+                
+                # Check if there is a highlighted selection in the active view
+                active_widget = (
+                    self.current_tab.source_editor
+                    if self.current_tab.current_mode == "source"
+                    else self.current_tab.visual_viewer.text_widget
+                )
+                sel_text = ""
+                try:
+                    if active_widget.tag_ranges(tk.SEL):
+                        sel_text = active_widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+                except tk.TclError:
+                    sel_text = ""
+                
+                if sel_text:
+                    sel_words = len(sel_text.split())
+                    sel_chars = len(sel_text)
+                    self.word_count_label.config(
+                        text=f"Words: {sel_words} / {word_count} | Chars: {sel_chars} / {char_count}"
+                    )
+                else:
+                    self.word_count_label.config(text=f"Words: {word_count} | Chars: {char_count}")
             else:
                 self.word_count_label.config(text="Words: 0 | Chars: 0")
-        except:
+        except Exception:
             pass
     
     def _update_title(self):
@@ -3823,6 +3927,18 @@ class MarkdownNotepad(tk.Tk):
         self.wrap_label.config(text=f"Wrap: {'On' if self.word_wrap else 'Off'}")
         status = "Word wrap enabled" if self.word_wrap else "Word wrap disabled (horizontal scroll)"
         self._set_status(status)
+
+    def _toggle_typewriter_scrolling(self):
+        """Toggle typewriter scrolling (keep cursor line vertically centered)"""
+        enabled = bool(self.typewriter_var.get())
+        self.theme['typewriter_scrolling'] = enabled
+        self._save_theme()
+        if enabled and self.current_tab:
+            self.current_tab.center_cursor_vertically()
+        self._set_status(
+            "Typewriter scrolling enabled (cursor centered)"
+            if enabled else "Typewriter scrolling disabled"
+        )
     
     def _toggle_large_file_mode(self):
         """Toggle large file mode for better performance with big files"""
@@ -4573,6 +4689,68 @@ class MarkdownNotepad(tk.Tk):
         self.current_tab.is_modified = True
         self._update_tab_title(self.current_tab)
         self._schedule_syntax_highlight()
+        return "break"
+
+    def insert_table(self):
+        """Open dialog to insert a formatted Markdown table with configurable rows, columns, and header."""
+        if not self.current_tab or self.current_tab.current_mode != "source":
+            self._set_status("Switch to Source Mode to insert a table")
+            return "break"
+        InsertTableDialog(self, self.current_tab.source_editor, self._on_table_inserted)
+        return "break"
+
+    def _on_table_inserted(self):
+        if self.current_tab:
+            self.current_tab.is_modified = True
+            self._update_tab_title(self.current_tab)
+            self._schedule_syntax_highlight()
+            self._schedule_outline_update()
+            self._set_status("Markdown table inserted (use Tab / Shift+Tab to navigate & align cells)")
+
+    def insert_footnote(self):
+        """Insert a numbered footnote citation [^n] at cursor and append [^n]: definition at bottom."""
+        if not self.current_tab or self.current_tab.current_mode != "source":
+            self._set_status("Switch to Source Mode to insert a footnote")
+            return "break"
+        editor = self.current_tab.source_editor
+        content = editor.get("1.0", tk.END)
+        existing = [int(m) for m in re.findall(r'\[\^(\d+)\]', content)]
+        next_num = (max(existing) + 1) if existing else 1
+        ref_token = f"[^{next_num}]"
+
+        # If selection exists, place citation immediately after selection
+        try:
+            insert_pos = editor.index(tk.SEL_LAST)
+        except tk.TclError:
+            insert_pos = editor.index(tk.INSERT)
+
+        editor.insert(insert_pos, ref_token)
+        # Append footnote definition at the end of the document
+        end_text = editor.get("1.0", "end-1c")
+        prefix = "\n\n" if not end_text.endswith("\n\n") else ""
+        if end_text.endswith("\n") and not end_text.endswith("\n\n"):
+            prefix = "\n"
+        def_token = f"{prefix}[^{next_num}]: "
+        editor.insert("end-1c", def_token)
+        editor.mark_set(tk.INSERT, "end-1c")
+        editor.see(tk.INSERT)
+        self.current_tab.is_modified = True
+        self._update_tab_title(self.current_tab)
+        self._schedule_syntax_highlight()
+        self._schedule_outline_update()
+        self._set_status(f"Inserted footnote {ref_token} — enter footnote text below")
+        return "break"
+
+    def open_math_symbol_picker(self):
+        """Open the non-modal Math & Unicode Symbol palette."""
+        if not self.current_tab or self.current_tab.current_mode != "source":
+            self._set_status("Switch to Source Mode to insert math & symbols")
+            return "break"
+        if hasattr(self, '_math_picker_win') and self._math_picker_win and self._math_picker_win.winfo_exists():
+            self._math_picker_win.lift()
+            self._math_picker_win.focus_set()
+            return "break"
+        self._math_picker_win = MathSymbolDialog(self)
         return "break"
     
     # === Image Management ===
@@ -5898,6 +6076,252 @@ class FindDialog(tk.Toplevel):
             # Wrap around to beginning
             self.search_pos = "1.0"
             messagebox.showinfo("Find", "Reached end of document. Search will continue from beginning.")
+
+
+class InsertTableDialog(tk.Toplevel):
+    """Dialog for inserting a formatted Markdown table with rows, columns, header, and alignment."""
+
+    def __init__(self, parent, text_widget, on_inserted=None):
+        super().__init__(parent)
+        self.parent = parent
+        self.text_widget = text_widget
+        self.on_inserted = on_inserted
+
+        self.title("Insert Markdown Table")
+        self.geometry("360x260")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self._setup_ui()
+
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        self.bind("<Return>", lambda e: self._insert())
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _setup_ui(self):
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Configure Table Dimensions", font=(SANS_FONT, 10, "bold")).pack(anchor=tk.W, pady=(0, 10))
+
+        grid = ttk.Frame(frame)
+        grid.pack(fill=tk.X, pady=4)
+
+        ttk.Label(grid, text="Columns:", width=16).grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.cols_var = tk.IntVar(value=3)
+        cols_spin = ttk.Spinbox(grid, from_=1, to=12, textvariable=self.cols_var, width=8)
+        cols_spin.grid(row=0, column=1, sticky=tk.W, pady=4)
+
+        ttk.Label(grid, text="Data Rows:", width=16).grid(row=1, column=0, sticky=tk.W, pady=4)
+        self.rows_var = tk.IntVar(value=3)
+        rows_spin = ttk.Spinbox(grid, from_=1, to=50, textvariable=self.rows_var, width=8)
+        rows_spin.grid(row=1, column=1, sticky=tk.W, pady=4)
+
+        ttk.Label(grid, text="Column Alignment:", width=16).grid(row=2, column=0, sticky=tk.W, pady=4)
+        self.align_var = tk.StringVar(value="Left")
+        align_combo = ttk.Combobox(grid, textvariable=self.align_var, values=["Left", "Center", "Right"], state="readonly", width=10)
+        align_combo.grid(row=2, column=1, sticky=tk.W, pady=4)
+
+        self.header_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="Include Header Row", variable=self.header_var).pack(anchor=tk.W, pady=(8, 4))
+
+        ttk.Label(frame, text="Tip: Use Tab and Shift+Tab inside tables to jump cells and auto-align.",
+                  font=(SANS_FONT, 8), foreground="#666666").pack(anchor=tk.W, pady=(2, 10))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X, side=tk.BOTTOM)
+        ttk.Button(btn_frame, text="Insert Table", command=self._insert, width=14).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy, width=10).pack(side=tk.RIGHT)
+
+        cols_spin.focus_set()
+
+    def _insert(self):
+        try:
+            cols = max(1, min(12, int(self.cols_var.get())))
+        except (ValueError, tk.TclError):
+            cols = 3
+        try:
+            rows = max(1, min(50, int(self.rows_var.get())))
+        except (ValueError, tk.TclError):
+            rows = 3
+
+        include_header = bool(self.header_var.get())
+        align = self.align_var.get()
+
+        col_width = 10
+        if align == "Center":
+            sep_cell = ":" + "-" * (col_width - 2) + ":"
+        elif align == "Right":
+            sep_cell = "-" * (col_width - 1) + ":"
+        else:
+            sep_cell = ":" + "-" * (col_width - 1)
+
+        lines = []
+        if include_header:
+            headers = [f"Header {c+1}".ljust(col_width) for c in range(cols)]
+            lines.append("| " + " | ".join(headers) + " |")
+        else:
+            blank_top = [" " * col_width for _ in range(cols)]
+            lines.append("| " + " | ".join(blank_top) + " |")
+
+        seps = [sep_cell for _ in range(cols)]
+        lines.append("| " + " | ".join(seps) + " |")
+
+        data_row_count = rows if include_header else max(0, rows - 1)
+        for _ in range(data_row_count):
+            cells = [" " * col_width for _ in range(cols)]
+            lines.append("| " + " | ".join(cells) + " |")
+
+        table_md = "\n" + "\n".join(lines) + "\n\n"
+        insert_idx = self.text_widget.index(tk.INSERT)
+        self.text_widget.insert(insert_idx, table_md)
+
+        # Place cursor inside the first cell
+        first_cell_start = f"{insert_idx}+1l+2c"
+        first_cell_end = f"{first_cell_start}+{col_width if not include_header else len('Header 1')}c"
+        try:
+            self.text_widget.mark_set(tk.INSERT, first_cell_start)
+            if include_header:
+                self.text_widget.tag_remove(tk.SEL, "1.0", tk.END)
+                self.text_widget.tag_add(tk.SEL, first_cell_start, first_cell_end)
+            self.text_widget.see(first_cell_start)
+            self.text_widget.focus_set()
+        except tk.TclError:
+            pass
+
+        if self.on_inserted:
+            self.on_inserted()
+        self.destroy()
+
+
+class MathSymbolDialog(tk.Toplevel):
+    """Non-modal palette for inserting Unicode mathematical symbols, Greek letters, and LaTeX templates."""
+
+    CATEGORIES = {
+        "Greek": [
+            ("α", "alpha"), ("β", "beta"), ("γ", "gamma"), ("δ", "delta"),
+            ("ε", "epsilon"), ("ζ", "zeta"), ("η", "eta"), ("θ", "theta"),
+            ("ι", "iota"), ("κ", "kappa"), ("λ", "lambda"), ("μ", "mu"),
+            ("ν", "nu"), ("ξ", "xi"), ("π", "pi"), ("ρ", "rho"),
+            ("σ", "sigma"), ("τ", "tau"), ("υ", "upsilon"), ("φ", "phi"),
+            ("χ", "chi"), ("ψ", "psi"), ("ω", "omega"), ("Γ", "Gamma"),
+            ("Δ", "Delta"), ("Θ", "Theta"), ("Λ", "Lambda"), ("Ξ", "Xi"),
+            ("Π", "Pi"), ("Σ", "Sigma"), ("Φ", "Phi"), ("Ψ", "Psi"), ("Ω", "Omega")
+        ],
+        "Operators": [
+            ("±", "Plus-minus"), ("∓", "Minus-plus"), ("×", "Multiply"), ("÷", "Divide"),
+            ("√", "Square root"), ("∛", "Cube root"), ("∞", "Infinity"), ("∂", "Partial derivative"),
+            ("∇", "Nabla / Del"), ("∑", "Summation"), ("∏", "Product"), ("∫", "Integral"),
+            ("∬", "Double integral"), ("∮", "Contour integral"), ("≈", "Approximately equal"), ("≠", "Not equal"),
+            ("≡", "Identical to"), ("≤", "Less than or equal"), ("≥", "Greater than or equal"), ("≪", "Much less than"),
+            ("≫", "Much greater than"), ("∝", "Proportional to"), ("∠", "Angle"), ("°", "Degree"),
+            ("′", "Prime"), ("″", "Double prime"), ("‰", "Per mille"), ("⋅", "Dot operator")
+        ],
+        "Sets & Logic": [
+            ("∈", "Element of"), ("∉", "Not element of"), ("∋", "Contains"), ("⊂", "Subset"),
+            ("⊃", "Superset"), ("⊆", "Subset or equal"), ("⊇", "Superset or equal"), ("∪", "Union"),
+            ("∩", "Intersection"), ("∅", "Empty set"), ("∀", "For all"), ("∃", "There exists"),
+            ("∄", "Does not exist"), ("¬", "Logical NOT"), ("∧", "Logical AND"), ("∨", "Logical OR"),
+            ("⊕", "XOR / Direct sum"), ("⇒", "Implies"), ("⇔", "If and only if"), ("→", "Right arrow"),
+            ("←", "Left arrow"), ("↔", "Left-right arrow"), ("↦", "Maps to"), ("∴", "Therefore"),
+            ("∵", "Because"), ("ℕ", "Natural numbers"), ("ℤ", "Integers"), ("ℝ", "Real numbers")
+        ],
+        "Sub & Super": [
+            ("⁰", "^0"), ("¹", "^1"), ("²", "^2"), ("³", "^3"), ("⁴", "^4"),
+            ("⁵", "^5"), ("⁶", "^6"), ("⁷", "^7"), ("⁸", "^8"), ("⁹", "^9"),
+            ("⁺", "^+"), ("⁻", "^-"), ("⁼", "^="), ("⁽", "^("), ("⁾", "^)"),
+            ("ⁿ", "^n"), ("ⁱ", "^i"), ("₀", "_0"), ("₁", "_1"), ("₂", "_2"),
+            ("₃", "_3"), ("₄", "_4"), ("₅", "_5"), ("₆", "_6"), ("₇", "_7"),
+            ("₈", "_8"), ("₉", "_9"), ("₊", "_+"), ("₋", "_-"), ("₌", "_="),
+            ("ᵢ", "_i"), ("ⱼ", "_j"), ("ₖ", "_k"), ("ₙ", "_n")
+        ],
+    }
+
+    LATEX_TEMPLATES = [
+        ("Inline $...$", "$", "$", "Wrap inline math $...$"),
+        ("Block $$...$$", "\n$$\n", "\n$$\n", "Insert display math block $$...$$"),
+        ("\\frac{a}{b}", "\\frac{", "}{b}", "LaTeX fraction"),
+        ("\\sqrt{x}", "\\sqrt{", "}", "LaTeX square root"),
+        ("\\sum_{i=1}^{n}", "\\sum_{i=1}^{n} ", "", "LaTeX summation"),
+        ("\\int_{a}^{b}", "\\int_{a}^{b} ", "", "LaTeX integral"),
+    ]
+
+    def __init__(self, notepad: MarkdownNotepad):
+        super().__init__(notepad)
+        self.notepad = notepad
+        self.title("Math & Symbol Palette")
+        self.geometry("430x310")
+        self.resizable(False, False)
+        self.transient(notepad)
+
+        self._setup_ui()
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _setup_ui(self):
+        main = ttk.Frame(self, padding=10)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        nb = ttk.Notebook(main)
+        nb.pack(fill=tk.BOTH, expand=True)
+
+        for cat_name, symbols in self.CATEGORIES.items():
+            page = ttk.Frame(nb, padding=6)
+            nb.add(page, text=cat_name)
+            cols = 7
+            for idx, (sym, desc) in enumerate(symbols):
+                r, c = divmod(idx, cols)
+                btn = ttk.Button(
+                    page, text=sym, width=4,
+                    command=lambda s=sym: self._insert_symbol(s)
+                )
+                btn.grid(row=r, column=c, padx=2, pady=2, sticky="nsew")
+                ToolTip(btn, f"{sym} — {desc}")
+
+        # LaTeX templates tab
+        latex_page = ttk.Frame(nb, padding=8)
+        nb.add(latex_page, text="LaTeX Math")
+        ttk.Label(
+            latex_page,
+            text="Insert LaTeX math (rendered with Unicode symbols in Visual Mode):",
+            font=(SANS_FONT, 8), foreground="#555555"
+        ).pack(anchor=tk.W, pady=(0, 6))
+        t_grid = ttk.Frame(latex_page)
+        t_grid.pack(fill=tk.BOTH, expand=True)
+        for idx, (label, pfx, sfx, tip) in enumerate(self.LATEX_TEMPLATES):
+            r, c = divmod(idx, 2)
+            btn = ttk.Button(
+                t_grid, text=label, width=18,
+                command=lambda p=pfx, s=sfx: self._insert_template(p, s)
+            )
+            btn.grid(row=r, column=c, padx=4, pady=4, sticky="ew")
+            ToolTip(btn, tip)
+
+        footer = ttk.Frame(main)
+        footer.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(footer, text="Click any symbol to insert at cursor", font=(SANS_FONT, 8), foreground="gray").pack(side=tk.LEFT)
+        ttk.Button(footer, text="Close", command=self.destroy, width=8).pack(side=tk.RIGHT)
+
+    def _insert_symbol(self, sym: str):
+        if self.notepad.current_tab and self.notepad.current_tab.current_mode == "source":
+            editor = self.notepad.current_tab.source_editor
+            editor.insert(tk.INSERT, sym)
+            self.notepad.current_tab.is_modified = True
+            self.notepad._update_tab_title(self.notepad.current_tab)
+            self.notepad._schedule_syntax_highlight()
+            editor.focus_set()
+
+    def _insert_template(self, prefix: str, suffix: str):
+        if self.notepad.current_tab and self.notepad.current_tab.current_mode == "source":
+            if suffix:
+                self.notepad._insert_format(prefix, suffix)
+            else:
+                self.notepad._insert_text(prefix)
+            self.notepad.current_tab.source_editor.focus_set()
 
 
 def main():
