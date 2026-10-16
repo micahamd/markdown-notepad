@@ -65,6 +65,39 @@ def get_available_export_formats() -> Dict[str, bool]:
 # CSS Stylesheet for PDF/HTML Export
 # =============================================================================
 
+def _export_latex_to_unicode(expr: str) -> str:
+    """Convert common LaTeX commands, superscripts, and subscripts to readable Unicode for exports."""
+    if not expr:
+        return ""
+    s = expr.strip()
+    s = re.sub(r'\\frac\{([^{}]+)\}\{([^{}]+)\}', r'(\1)/(\2)', s)
+    s = re.sub(r'\\sqrt\{([^{}]+)\}', r'√(\1)', s)
+    symbols = {
+        r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ', r'\epsilon': 'ε',
+        r'\theta': 'θ', r'\lambda': 'λ', r'\mu': 'μ', r'\pi': 'π', r'\sigma': 'σ',
+        r'\tau': 'τ', r'\phi': 'φ', r'\omega': 'ω', r'\Gamma': 'Γ', r'\Delta': 'Δ',
+        r'\Theta': 'Θ', r'\Lambda': 'Λ', r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Omega': 'Ω',
+        r'\pm': '±', r'\mp': '∓', r'\times': '×', r'\div': '÷', r'\cdot': '·',
+        r'\leq': '≤', r'\le': '≤', r'\geq': '≥', r'\ge': '≥', r'\neq': '≠', r'\ne': '≠',
+        r'\approx': '≈', r'\equiv': '≡', r'\propto': '∝', r'\infty': '∞', r'\partial': '∂',
+        r'\nabla': '∇', r'\sum': '∑', r'\prod': '∏', r'\int': '∫', r'\sqrt': '√',
+        r'\in': '∈', r'\notin': '∉', r'\subset': '⊂', r'\subseteq': '⊆',
+        r'\cup': '∪', r'\cap': '∩', r'\emptyset': '∅', r'\forall': '∀', r'\exists': '∃',
+        r'\neg': '¬', r'\wedge': '∧', r'\vee': '∨', r'\rightarrow': '→', r'\to': '→',
+        r'\leftarrow': '←', r'\leftrightarrow': '↔', r'\Rightarrow': '⇒',
+        r'\Leftarrow': '⇐', r'\Leftrightarrow': '⇔', r'\iff': '⇔', r'\dots': '…', r'\cdots': '⋯',
+    }
+    for cmd in sorted(symbols.keys(), key=len, reverse=True):
+        s = s.replace(cmd, symbols[cmd])
+    sup_map = str.maketrans("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ")
+    sub_map = str.maketrans("0123456789+-=()aeioruvxjk", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑᵢₒᵣᵤᵥₓⱼₖ")
+    s = re.sub(r'\^\{([^{}]+)\}', lambda m: m.group(1).translate(sup_map), s)
+    s = re.sub(r'\^([0-9+\-=ni])', lambda m: m.group(1).translate(sup_map), s)
+    s = re.sub(r'_\{([^{}]+)\}', lambda m: m.group(1).translate(sub_map), s)
+    s = re.sub(r'_([0-9+\-=aeioruvxjk])', lambda m: m.group(1).translate(sub_map), s)
+    return s
+
+
 def _build_css(theme: Optional[Dict] = None, page_settings: Optional[Dict] = None) -> str:
     """Build a CSS stylesheet for HTML/PDF export based on theme"""
     # Defaults
@@ -72,6 +105,19 @@ def _build_css(theme: Optional[Dict] = None, page_settings: Optional[Dict] = Non
     fg = theme.get('visual_fg', '#1a1a1a') if theme else '#1a1a1a'
     font_family = theme.get('visual_font', 'Georgia') if theme else 'Georgia'
     font_size = theme.get('visual_font_size', 11) if theme else 11
+
+    bq_font = (theme.get('blockquote_font') if theme else None) or font_family
+    bq_size_val = (theme.get('blockquote_size') if theme else 0) or 0
+    bq_size = int(bq_size_val) if int(bq_size_val) > 0 else font_size
+    bq_style_raw = (theme.get('blockquote_style', 'italic') if theme else 'italic') or 'italic'
+    bq_font_style = 'italic' if 'italic' in bq_style_raw else 'normal'
+    bq_font_weight = 'bold' if 'bold' in bq_style_raw else 'normal'
+    bq_fg = (theme.get('blockquote_fg') if theme else None) or '#555555'
+    bq_bg = (theme.get('blockquote_bg') if theme else None) or '#f9f9f9'
+    bq_bar = (theme.get('blockquote_bar_fg') if theme else None) or '#2563eb'
+    bq_pad = int((theme.get('blockquote_padding', 16) if theme else 16) or 16)
+    bq_space = int((theme.get('blockquote_spacing', 4) if theme else 4) or 4)
+    bq_justify = (theme.get('blockquote_justify', 'left') if theme else 'left') or 'left'
     
     page_size = 'A4'
     margin = '2cm'
@@ -100,10 +146,44 @@ def _build_css(theme: Optional[Dict] = None, page_settings: Optional[Dict] = Non
     h5, h6 {{ font-size: 1em; margin: 0.5em 0 0.25em; }}
     p {{ margin: 0.8em 0; text-align: justify; text-justify: inter-word; hyphens: auto; }}
     blockquote {{
-        margin: 1em 0;
-        padding: 0.5em 1em;
-        color: #555;
-        background: #f9f9f9;
+        margin: {bq_space}px 0;
+        padding: 0.5em {bq_pad}px;
+        border-left: 4px solid {bq_bar};
+        font-family: '{bq_font}', Georgia, serif;
+        font-size: {bq_size}pt;
+        font-style: {bq_font_style};
+        font-weight: {bq_font_weight};
+        text-align: {bq_justify};
+        color: {bq_fg};
+        background: {bq_bg};
+    }}
+    blockquote p {{
+        text-align: {bq_justify};
+        margin: 0.3em 0;
+    }}
+    .math-inline {{
+        font-family: 'Cambria Math', 'STIX Two Math', Georgia, serif;
+        font-style: italic;
+        color: #0f766e;
+    }}
+    .math-block {{
+        font-family: 'Cambria Math', 'STIX Two Math', Georgia, serif;
+        font-size: 1.15em;
+        text-align: center;
+        margin: 0.8em 0;
+        padding: 0.5em;
+        background: #f8fafc;
+        color: #0f766e;
+    }}
+    .footnote-ref {{
+        font-size: 0.8em;
+        vertical-align: super;
+        font-weight: bold;
+    }}
+    .footnote-def {{
+        font-size: 0.9em;
+        color: #475569;
+        margin: 0.3em 0 0.3em 1em;
     }}
     code {{
         font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
@@ -188,7 +268,7 @@ def _clean_bookmark_name(name: str) -> str:
 
 
 def _preprocess_anchors_for_html(text: str) -> str:
-    """Convert [@anchor: point] and [@point] into HTML anchors and links for PDF/HTML export."""
+    """Convert [@anchor: point], [@point], footnotes [^id], and math $...$ into HTML for PDF/HTML export."""
     def sub_anchor(m):
         lbl = m.group(1).strip()
         aid = _clean_bookmark_name(lbl)
@@ -200,6 +280,35 @@ def _preprocess_anchors_for_html(text: str) -> str:
         aid = _clean_bookmark_name(lbl)
         return f'<a href="#{aid}" class="internal-link">[@{lbl}]</a>'
     text = re.sub(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', sub_ref, text, flags=re.IGNORECASE)
+
+    # Display math $$...$$
+    text = re.sub(
+        r'\$\$([\s\S]+?)\$\$',
+        lambda m: f'<div class="math-block">{_export_latex_to_unicode(m.group(1))}</div>',
+        text
+    )
+    # Inline math $...$
+    text = re.sub(
+        r'(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)',
+        lambda m: f'<span class="math-inline">{_export_latex_to_unicode(m.group(1))}</span>',
+        text
+    )
+    # Footnote definitions [^id]: text
+    def sub_fn_def(m):
+        fid = _clean_bookmark_name('fn_' + m.group(1).strip())
+        ref_id = _clean_bookmark_name('fnref_' + m.group(1).strip())
+        label = m.group(1).strip()
+        body = m.group(2).strip()
+        return f'<div id="{fid}" class="footnote-def"><strong>[{label}]</strong> {body} <a href="#{ref_id}">↩</a></div>'
+    text = re.sub(r'^\[\^([^\]]+)\]:\s*(.+)$', sub_fn_def, text, flags=re.MULTILINE)
+
+    # Inline footnote refs [^id]
+    def sub_fn_ref(m):
+        label = m.group(1).strip()
+        fid = _clean_bookmark_name('fn_' + label)
+        ref_id = _clean_bookmark_name('fnref_' + label)
+        return f'<sup id="{ref_id}" class="footnote-ref"><a href="#{fid}">[{label}]</a></sup>'
+    text = re.sub(r'\[\^([^\]\n]+)\](?!:)', sub_fn_ref, text)
     return text
 
 
@@ -439,6 +548,47 @@ def export_to_docx(md_content: str, output_path: str,
             i += 1  # skip closing ```
             _add_code_block(doc, '\n'.join(code_lines), lang)
             continue
+
+        # Display math block $$...$$
+        if line.strip().startswith('$$'):
+            stripped_m = line.strip()
+            if stripped_m.endswith('$$') and len(stripped_m) > 4:
+                expr = stripped_m[2:-2].strip()
+                i += 1
+            else:
+                math_lines = [stripped_m[2:].strip()] if stripped_m[2:].strip() else []
+                i += 1
+                while i < len(lines) and not lines[i].strip().endswith('$$'):
+                    math_lines.append(lines[i])
+                    i += 1
+                if i < len(lines):
+                    tail = lines[i].strip()[:-2].strip()
+                    if tail:
+                        math_lines.append(tail)
+                    i += 1
+                expr = '\n'.join(math_lines).strip()
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            r = p.add_run(_export_latex_to_unicode(expr))
+            r.font.name = 'Cambria Math'
+            r.italic = True
+            continue
+
+        # Footnote definition [^id]: text
+        fn_def_m = re.match(r'^\[\^([^\]]+)\]:\s*(.+)$', line.strip())
+        if fn_def_m:
+            fn_id = fn_def_m.group(1).strip()
+            fn_body = fn_def_m.group(2).strip()
+            p = doc.add_paragraph()
+            p.paragraph_format.left_indent = Cm(0.8)
+            bm_counter[0] += 1
+            _add_docx_bookmark(p, _clean_bookmark_name('fn_' + fn_id), bm_counter[0])
+            r_badge = p.add_run(f"[{fn_id}] ")
+            r_badge.bold = True
+            r_badge.font.size = Pt(max(8, font_size - 1))
+            _add_inline_formatting(p, fn_body, bm_counter)
+            i += 1
+            continue
         
         # Heading
         heading_match = re.match(r'^(#{1,6})\s+(.*)', line)
@@ -474,12 +624,28 @@ def export_to_docx(md_content: str, output_path: str,
                 i += 1
             p = doc.add_paragraph(' '.join(quote_lines))
             p.style = doc.styles['Normal']
-            p.paragraph_format.left_indent = Cm(1.5)
+            bq_pad_px = int((theme.get('blockquote_padding', 16) if theme else 16) or 16)
+            p.paragraph_format.left_indent = Cm(max(0.5, bq_pad_px / 12.0))
             pf = p.paragraph_format
-            pf.space_before = Pt(4)
-            pf.space_after = Pt(4)
+            bq_space_pt = int((theme.get('blockquote_spacing', 4) if theme else 4) or 4)
+            pf.space_before = Pt(bq_space_pt)
+            pf.space_after = Pt(bq_space_pt)
+            bq_just = (theme.get('blockquote_justify', 'left') if theme else 'left') or 'left'
+            if bq_just == 'center':
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            elif bq_just == 'right':
+                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            else:
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            bq_style_str = (theme.get('blockquote_style', 'italic') if theme else 'italic') or 'italic'
+            bq_font_fam = (theme.get('blockquote_font') if theme else None) or font_name
+            bq_sz_val = int((theme.get('blockquote_size') if theme else 0) or 0)
             for run in p.runs:
-                run.font.italic = True
+                run.font.name = bq_font_fam
+                if bq_sz_val > 0:
+                    run.font.size = Pt(bq_sz_val)
+                run.font.italic = ('italic' in bq_style_str)
+                run.font.bold = ('bold' in bq_style_str)
                 run.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
             continue
         
@@ -545,7 +711,11 @@ def _is_special_line(line: str) -> bool:
         return True
     if stripped.startswith('```'):
         return True
+    if stripped.startswith('$$'):
+        return True
     if stripped.startswith('>'):
+        return True
+    if re.match(r'^\[\^([^\]]+)\]:', stripped):
         return True
     if re.match(r'^[\s]*[-*+]\s+', line):
         return True
@@ -601,6 +771,8 @@ def _add_inline_formatting(paragraph, text: str, bm_counter: Optional[List[int]]
         r'|(~~(.+?)~~)'            # strikethrough (10, 11)
         r'|(\[@(?:anchor|def):\s*([^\]\n]+)\])'  # anchor definition (12, 13)
         r'|(\[@(?!(?:anchor|def):)([^\]\n]+)\])'  # anchor reference (14, 15)
+        r'|((?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$))'  # inline math (16, 17)
+        r'|(\[\^([^\]\n]+)\])'     # footnote reference (18, 19)
     )
     
     last_end = 0
@@ -645,6 +817,15 @@ def _add_inline_formatting(paragraph, text: str, bm_counter: Optional[List[int]]
             ref_raw = match.group(15).strip()
             bm_name = _clean_bookmark_name(ref_raw)
             _add_docx_internal_hyperlink(paragraph, f"[@{ref_raw}]", bm_name)
+        elif match.group(16):  # $math$
+            math_raw = match.group(17).strip()
+            run = paragraph.add_run(_export_latex_to_unicode(math_raw))
+            run.font.name = 'Cambria Math'
+            run.italic = True
+        elif match.group(18):  # [^footnote]
+            fn_id = match.group(19).strip()
+            bm_name = _clean_bookmark_name('fn_' + fn_id)
+            _add_docx_internal_hyperlink(paragraph, f"[{fn_id}]", bm_name)
         
         last_end = match.end()
     

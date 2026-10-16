@@ -969,6 +969,84 @@ class PageView(tk.Frame):
                 self.on_resized()
 
 
+_LATEX_SYMBOLS = {
+    r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
+    r'\epsilon': 'ε', r'\varepsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η',
+    r'\theta': 'θ', r'\vartheta': 'ϑ', r'\iota': 'ι', r'\kappa': 'κ',
+    r'\lambda': 'λ', r'\mu': 'μ', r'\nu': 'ν', r'\xi': 'ξ',
+    r'\pi': 'π', r'\rho': 'ρ', r'\sigma': 'σ', r'\tau': 'τ',
+    r'\upsilon': 'υ', r'\phi': 'φ', r'\varphi': 'ϕ', r'\chi': 'χ',
+    r'\psi': 'ψ', r'\omega': 'ω',
+    r'\Gamma': 'Γ', r'\Delta': 'Δ', r'\Theta': 'Θ', r'\Lambda': 'Λ',
+    r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Upsilon': 'Υ',
+    r'\Phi': 'Φ', r'\Psi': 'Ψ', r'\Omega': 'Ω',
+    r'\pm': '±', r'\mp': '∓', r'\times': '×', r'\div': '÷',
+    r'\cdot': '⋅', r'\ast': '∗', r'\star': '⋆', r'\circ': '∘',
+    r'\bullet': '∙', r'\oplus': '⊕', r'\otimes': '⊗',
+    r'\leq': '≤', r'\le': '≤', r'\geq': '≥', r'\ge': '≥',
+    r'\neq': '≠', r'\ne': '≠', r'\approx': '≈', r'\equiv': '≡',
+    r'\sim': '∼', r'\simeq': '≃', r'\cong': '≅', r'\propto': '∝',
+    r'\ll': '≪', r'\gg': '≫', r'\infty': '∞', r'\partial': '∂',
+    r'\nabla': '∇', r'\sum': '∑', r'\prod': '∏', r'\coprod': '∐',
+    r'\int': '∫', r'\iint': '∬', r'\iiint': '∭', r'\oint': '∮',
+    r'\in': '∈', r'\notin': '∉', r'\ni': '∋',
+    r'\subset': '⊂', r'\supset': '⊃', r'\subseteq': '⊆', r'\supseteq': '⊇',
+    r'\cup': '∪', r'\cap': '∩', r'\emptyset': '∅', r'\varnothing': '∅',
+    r'\forall': '∀', r'\exists': '∃', r'\nexists': '∄',
+    r'\neg': '¬', r'\lnot': '¬', r'\land': '∧', r'\lor': '∨',
+    r'\Rightarrow': '⇒', r'\Leftarrow': '⇐', r'\Leftrightarrow': '⇔',
+    r'\iff': '⇔', r'\implies': '⇒',
+    r'\rightarrow': '→', r'\to': '→', r'\leftarrow': '←',
+    r'\leftrightarrow': '↔', r'\mapsto': '↦',
+    r'\uparrow': '↑', r'\downarrow': '↓',
+    r'\therefore': '∴', r'\because': '∵', r'\angle': '∠',
+    r'\perp': '⊥', r'\parallel': '∥', r'\degree': '°', r'\prime': '′',
+}
+
+_SUPERSCRIPT_MAP = str.maketrans("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ")
+_SUBSCRIPT_MAP = str.maketrans("0123456789+-=()ijknm", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ᵢⱼₖₙₘ")
+
+
+def _latex_to_unicode(expr: str) -> str:
+    """Convert common LaTeX math commands, fractions, roots, and sub/superscripts into readable Unicode."""
+    if not expr:
+        return expr
+    out = expr.strip()
+    # Replace \frac{a}{b} -> (a)/(b) or a/b
+    out = re.sub(
+        r'\\frac\{([^{}]+)\}\{([^{}]+)\}',
+        lambda m: f"{m.group(1)}/{m.group(2)}" if len(m.group(1)) == 1 and len(m.group(2)) == 1 else f"({m.group(1)})/({m.group(2)})",
+        out
+    )
+    # Replace \sqrt{x} -> √(x) or √x
+    out = re.sub(
+        r'\\sqrt\{([^{}]+)\}',
+        lambda m: f"√{m.group(1)}" if len(m.group(1)) == 1 else f"√({m.group(1)})",
+        out
+    )
+    # Replace known control words (longest first so \Leftrightarrow beats \Leftarrow)
+    for cmd in sorted(_LATEX_SYMBOLS.keys(), key=len, reverse=True):
+        out = re.sub(re.escape(cmd) + r'(?![a-zA-Z])', _LATEX_SYMBOLS[cmd], out)
+    # Convert ^{...} and ^x when all characters have Unicode superscript equivalents
+    def _sup_repl(m):
+        inner = m.group(1) if m.group(1) is not None else m.group(2)
+        if all(ch in "0123456789+-=()ni" for ch in inner):
+            return inner.translate(_SUPERSCRIPT_MAP)
+        return f"^({inner})" if len(inner) > 1 else f"^{inner}"
+
+    def _sub_repl(m):
+        inner = m.group(1) if m.group(1) is not None else m.group(2)
+        if all(ch in "0123456789+-=()ijknm" for ch in inner):
+            return inner.translate(_SUBSCRIPT_MAP)
+        return f"_({inner})" if len(inner) > 1 else f"_{inner}"
+
+    out = re.sub(r'\^\{([^{}]+)\}|\^([0-9+\-=ni])', _sup_repl, out)
+    out = re.sub(r'_\{([^{}]+)\}|_([0-9+\-=ijknm])', _sub_repl, out)
+    # Strip leftover braces from simple groupings
+    out = out.replace('{', '').replace('}', '')
+    return out
+
+
 class MarkdownVisualWidget(tk.Frame):
     """
     A widget for rendering markdown visually with image support.
@@ -997,6 +1075,10 @@ class MarkdownVisualWidget(tk.Frame):
         self.on_zoom_wheel = None
         self._anchor_marks = {}
         self._heading_marks = {}
+        self._footnotes = {}
+        self._footnote_def_marks = {}
+        self._footnote_ref_marks = {}
+        self._fn_tooltip = None
         self._nav_history = []
         self._link_counter = 0
         self._setup_widget()
@@ -1169,6 +1251,16 @@ class MarkdownVisualWidget(tk.Frame):
         self.text_widget.delete(1.0, tk.END)
         self.embedded_images.clear()
         self.image_handler.clear_caches()
+        self._anchor_marks.clear()
+        self._heading_marks.clear()
+        self._footnotes.clear()
+        self._footnote_def_marks.clear()
+        self._footnote_ref_marks.clear()
+        self._link_counter = 0
+
+        # Pre-scan footnote definitions so hover tooltips work regardless of position
+        for fn_match in re.finditer(r'^\[\^([^\]]+)\]:\s*(.+)$', markdown_text, re.MULTILINE):
+            self._footnotes[fn_match.group(1).strip()] = fn_match.group(2).strip()
         
         # Find all images in the text
         images = self.image_handler.find_images(markdown_text)
@@ -1203,7 +1295,7 @@ class MarkdownVisualWidget(tk.Frame):
             self.text_widget.config(state=tk.DISABLED)
             self._restore_yview()
     
-    # Inline markdown pattern: captures bold, italic, highlight, code, anchors, links in order
+    # Inline markdown pattern: captures bold, italic, highlight, code, math, footnotes, anchors, links in order
     _INLINE_RE = re.compile(
         r'(\*\*|__)(?P<bold>.+?)\1'        # **bold** or __bold__
         r'|(?<!\*)\*(?!\*)(?P<italic>.+?)(?<!\*)\*(?!\*)'  # *italic*
@@ -1211,6 +1303,8 @@ class MarkdownVisualWidget(tk.Frame):
         r'|==(?P<highlight>[^=\n]+)=='     # ==highlight==
         r'|<mark>(?P<mark_text>.*?)</mark>' # <mark>highlight</mark>
         r'|`(?P<code>[^`]+)`'              # `code`
+        r'|(?<!\$)\$(?!\$)(?P<math_inline>[^$\n]+?)(?<!\$)\$(?!\$)' # $math$
+        r'|\[\^(?P<footnote_ref>[^\]\n]+)\]' # [^1]
         r'|\[@(?:anchor|def):\s*(?P<anchor_name>[^\]\n]+)\]' # [@anchor: point]
         r'|\[@(?!(?:anchor|def):)(?P<ref_name>[^\]\n]+)\]'   # [@point]
         r'|\[(?P<link_label>[^\]]+)\]\((?P<link_url>[^\)]+)\)' # [label](url)
@@ -1242,6 +1336,22 @@ class MarkdownVisualWidget(tk.Frame):
                 tw.insert(tk.END, m.group('mark_text'), base_tags + ('highlight',) if base_tags else 'highlight')
             elif m.group('code') is not None:
                 tw.insert(tk.END, m.group('code'), base_tags + ('code',) if base_tags else 'code')
+            elif m.group('math_inline') is not None:
+                rendered_math = _latex_to_unicode(m.group('math_inline'))
+                tw.insert(tk.END, rendered_math, base_tags + ('math_inline',) if base_tags else 'math_inline')
+            elif m.group('footnote_ref') is not None:
+                fn_id = m.group('footnote_ref').strip()
+                self._link_counter += 1
+                ref_mark = f"fnref_{self._link_counter}"
+                tw.mark_set(ref_mark, "end-1c")
+                tw.mark_gravity(ref_mark, tk.LEFT)
+                if fn_id not in self._footnote_ref_marks:
+                    self._footnote_ref_marks[fn_id] = ref_mark
+                fn_tag = f"fn_ref_tag_{self._link_counter}"
+                tw.insert(tk.END, f"[{fn_id}]", base_tags + ('footnote_ref', fn_tag) if base_tags else ('footnote_ref', fn_tag))
+                tw.tag_bind(fn_tag, "<Button-1>", lambda e, fid=fn_id: self._jump_to_footnote_def(fid))
+                tw.tag_bind(fn_tag, "<Enter>", lambda e, fid=fn_id: self._show_footnote_tooltip(e, fid))
+                tw.tag_bind(fn_tag, "<Leave>", lambda e: self._hide_footnote_tooltip())
             elif m.group('anchor_name') is not None:
                 raw_anchor = m.group('anchor_name').strip()
                 key = _normalize_anchor_key(raw_anchor)
@@ -1284,15 +1394,20 @@ class MarkdownVisualWidget(tk.Frame):
 
     def _render_content(self, markdown_text, images, is_chunk=False):
         """Render markdown content efficiently into the single text widget"""
-        self._anchor_marks.clear()
-        self._heading_marks.clear()
-        self._link_counter = 0
+        if not is_chunk:
+            self._anchor_marks.clear()
+            self._heading_marks.clear()
+            self._footnote_def_marks.clear()
+            self._footnote_ref_marks.clear()
+            self._link_counter = 0
         # Build a map of image positions
         image_positions = {img['start']: img for img in images}
         
         lines = markdown_text.split('\n')
         in_code_block = False
         code_block_content = []
+        in_math_block = False
+        math_block_content = []
         in_table = False
         table_rows = []
         
@@ -1321,6 +1436,47 @@ class MarkdownVisualWidget(tk.Frame):
             if in_code_block:
                 code_block_content.append(line)
                 continue
+
+            # Handle display math blocks ($$ ... $$)
+            stripped_line = line.strip()
+            if stripped_line.startswith('$$'):
+                if in_table and table_rows:
+                    self._render_table(table_rows)
+                    table_rows = []
+                    in_table = False
+                # Single-line $$ ... $$
+                if not in_math_block and stripped_line.endswith('$$') and len(stripped_line) > 4:
+                    expr = stripped_line[2:-2].strip()
+                    self.text_widget.insert(tk.END, _latex_to_unicode(expr) + '\n', "math_block")
+                    continue
+                elif in_math_block:
+                    tail = stripped_line[:-2].strip() if stripped_line.endswith('$$') else stripped_line[2:].strip()
+                    if tail:
+                        math_block_content.append(tail)
+                    expr = '\n'.join(math_block_content).strip()
+                    self.text_widget.insert(tk.END, _latex_to_unicode(expr) + '\n', "math_block")
+                    math_block_content = []
+                    in_math_block = False
+                    continue
+                else:
+                    in_math_block = True
+                    head = stripped_line[2:].strip()
+                    if head:
+                        math_block_content.append(head)
+                    continue
+
+            if in_math_block:
+                if stripped_line.endswith('$$'):
+                    tail = stripped_line[:-2].strip()
+                    if tail:
+                        math_block_content.append(tail)
+                    expr = '\n'.join(math_block_content).strip()
+                    self.text_widget.insert(tk.END, _latex_to_unicode(expr) + '\n', "math_block")
+                    math_block_content = []
+                    in_math_block = False
+                else:
+                    math_block_content.append(line)
+                continue
             
             # Handle tables - collect consecutive table rows
             if '|' in line and line.strip().startswith('|'):
@@ -1335,6 +1491,26 @@ class MarkdownVisualWidget(tk.Frame):
                     table_rows = []
                     in_table = False
             
+            # Handle footnote definition: [^id]: text
+            fn_def_match = re.match(r'^\[\^([^\]]+)\]:\s*(.+)$', line.strip())
+            if fn_def_match:
+                fn_id = fn_def_match.group(1).strip()
+                fn_body = fn_def_match.group(2).strip()
+                self._footnotes[fn_id] = fn_body
+                self._link_counter += 1
+                def_mark = f"fndef_{self._link_counter}"
+                self.text_widget.mark_set(def_mark, "end-1c")
+                self.text_widget.mark_gravity(def_mark, tk.LEFT)
+                self._footnote_def_marks[fn_id] = def_mark
+                back_tag = f"fn_back_{self._link_counter}"
+                self.text_widget.insert(tk.END, f"[{fn_id}] ", ('footnote_def', 'footnote_badge', back_tag))
+                self._insert_inline(fn_body, ('footnote_def',))
+                self.text_widget.insert(tk.END, " ↩\n", ('footnote_def', 'link', back_tag))
+                self.text_widget.tag_bind(back_tag, "<Button-1>", lambda e, fid=fn_id: self._jump_to_footnote_ref(fid))
+                self.text_widget.tag_bind(back_tag, "<Enter>", lambda e: self.text_widget.config(cursor="hand2"))
+                self.text_widget.tag_bind(back_tag, "<Leave>", lambda e: self.text_widget.config(cursor=""))
+                continue
+
             # Handle images - insert placeholder with embedded image
             if img_match and PIL_AVAILABLE:
                 matched_img = None
@@ -1685,11 +1861,43 @@ class MarkdownVisualWidget(tk.Frame):
                          spacing1=self._s(3), spacing3=self._s(3), lmargin1=self._s(16), lmargin2=self._s(16),
                          rmargin=self._s(16))
         
-        # Block styles
-        tw.tag_configure("blockquote", font=(font_family, self._px(font_size), "italic"), foreground=quote_fg,
-                         lmargin1=self._s(12), lmargin2=self._s(28), rmargin=self._s(12),
-                         spacing1=self._s(4), spacing3=self._s(4), background=quote_bg)
-        tw.tag_configure("quote_bar", foreground=link_fg, font=(font_family, self._px(font_size)))
+        # Block styles (customizable single blockquote)
+        bq_font = theme.get('blockquote_font') or font_family
+        bq_size_val = theme.get('blockquote_size')
+        try:
+            bq_size = int(bq_size_val) if bq_size_val and int(bq_size_val) > 0 else font_size
+        except (ValueError, TypeError):
+            bq_size = font_size
+        bq_style = theme.get('blockquote_style', 'italic')
+        bq_style_parts = tuple(bq_style.split()) if bq_style and bq_style != 'normal' else ()
+        bq_fg = theme.get('blockquote_fg') or quote_fg
+        bq_bg = theme.get('blockquote_bg') or quote_bg
+        bq_bar_fg = theme.get('blockquote_bar_fg') or link_fg
+        try:
+            bq_pad = int(theme.get('blockquote_padding', 16))
+        except (ValueError, TypeError):
+            bq_pad = 16
+        try:
+            bq_space = int(theme.get('blockquote_spacing', 4))
+        except (ValueError, TypeError):
+            bq_space = 4
+        bq_justify = theme.get('blockquote_justify', 'left')
+        if bq_justify not in ('left', 'center', 'right'):
+            bq_justify = 'left'
+
+        tw.tag_configure(
+            "blockquote",
+            font=(bq_font, self._px(bq_size), *bq_style_parts),
+            foreground=bq_fg,
+            background=bq_bg,
+            lmargin1=self._s(bq_pad),
+            lmargin2=self._s(bq_pad + 16),
+            rmargin=self._s(bq_pad),
+            spacing1=self._s(bq_space),
+            spacing3=self._s(bq_space),
+            justify=bq_justify,
+        )
+        tw.tag_configure("quote_bar", foreground=bq_bar_fg, font=(bq_font, self._px(bq_size)))
         tw.tag_configure("list_item", spacing1=self._s(1), spacing3=self._s(3))
         for depth in range(4):
             first = self._s(16 + 22 * depth)
@@ -1700,6 +1908,24 @@ class MarkdownVisualWidget(tk.Frame):
         anc_fg = "#c4b5fd" if is_dark else "#6d28d9"
         tw.tag_configure("anchor_badge", font=(font_family, self._px(font_size, 0.85), "bold"),
                          foreground=anc_fg, background=anc_bg)
+        # Footnote and Math styles
+        fn_bg = "#1e3a8a" if is_dark else "#dbeafe"
+        fn_fg = "#93c5fd" if is_dark else "#1d4ed8"
+        tw.tag_configure("footnote_ref", font=(font_family, self._px(font_size, 0.78), "bold"),
+                         offset=self._s(4), foreground=fn_fg, background=fn_bg)
+        tw.tag_configure("footnote_def", font=(font_family, self._px(font_size, 0.9)),
+                         foreground=quote_fg, lmargin1=self._s(16), lmargin2=self._s(32),
+                         spacing1=self._s(2), spacing3=self._s(2))
+        tw.tag_configure("footnote_badge", font=(font_family, self._px(font_size, 0.9), "bold"),
+                         foreground=link_fg)
+        math_font = "Cambria Math" if os.name == "nt" else font_family
+        math_fg = "#5eead4" if is_dark else "#0f766e"
+        tw.tag_configure("math_inline", font=(math_font, self._px(font_size, 1.05), "italic"),
+                         foreground=math_fg, background=inline_code_bg)
+        tw.tag_configure("math_block", font=(math_font, self._px(font_size, 1.15)),
+                         foreground=math_fg, background=quote_bg, justify="center",
+                         lmargin1=self._s(24), rmargin=self._s(24),
+                         spacing1=self._s(8), spacing3=self._s(8))
         flash_bg = "#854d0e" if is_dark else "#fef08a"
         flash_fg = "#fef9c3" if is_dark else "#1a1a1a"
         tw.tag_configure("flash_target", background=flash_bg, foreground=flash_fg)
@@ -1789,6 +2015,78 @@ class MarkdownVisualWidget(tk.Frame):
             notepad = self._get_notepad()
             if notepad and hasattr(notepad, '_set_status'):
                 notepad._set_status(f"Anchor '[@anchor: {label}]' not found in document")
+
+    def _show_footnote_tooltip(self, event, fn_id: str):
+        """Display a hover tooltip previewing the footnote definition text."""
+        self.text_widget.config(cursor="hand2")
+        self._hide_footnote_tooltip()
+        fn_body = self._footnotes.get(fn_id, f"(Footnote [^{fn_id}] not yet defined)")
+        try:
+            self._fn_tooltip = tk.Toplevel(self)
+            self._fn_tooltip.wm_overrideredirect(True)
+            self._fn_tooltip.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 16}")
+            is_dark = self._is_dark((self.current_theme or {}).get('visual_bg', '#ffffff'))
+            bg = "#1e293b" if is_dark else "#0f172a"
+            fg = "#f8fafc"
+            lbl = tk.Label(
+                self._fn_tooltip,
+                text=f"[^{fn_id}]: {fn_body}",
+                justify=tk.LEFT,
+                wraplength=360,
+                background=bg,
+                foreground=fg,
+                relief=tk.SOLID,
+                borderwidth=1,
+                font=(SANS_FONT, 9),
+                padx=8,
+                pady=5,
+            )
+            lbl.pack()
+        except Exception:
+            self._fn_tooltip = None
+
+    def _hide_footnote_tooltip(self):
+        """Hide any active footnote tooltip."""
+        self.text_widget.config(cursor="")
+        if self._fn_tooltip is not None:
+            try:
+                self._fn_tooltip.destroy()
+            except Exception:
+                pass
+            self._fn_tooltip = None
+
+    def _jump_to_footnote_def(self, fn_id: str):
+        """Jump from an inline footnote badge [^id] to its definition."""
+        self._hide_footnote_tooltip()
+        tw = self.text_widget
+        mark = self._footnote_def_marks.get(fn_id)
+        if mark and mark in tw.mark_names():
+            try:
+                curr_idx = tw.index("@0,0")
+                if not self._nav_history or self._nav_history[-1] != curr_idx:
+                    self._nav_history.append(curr_idx)
+            except Exception:
+                pass
+            tw.see(mark)
+            self._flash_target(mark)
+            notepad = self._get_notepad()
+            if notepad and hasattr(notepad, '_set_status'):
+                notepad._set_status(f"Jumped to footnote [^{fn_id}]  (Click ↩ or Alt+Left to return)")
+        else:
+            notepad = self._get_notepad()
+            if notepad and hasattr(notepad, '_set_status'):
+                notepad._set_status(f"Footnote definition '[^{fn_id}]:' not found")
+
+    def _jump_to_footnote_ref(self, fn_id: str):
+        """Jump from a footnote definition back to its inline citation."""
+        tw = self.text_widget
+        mark = self._footnote_ref_marks.get(fn_id)
+        if mark and mark in tw.mark_names():
+            tw.see(mark)
+            self._flash_target(mark)
+            notepad = self._get_notepad()
+            if notepad and hasattr(notepad, '_set_status'):
+                notepad._set_status(f"Returned to citation [^{fn_id}]")
 
     def _flash_target(self, mark_name: str):
         """Briefly highlight the target anchor/line for visual confirmation."""
@@ -2045,9 +2343,37 @@ class DocumentTab(ttk.Frame):
         editor.tag_configure('syn_link',        foreground=link_fg, underline=True)
         anc_fg = '#c084fc' if dark else '#7c3aed'
         editor.tag_configure('syn_anchor',      foreground=anc_fg, font=(mono, px(sz), 'bold'))
+        editor.tag_configure('syn_footnote',    foreground='#38bdf8' if dark else '#0284c7', font=(mono, px(sz), 'bold'))
+        editor.tag_configure('syn_math',        foreground='#5eead4' if dark else '#0f766e', background=code_bg, font=(mono, px(sz), 'italic'))
         editor.tag_configure('syn_flash',       background=hl_bg, foreground=hl_fg)
-        editor.tag_configure('syn_blockquote',  font=(mono, px(sz), 'italic'), foreground=quote_fg,
-                             lmargin1=int(30 * k96))
+        bq_font = self.theme.get('blockquote_font') or mono
+        bq_size_val = self.theme.get('blockquote_size')
+        try:
+            bq_sz = int(bq_size_val) if bq_size_val and int(bq_size_val) > 0 else sz
+        except (ValueError, TypeError):
+            bq_sz = sz
+        bq_style = self.theme.get('blockquote_style', 'italic')
+        bq_style_parts = tuple(bq_style.split()) if bq_style and bq_style != 'normal' else ()
+        bq_fg = self.theme.get('blockquote_fg') or quote_fg
+        bq_bg = self.theme.get('blockquote_bg') or ''
+        try:
+            bq_pad = int(self.theme.get('blockquote_padding', 16))
+        except (ValueError, TypeError):
+            bq_pad = 16
+        bq_justify = self.theme.get('blockquote_justify', 'left')
+        if bq_justify not in ('left', 'center', 'right'):
+            bq_justify = 'left'
+        bq_kwargs = {
+            'font': (bq_font, px(bq_sz), *bq_style_parts),
+            'foreground': bq_fg,
+            'lmargin1': int(max(12, bq_pad) * k96),
+            'lmargin2': int(max(20, bq_pad + 12) * k96),
+            'rmargin': int(max(12, bq_pad) * k96),
+            'justify': bq_justify,
+        }
+        if bq_bg:
+            bq_kwargs['background'] = bq_bg
+        editor.tag_configure('syn_blockquote',  **bq_kwargs)
         editor.tag_configure('syn_list_marker', font=(mono, px(sz), 'bold'), foreground=link_fg)
         editor.tag_configure('syn_hr',          foreground=hr_fg)
 
@@ -2056,7 +2382,8 @@ class DocumentTab(ttk.Frame):
         editor = self.source_editor
         for tag in ('syn_h1', 'syn_h2', 'syn_h3', 'syn_h4', 'syn_bold', 'syn_italic',
                     'syn_highlight', 'syn_code_inline', 'syn_code_block', 'syn_link',
-                    'syn_anchor', 'syn_flash', 'syn_blockquote', 'syn_list_marker', 'syn_hr'):
+                    'syn_anchor', 'syn_footnote', 'syn_math', 'syn_flash', 'syn_blockquote',
+                    'syn_list_marker', 'syn_hr'):
             editor.tag_remove(tag, '1.0', tk.END)
 
         content = editor.get('1.0', tk.END)
@@ -2082,7 +2409,7 @@ class DocumentTab(ttk.Frame):
             elif re.match(r'^#{4,6} ',   line): editor.tag_add('syn_h4', line_start, line_end)
             elif line.strip() in ('---', '***', '___'):
                 editor.tag_add('syn_hr', line_start, line_end)
-            elif line.startswith('> '):
+            elif line.startswith('>'):
                 editor.tag_add('syn_blockquote', line_start, line_end)
             else:
                 m = re.match(r'^(\s*)([-*+]|\d+\.)\s', line)
@@ -2097,6 +2424,10 @@ class DocumentTab(ttk.Frame):
                 editor.tag_add('syn_highlight', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'`([^`]+)`', line):
                 editor.tag_add('syn_code_inline', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'\$\$(.+?)\$\$|(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)', line):
+                editor.tag_add('syn_math', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'\[\^([^\]\n]+)\]', line):
+                editor.tag_add('syn_footnote', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', line):
                 editor.tag_add('syn_anchor',  f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', line):
@@ -2105,7 +2436,7 @@ class DocumentTab(ttk.Frame):
                 editor.tag_add('syn_link',    f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
 
     def _on_source_ctrl_click(self, event):
-        """Handle Ctrl+Click on links or anchor references in source mode to jump to target."""
+        """Handle Ctrl+Click on links, anchor references, or footnotes in source mode to jump to target."""
         editor = self.source_editor
         click_idx = editor.index(f"@{event.x},{event.y}")
         try:
@@ -2113,6 +2444,27 @@ class DocumentTab(ttk.Frame):
         except (ValueError, TypeError):
             return None
         line = editor.get(f"{line_num}.0", f"{line_num}.end")
+
+        # Check [^footnote]
+        for m in re.finditer(r'\[\^([^\]\n]+)\]', line):
+            if m.start() <= col_num <= m.end():
+                fn_id = m.group(1).strip()
+                content = editor.get("1.0", tk.END)
+                is_def_line = bool(re.match(r'^\[\^' + re.escape(fn_id) + r'\]:', line.strip()))
+                if is_def_line:
+                    pat = re.compile(r'\[\^' + re.escape(fn_id) + r'\](?!:)')
+                else:
+                    pat = re.compile(r'^\[\^' + re.escape(fn_id) + r'\]:', re.MULTILINE)
+                fm = pat.search(content)
+                if fm:
+                    found_idx = f"1.0 + {fm.start()} chars"
+                    editor.mark_set(tk.INSERT, found_idx)
+                    editor.see(found_idx)
+                    ls = editor.index(f"{found_idx} linestart")
+                    le = editor.index(f"{found_idx} lineend+1c")
+                    editor.tag_add('syn_flash', ls, le)
+                    self.after(1200, lambda: editor.tag_remove('syn_flash', '1.0', tk.END))
+                    return "break"
 
         target_ref = None
         # Check [@point]
@@ -2746,6 +3098,16 @@ class MarkdownNotepad(tk.Tk):
         'page_margin': 'Normal',
         'zoom_pct': 100,
         'typewriter_scrolling': False,
+        # Blockquote customization (empty strings/0 mean inherit from active theme)
+        'blockquote_font': '',
+        'blockquote_size': 0,
+        'blockquote_style': 'italic',
+        'blockquote_fg': '',
+        'blockquote_bg': '',
+        'blockquote_bar_fg': '',
+        'blockquote_padding': 16,
+        'blockquote_spacing': 4,
+        'blockquote_justify': 'left',
     }
 
     ZOOM_STEPS = [25, 50, 75, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400]
@@ -3155,6 +3517,7 @@ class MarkdownNotepad(tk.Tk):
         format_menu.add_command(label="Bullet List", command=lambda: self._insert_line_prefix("- "))
         format_menu.add_command(label="Numbered List", command=lambda: self._insert_line_prefix("1. "))
         format_menu.add_command(label="Blockquote", command=lambda: self._insert_line_prefix("> "), accelerator="Ctrl+Shift+Q")
+        format_menu.add_command(label="Customize Blockquote Style...", command=self.open_blockquote_style_dialog)
         format_menu.add_separator()
         format_menu.add_command(label="Insert Table...", command=self.insert_table, accelerator="Alt+T")
         format_menu.add_command(label="Code Block", command=lambda: self._insert_text("\n```\n\n```\n"), accelerator="Ctrl+Shift+K")
@@ -3254,7 +3617,8 @@ class MarkdownNotepad(tk.Tk):
         ToolTip(heading_mb, "Insert Section Heading (# to ####)")
         self._format_buttons.append(heading_mb)
         
-        add_format_button("\u275d Quote", lambda: self._insert_line_prefix("> "), 7, "Blockquote > (Ctrl+Shift+Q)")
+        quote_btn = add_format_button("\u275d Quote", lambda: self._insert_line_prefix("> "), 7, "Blockquote > (Ctrl+Shift+Q) — Right-click to customize style")
+        quote_btn.bind("<Button-3>", lambda e: self.open_blockquote_style_dialog())
         add_format_button("\u2022 List", lambda: self._insert_line_prefix("- "), 6, "Bullet List (- item)")
         add_format_button("1. List", lambda: self._insert_line_prefix("1. "), 6, "Numbered List (1. item)")
         add_format_button("\u229e Table", self.insert_table, 7, "Insert Table — Choose rows, columns & header (Alt+T)")
@@ -5373,6 +5737,10 @@ class MarkdownNotepad(tk.Tk):
     def open_theme_dialog(self):
         """Open theme settings dialog"""
         ThemeDialog(self, self.theme, self._apply_theme)
+
+    def open_blockquote_style_dialog(self):
+        """Open blockquote customization dialog"""
+        BlockquoteStyleDialog(self, self.theme, self._apply_theme)
     
     def _apply_theme(self, new_theme):
         """Apply a new theme to the application"""
@@ -5388,6 +5756,11 @@ class MarkdownNotepad(tk.Tk):
         
         if getattr(self, 'ai_sidebar', None):
             self.ai_sidebar.apply_theme(self.theme)
+        if getattr(self, 'outline_panel', None):
+            try:
+                self.outline_panel.apply_theme(self.theme)
+            except Exception:
+                pass
         
         self._set_status("Theme applied")
 
@@ -5436,9 +5809,9 @@ class ThemeDialog(tk.Toplevel):
         self.on_apply = on_apply
         
         self.title("Theme Settings")
-        self.geometry("520x680")
+        self.geometry("520x720")
         self.resizable(True, True)
-        self.minsize(470, 650)  # Set minimum size to prevent UI elements from overlapping
+        self.minsize(470, 680)  # Set minimum size to prevent UI elements from overlapping
         self.transient(parent)
         
         self._setup_ui()
@@ -5544,7 +5917,7 @@ class ThemeDialog(tk.Toplevel):
         vsize_spin.pack(side=tk.LEFT, padx=2)
         
         # Desk (background behind the page)
-        desk_frame = ttk.LabelFrame(main_frame, text="Page Layout", padding=10)
+        desk_frame = ttk.LabelFrame(main_frame, text="Page Layout & Blockquote", padding=10)
         desk_frame.pack(fill=tk.X, pady=5)
         
         dbg_frame = ttk.Frame(desk_frame)
@@ -5555,6 +5928,14 @@ class ThemeDialog(tk.Toplevel):
         self.desk_bg_preview.pack(side=tk.LEFT, padx=5)
         ttk.Entry(dbg_frame, textvariable=self.desk_bg_var, width=10).pack(side=tk.LEFT, padx=2)
         ttk.Button(dbg_frame, text="Choose...", command=lambda: self._choose_color('desk_bg')).pack(side=tk.LEFT, padx=2)
+
+        bq_btn_row = ttk.Frame(desk_frame)
+        bq_btn_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(
+            bq_btn_row,
+            text="❝ Customize Blockquote Style (Font, Color, Padding, Justification)...",
+            command=lambda: BlockquoteStyleDialog(self, self.theme, self._on_blockquote_updated)
+        ).pack(side=tk.LEFT)
         
         # Font Detection Section
         detect_frame = ttk.Frame(main_frame)
@@ -5572,6 +5953,11 @@ class ThemeDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="Apply", command=self._apply, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Reset to Default", command=self._reset).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=self.destroy, width=10).pack(side=tk.RIGHT, padx=5)
+
+    def _on_blockquote_updated(self, updated_theme):
+        """Merge blockquote updates from BlockquoteStyleDialog into ThemeDialog's working theme."""
+        self.theme.update(updated_theme)
+        self.on_apply(self.theme)
     
     def _detect_fonts(self):
         """Detect all available system fonts and populate the comboboxes"""
@@ -5672,6 +6058,150 @@ class ThemeDialog(tk.Toplevel):
         self.visual_size_var.set(default['visual_font_size'])
         self.desk_bg_var.set(default['desk_bg'])
         self.desk_bg_preview.config(bg=default['desk_bg'])
+
+
+class BlockquoteStyleDialog(tk.Toplevel):
+    """Dialog for customizing the single Blockquote (>) appearance:
+    font family, size, style, text color, background color, bar color,
+    padding, vertical spacing, and justification.
+    """
+
+    def __init__(self, parent, current_theme, on_apply):
+        super().__init__(parent)
+        self.parent = parent
+        self.theme = current_theme.copy()
+        self.on_apply = on_apply
+
+        self.title("Customize Blockquote Style (>)")
+        self.geometry("480x500")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self._setup_ui()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _setup_ui(self):
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Typography group
+        typo = ttk.LabelFrame(frame, text="Typography", padding=10)
+        typo.pack(fill=tk.X, pady=(0, 8))
+
+        r1 = ttk.Frame(typo)
+        r1.pack(fill=tk.X, pady=3)
+        ttk.Label(r1, text="Font Family:", width=15).pack(side=tk.LEFT)
+        self.font_var = tk.StringVar(value=self.theme.get('blockquote_font', ''))
+        fonts = ['', 'Georgia', 'Times New Roman', 'Segoe UI', 'Calibri', 'Arial', 'Consolas', 'Verdana']
+        ttk.Combobox(r1, textvariable=self.font_var, values=fonts, width=22).pack(side=tk.LEFT, padx=4)
+        ttk.Label(r1, text="(blank = theme)", foreground="#64748b", font=(SANS_FONT, 8)).pack(side=tk.LEFT)
+
+        r2 = ttk.Frame(typo)
+        r2.pack(fill=tk.X, pady=3)
+        ttk.Label(r2, text="Font Size (pt):", width=15).pack(side=tk.LEFT)
+        self.size_var = tk.IntVar(value=int(self.theme.get('blockquote_size') or 0))
+        ttk.Spinbox(r2, from_=0, to=36, textvariable=self.size_var, width=6).pack(side=tk.LEFT, padx=4)
+        ttk.Label(r2, text="(0 = inherit body size)", foreground="#64748b", font=(SANS_FONT, 8)).pack(side=tk.LEFT)
+
+        r3 = ttk.Frame(typo)
+        r3.pack(fill=tk.X, pady=3)
+        ttk.Label(r3, text="Font Style:", width=15).pack(side=tk.LEFT)
+        self.style_var = tk.StringVar(value=self.theme.get('blockquote_style', 'italic'))
+        ttk.Combobox(
+            r3, textvariable=self.style_var,
+            values=['italic', 'normal', 'bold', 'bold italic'],
+            state='readonly', width=16
+        ).pack(side=tk.LEFT, padx=4)
+
+        # Colors group
+        col_frame = ttk.LabelFrame(frame, text="Colors (leave blank for automatic theme colors)", padding=10)
+        col_frame.pack(fill=tk.X, pady=6)
+
+        self.fg_var = tk.StringVar(value=self.theme.get('blockquote_fg', ''))
+        self.bg_var = tk.StringVar(value=self.theme.get('blockquote_bg', ''))
+        self.bar_var = tk.StringVar(value=self.theme.get('blockquote_bar_fg', ''))
+
+        for label_text, var in (
+            ("Text Color:", self.fg_var),
+            ("Background:", self.bg_var),
+            ("Accent Bar Color:", self.bar_var),
+        ):
+            row = ttk.Frame(col_frame)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=label_text, width=15).pack(side=tk.LEFT)
+            ent = ttk.Entry(row, textvariable=var, width=12)
+            ent.pack(side=tk.LEFT, padx=4)
+            ttk.Button(
+                row, text="Pick...", width=8,
+                command=lambda v=var: self._pick_color(v)
+            ).pack(side=tk.LEFT, padx=2)
+            ttk.Button(
+                row, text="Auto", width=6,
+                command=lambda v=var: v.set('')
+            ).pack(side=tk.LEFT, padx=2)
+
+        # Layout & Justification group
+        layout = ttk.LabelFrame(frame, text="Padding, Spacing & Justification", padding=10)
+        layout.pack(fill=tk.X, pady=6)
+
+        l1 = ttk.Frame(layout)
+        l1.pack(fill=tk.X, pady=3)
+        ttk.Label(l1, text="Side Padding (px):", width=15).pack(side=tk.LEFT)
+        self.pad_var = tk.IntVar(value=int(self.theme.get('blockquote_padding', 16)))
+        ttk.Spinbox(l1, from_=4, to=80, textvariable=self.pad_var, width=6).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(l1, text="Vertical Space:", width=13).pack(side=tk.LEFT, padx=(12, 0))
+        self.space_var = tk.IntVar(value=int(self.theme.get('blockquote_spacing', 4)))
+        ttk.Spinbox(l1, from_=0, to=32, textvariable=self.space_var, width=6).pack(side=tk.LEFT, padx=4)
+
+        l2 = ttk.Frame(layout)
+        l2.pack(fill=tk.X, pady=3)
+        ttk.Label(l2, text="Justification:", width=15).pack(side=tk.LEFT)
+        self.justify_var = tk.StringVar(value=self.theme.get('blockquote_justify', 'left'))
+        for val, lbl in (('left', 'Left'), ('center', 'Center'), ('right', 'Right')):
+            ttk.Radiobutton(l2, text=lbl, value=val, variable=self.justify_var).pack(side=tk.LEFT, padx=6)
+
+        # Action buttons
+        btns = ttk.Frame(frame)
+        btns.pack(fill=tk.X, pady=(14, 0))
+        ttk.Button(btns, text="Apply", command=self._apply, width=10).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Reset Defaults", command=self._reset).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=self.destroy, width=10).pack(side=tk.RIGHT, padx=4)
+
+    def _pick_color(self, var: tk.StringVar):
+        initial = var.get().strip() or "#475569"
+        color = colorchooser.askcolor(color=initial, parent=self)
+        if color and color[1]:
+            var.set(color[1])
+
+    def _reset(self):
+        self.font_var.set('')
+        self.size_var.set(0)
+        self.style_var.set('italic')
+        self.fg_var.set('')
+        self.bg_var.set('')
+        self.bar_var.set('')
+        self.pad_var.set(16)
+        self.space_var.set(4)
+        self.justify_var.set('left')
+
+    def _apply(self):
+        self.theme.update({
+            'blockquote_font': self.font_var.get().strip(),
+            'blockquote_size': int(self.size_var.get() or 0),
+            'blockquote_style': self.style_var.get(),
+            'blockquote_fg': self.fg_var.get().strip(),
+            'blockquote_bg': self.bg_var.get().strip(),
+            'blockquote_bar_fg': self.bar_var.get().strip(),
+            'blockquote_padding': int(self.pad_var.get() or 16),
+            'blockquote_spacing': int(self.space_var.get() or 4),
+            'blockquote_justify': self.justify_var.get(),
+        })
+        if self.on_apply:
+            self.on_apply(self.theme)
+        self.destroy()
 
 
 class InsertImageDialog(tk.Toplevel):
