@@ -228,14 +228,32 @@ class AISettings:
         "deepseek-reasoner",
     ]
     
-    # Default AGY models & efforts
-    AGY_MODELS = [
+    # Deprecated AGY model slugs from older versions (used to sanitize stale caches)
+    DEPRECATED_AGY_MODELS = {
         "gemini-3.6-flash",
         "gemini-3.5-flash",
         "gemini-3.1-pro",
         "claude-sonnet-4.6",
         "claude-opus-4.6",
         "gpt-oss-120b",
+        "gemini-2.5-flash",
+    }
+
+    # Default AGY models & efforts
+    AGY_MODELS = [
+        "gemini-3.8-flash-low",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-high",
+        "gemini-4-argon-low",
+        "gemini-4-argon-medium",
+        "gemini-4-argon-high",
+        "claude-sonnet-5-5-low",
+        "claude-sonnet-5-5-medium",
+        "claude-sonnet-5-5-high",
+        "claude-opus-5-5-low",
+        "claude-opus-5-5-medium",
+        "claude-opus-5-5-high",
+        "gpt-oss-120b-medium",
     ]
     AGY_EFFORTS = ["low", "medium", "high"]
     
@@ -246,9 +264,9 @@ class AISettings:
         'deepseek_api_key': '',  # Separate API key for DeepSeek
         'ollama_url': 'http://localhost:11434',  # Ollama server URL
         'agy_path': '',  # Custom path to agy CLI executable
-        'agy_model': 'gemini-3.6-flash',
+        'agy_model': 'gemini-3.8-flash-low',
         'agy_effort': 'low',
-        'model': 'gemini-3.6-flash',
+        'model': 'gemini-3.8-flash-low',
         'system_prompt': 'You are a helpful AI assistant. You help users with their markdown documents, answer questions, and provide writing assistance.',
         'max_tokens': 4096,
         'temperature': 0.7,
@@ -285,6 +303,15 @@ class AISettings:
                 with open(self.CONFIG_FILE, 'r', encoding='utf-8') as f:
                     saved = json.load(f)
                     self.settings.update(saved)
+                # Sanitize stale cached AGY models from older fallback lists
+                cached_agy = self.settings.get('cached_agy_models', [])
+                if cached_agy and all(m in self.DEPRECATED_AGY_MODELS for m in cached_agy):
+                    self.settings['cached_agy_models'] = []
+                if self.settings.get('agy_model') in self.DEPRECATED_AGY_MODELS:
+                    self.settings['agy_model'] = self.AGY_MODELS[0]
+                if (self.settings.get('provider') in ('agy', 'antigravity')
+                        and self.settings.get('model') in self.DEPRECATED_AGY_MODELS):
+                    self.settings['model'] = self.settings['agy_model']
                 return True
         except Exception as e:
             print(f"Error loading AI settings: {e}")
@@ -918,12 +945,14 @@ class AnthropicClient(LLMClient):
                     break
         
         try:
+            # Clamp max_tokens to valid Anthropic output range [1, 8192]
+            safe_max_tokens = max(1, min(int(max_tokens or 4096), 8192))
             # Build kwargs for the API call
             stream_kwargs = {
                 "model": model_name,
                 "messages": api_messages,
                 "system": system_prompt if system_prompt else anthropic.NOT_GIVEN,
-                "max_tokens": max_tokens,
+                "max_tokens": safe_max_tokens,
                 "temperature": temperature,
             }
             
@@ -1666,10 +1695,11 @@ class DeepSeekClient(LLMClient):
             })
         
         try:
+            safe_max_tokens = max(1, min(int(max_tokens or 4096), 8192))
             stream = self.client.chat.completions.create(
                 model=model_name,
                 messages=api_messages,
-                max_tokens=max_tokens,
+                max_tokens=safe_max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 stream=True
@@ -1972,7 +2002,48 @@ def launch_cli_auth_window():
         return False, f"Failed to launch terminal window: {e}"
 
 
-def call_antigravity_cli(system_prompt: str, user_message: str, model_name: str = "gemini-3.6-flash", effort: str = "low", cli_command: str = "") -> str:
+_AGY_EFFORT_SUFFIXES = ('-low', '-medium', '-high', '-xhigh', '-max')
+
+
+def _parse_agy_models_output(stdout_text: str) -> List[str]:
+    """Parse stdout from `agy models` (either TSV/text lines or JSON) into model slugs."""
+    if not stdout_text or not stdout_text.strip():
+        return []
+    text = stdout_text.strip()
+    # Try JSON first in case future CLI versions emit JSON
+    if text.startswith('[') or text.startswith('{'):
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                return [str(m.get('name', m)).strip() for m in data if m]
+            if isinstance(data, dict):
+                models = data.get('models', [])
+                return [str(m.get('name', m)).strip() for m in models if m]
+        except Exception:
+            pass
+
+    models: List[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if (lower.startswith('fetching ')
+                or lower.startswith('available models')
+                or lower.startswith('usage:')
+                or lower.startswith('error:')
+                or lower.startswith('flags:')
+                or lower.startswith('---')):
+            continue
+        # `agy models` outputs: <model_slug>\t<Display Name>
+        slug = line.split('\t')[0].split()[0].strip()
+        if slug and re.match(r'^[a-zA-Z0-9._-]+$', slug):
+            if slug not in models:
+                models.append(slug)
+    return models
+
+
+def call_antigravity_cli(system_prompt: str, user_message: str, model_name: str = "gemini-3.8-flash-low", effort: str = "low", cli_command: str = "") -> str:
     """Execute non-interactive prompt call via agy CLI."""
     executable = str(cli_command or find_antigravity_cli_command()).strip()
     if not executable:
@@ -1985,25 +2056,30 @@ def call_antigravity_cli(system_prompt: str, user_message: str, model_name: str 
         '--output-format', 'json'
     ]
 
-    if model_name and str(model_name).strip():
-        cmd.extend(['--model', str(model_name).strip()])
-        eff = str(effort or 'low').strip().lower()
-        if eff in ('low', 'medium', 'high'):
-            cmd.extend(['--effort', eff])
-        else:
-            cmd.extend(['--effort', 'low'])
+    clean_model = str(model_name or '').strip()
+    if clean_model:
+        cmd.extend(['--model', clean_model])
+        # Only pass --effort if the model slug does not already end with an effort suffix
+        if not clean_model.lower().endswith(_AGY_EFFORT_SUFFIXES):
+            eff = str(effort or 'low').strip().lower()
+            if eff in ('low', 'medium', 'high'):
+                cmd.extend(['--effort', eff])
+            else:
+                cmd.extend(['--effort', 'low'])
 
     cmd.extend(['-p', prompt_input])
+    run_kwargs = {
+        'capture_output': True,
+        'text': True,
+        'encoding': 'utf-8',
+        'errors': 'replace',
+        'timeout': 180,
+    }
+    if sys.platform == 'win32':
+        run_kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
     try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            timeout=180
-        )
+        completed = subprocess.run(cmd, **run_kwargs)
     except FileNotFoundError as exc:
         raise RuntimeError(f"Antigravity CLI executable not found: {executable}") from exc
     except subprocess.TimeoutExpired as exc:
@@ -2013,29 +2089,49 @@ def call_antigravity_cli(system_prompt: str, user_message: str, model_name: str 
     stderr_text = str(completed.stderr or '').strip()
     detail = stderr_text or stdout_text or f"exit code {completed.returncode}"
 
-    # Fallback guard: if --effort was passed but model doesn't support it, retry without --effort
-    if completed.returncode != 0 and '--effort' in cmd and 'effort is not supported' in detail.lower():
+    # Fallback guard 1: if --effort conflicted or is unsupported, retry without --effort
+    if completed.returncode != 0 and '--effort' in cmd and any(
+        phrase in detail.lower()
+        for phrase in ('effort is not supported', 'conflicts with --effort', 'invalid model selection')
+    ):
         cmd_no_effort = [c for c in cmd]
         try:
             eff_idx = cmd_no_effort.index('--effort')
             del cmd_no_effort[eff_idx:eff_idx + 2]
         except ValueError:
             pass
-        
+
         try:
-            completed = subprocess.run(
-                cmd_no_effort,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=180
-            )
+            completed = subprocess.run(cmd_no_effort, **run_kwargs)
             stdout_text = str(completed.stdout or '').strip()
             stderr_text = str(completed.stderr or '').strip()
             detail = stderr_text or stdout_text or f"exit code {completed.returncode}"
         except Exception:
             pass
+
+    # Fallback guard 2: if the model slug is unrecognized/stale, discover live models and retry once
+    if completed.returncode != 0 and 'not recognized as a known model' in detail.lower():
+        live_models = list_antigravity_models(executable)
+        if live_models:
+            fallback_model = live_models[0]
+            for m in live_models:
+                if 'flash-low' in m or 'flash' in m:
+                    fallback_model = m
+                    break
+            retry_cmd = [
+                executable,
+                '--dangerously-skip-permissions',
+                '--output-format', 'json',
+                '--model', fallback_model,
+                '-p', prompt_input,
+            ]
+            try:
+                completed = subprocess.run(retry_cmd, **run_kwargs)
+                stdout_text = str(completed.stdout or '').strip()
+                stderr_text = str(completed.stderr or '').strip()
+                detail = stderr_text or stdout_text or f"exit code {completed.returncode}"
+            except Exception:
+                pass
 
     if completed.returncode != 0:
         raise RuntimeError(f"Antigravity CLI failed: {detail}")
@@ -2054,31 +2150,42 @@ def call_antigravity_cli(system_prompt: str, user_message: str, model_name: str 
     return response_text
 
 
-def list_antigravity_models(cli_command: str = "") -> List[str]:
-    """List models available to the agy CLI session."""
+def list_antigravity_models(cli_command: str = "", raise_on_error: bool = False) -> List[str]:
+    """List models available to the agy CLI session via `agy models`."""
     executable = str(cli_command or find_antigravity_cli_command()).strip()
-    fallback = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-pro", "claude-sonnet-4.6", "claude-opus-4.6", "gpt-oss-120b"]
+    fallback = list(AISettings.AGY_MODELS)
     if not executable:
+        if raise_on_error:
+            raise RuntimeError("Antigravity CLI (agy) executable was not found.")
         return fallback
 
-    cmd = [executable, 'models', '--output-format', 'json']
+    run_kwargs = {
+        'capture_output': True,
+        'text': True,
+        'encoding': 'utf-8',
+        'errors': 'replace',
+        'timeout': 30,
+    }
+    if sys.platform == 'win32':
+        run_kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+    cmd = [executable, 'models']
     try:
-        completed = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', timeout=30)
+        completed = subprocess.run(cmd, **run_kwargs)
         if completed.returncode == 0 and completed.stdout:
-            data = json.loads(completed.stdout)
-            if isinstance(data, list):
-                res = [str(m.get('name', m)) for m in data if m]
-                return res if res else fallback
-            elif isinstance(data, dict):
-                models = data.get('models', [])
-                res = [str(m.get('name', m)) for m in models if m]
-                return res if res else fallback
-    except Exception:
-        pass
+            parsed = _parse_agy_models_output(completed.stdout)
+            if parsed:
+                return parsed
+        if raise_on_error:
+            detail = (completed.stderr or completed.stdout or f"exit code {completed.returncode}").strip()
+            raise RuntimeError(f"Failed to query AGY models: {detail}")
+    except Exception as exc:
+        if raise_on_error:
+            raise
     return fallback
 
 
-def test_antigravity_connection(model_name: str = "gemini-3.6-flash", effort: str = "low", cli_command: str = "") -> str:
+def test_antigravity_connection(model_name: str = "gemini-3.8-flash-low", effort: str = "low", cli_command: str = "") -> str:
     """Run lightweight test query ('hi') to verify CLI connection."""
     test_sys = "You are a test assistant. Reply with the single word HI."
     test_msg = "hi"
@@ -2089,8 +2196,8 @@ def test_antigravity_connection(model_name: str = "gemini-3.6-flash", effort: st
 class AgyClient(LLMClient):
     """LLM client using Google Antigravity CLI (agy) backend."""
 
-    def __init__(self, model: str = "gemini-3.6-flash", effort: str = "low", cli_command: str = ""):
-        self.model = model or "gemini-3.6-flash"
+    def __init__(self, model: str = "gemini-3.8-flash-low", effort: str = "low", cli_command: str = ""):
+        self.model = model or "gemini-3.8-flash-low"
         self.effort = effort or "low"
         self.cli_command = cli_command or find_antigravity_cli_command()
 
@@ -2140,12 +2247,20 @@ class AgyClient(LLMClient):
 
     def test_connection(self) -> tuple:
         try:
+            models = list_antigravity_models(self.cli_command, raise_on_error=True)
+            if models and self.model not in models:
+                # Check if f"{self.model}-{self.effort}" matches a discovered model
+                candidate = f"{self.model}-{self.effort}"
+                if candidate in models:
+                    self.model = candidate
+                else:
+                    self.model = models[0]
             res = test_antigravity_connection(
                 model_name=self.model,
                 effort=self.effort,
                 cli_command=self.cli_command
             )
-            return True, f"AGY CLI connection successful! Output: '{res}'"
+            return True, f"AGY CLI connection successful (model: {self.model})! Output: '{res}'"
         except Exception as e:
             return False, f"AGY CLI connection failed: {e}"
 
@@ -3147,7 +3262,7 @@ class AISettingsDialog(tk.Toplevel):
             models = cached if cached else AISettings.AGY_MODELS
             self.model_combo['values'] = models
             current_agy = self.settings.agy_model
-            self.model_var.set(current_agy if current_agy in models else (models[0] if models else 'gemini-2.5-flash'))
+            self.model_var.set(current_agy if current_agy in models else (models[0] if models else AISettings.AGY_MODELS[0]))
         elif provider == 'cli':
             # CLI manages its own model; disable model selection
             self.model_combo['values'] = []
@@ -3189,9 +3304,11 @@ class AISettingsDialog(tk.Toplevel):
         if provider in ('agy', 'antigravity'):
             cli_cmd = self.agy_path_var.get().strip()
             try:
-                models = list_antigravity_models(cli_cmd)
+                models = list_antigravity_models(cli_cmd, raise_on_error=True)
                 if models:
                     self.model_combo['values'] = models
+                    if self.model_var.get().strip() not in models:
+                        self.model_var.set(models[0])
                     self.settings.set('cached_agy_models', models)
                     self.settings.save()
                     messagebox.showinfo("Success", f"Found {len(models)} AGY models (cached).", parent=self)
@@ -3281,8 +3398,23 @@ class AISettingsDialog(tk.Toplevel):
         client = None
         if provider in ('agy', 'antigravity'):
             cli_cmd = self.agy_path_var.get().strip()
-            effort = self.agy_effort_var.get().strip()
-            model = self.model_var.get().strip() or 'gemini-2.5-flash'
+            effort = self.agy_effort_var.get().strip() or 'low'
+            model = self.model_var.get().strip() or AISettings.AGY_MODELS[0]
+            # Discover and validate available AGY models first
+            try:
+                discovered = list_antigravity_models(cli_cmd, raise_on_error=True)
+                if discovered:
+                    self.model_combo['values'] = discovered
+                    self.settings.set('cached_agy_models', discovered)
+                    if model not in discovered:
+                        candidate = f"{model}-{effort}"
+                        model = candidate if candidate in discovered else discovered[0]
+                        self.model_var.set(model)
+                    self.settings.agy_model = model
+                    self.settings.save()
+            except Exception as e:
+                messagebox.showerror("Error", f"AGY CLI model check failed: {e}", parent=self)
+                return
             client = AgyClient(model=model, effort=effort, cli_command=cli_cmd)
             success, message = client.test_connection()
         elif provider == 'anthropic':
@@ -3939,7 +4071,12 @@ class ChatSidebar(tk.Frame):
         names = {'anthropic': 'Claude', 'gemini': 'Gemini', 'ollama': 'Ollama', 'deepseek': 'DeepSeek',
                  'cli': 'CLI', 'agy': 'Antigravity', 'antigravity': 'Antigravity'}
         prov = names.get(self.settings.provider, self.settings.provider)
-        model = '' if self.settings.provider == 'cli' else (self.settings.model or '')
+        if self.settings.provider == 'cli':
+            model = ''
+        elif self.settings.provider in ('agy', 'antigravity'):
+            model = self.settings.agy_model or self.settings.model or ''
+        else:
+            model = self.settings.model or ''
         self.badge_label.config(text=f"{prov} \u00b7 {model}" if model else prov)
 
     # ------------------------------------------------------------- font size
@@ -4078,7 +4215,7 @@ class ChatSidebar(tk.Frame):
                         w, text="\u21c4 Review & Apply", relief=tk.FLAT, bd=0, cursor='hand2', takefocus=0,
                         font=(SANS_FONT, max(7, self._fs - 2)), padx=4, pady=0,
                         bg=P[bg_key], fg=P['accent'], activebackground=P[bg_key],
-                        activeforeground=P['fg'],
+                        activeforeground=P['text'],
                         command=lambda i=idx: self._review_and_apply_message(i)
                     )
                     w.window_create(tk.END, window=rev_btn)
@@ -4368,12 +4505,19 @@ class ChatSidebar(tk.Frame):
                            cancel: threading.Event):
         """Generate response in background thread"""
         try:
+            active_model = self.settings.model
             if self.settings.provider == 'gemini':
                 self.llm_client.api_key = self.settings.gemini_api_key
             elif self.settings.provider == 'anthropic':
                 self.llm_client.api_key = self.settings.api_key
             elif self.settings.provider == 'deepseek':
                 self.llm_client.api_key = self.settings.deepseek_api_key
+            elif self.settings.provider in ('agy', 'antigravity'):
+                active_model = self.settings.agy_model or self.settings.model
+                if isinstance(self.llm_client, AgyClient):
+                    self.llm_client.model = active_model
+                    self.llm_client.effort = self.settings.agy_effort or 'low'
+                    self.llm_client.cli_command = self.settings.agy_path or find_antigravity_cli_command()
 
             text = ""
             gen = self.llm_client.send_message_stream(
@@ -4384,7 +4528,7 @@ class ChatSidebar(tk.Frame):
                 top_p=self.settings.top_p,
                 top_k=self.settings.top_k,
                 images=images if images else None,
-                model=self.settings.model
+                model=active_model
             )
             try:
                 for chunk in gen:
