@@ -514,6 +514,7 @@ class ImageHandler:
         # Check for key=value parameters
         kv_pattern = re.compile(r'(\w+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^,;|]+))')
         kv_matches = list(kv_pattern.finditer(param_str))
+        remaining_str = param_str
 
         if kv_matches:
             for m in kv_matches:
@@ -532,24 +533,28 @@ class ImageHandler:
                         result['align'] = v.lower()
                 elif k == 'caption':
                     result['caption'] = v
-        else:
-            # Check for positional shorthand (e.g. "400x300", "center", "400")
-            tokens = [t.strip() for t in re.split(r'[,|]', param_str) if t.strip()]
-            for token in tokens:
-                m_dim = re.match(r'^(\d+)\s*[xX×]\s*(\d+)$', token)
-                if m_dim:
+            remaining_str = kv_pattern.sub('', param_str)
+
+        # Check for positional shorthand in remaining tokens
+        tokens = [t.strip() for t in re.split(r'[,|]', remaining_str) if t.strip()]
+        for token in tokens:
+            m_dim = re.match(r'^(\d+)\s*[xX×]\s*(\d+)$', token)
+            if m_dim:
+                if result['width'] is None:
                     result['width'] = int(m_dim.group(1))
+                if result['height'] is None:
                     result['height'] = int(m_dim.group(2))
-                    continue
-                m_w = re.match(r'^(\d+)(?:px)?$', token)
-                if m_w:
+                continue
+            m_w = re.match(r'^(\d+)(?:px)?$', token)
+            if m_w:
+                if result['width'] is None:
                     result['width'] = int(m_w.group(1))
-                    continue
-                if token.lower() in ('left', 'right', 'center'):
-                    result['align'] = token.lower()
-                    continue
-                if not result['caption']:
-                    result['caption'] = token
+                continue
+            if token.lower() in ('left', 'right', 'center'):
+                result['align'] = token.lower()
+                continue
+            if not result['caption']:
+                result['caption'] = token
 
         return result
 
@@ -1052,6 +1057,17 @@ def _latex_to_unicode(expr: str) -> str:
 # Markdown Table & Spreadsheet Conversion Helpers
 # =============================================================================
 
+def _split_md_table_row(row_str: str) -> List[str]:
+    """Split a Markdown table row into cells, respecting escaped pipes (\\|)."""
+    s = row_str.strip()
+    if s.startswith('|'):
+        s = s[1:]
+    if s.endswith('|') and not s.endswith(r'\|'):
+        s = s[:-1]
+    cells = [c.strip() for c in re.split(r'(?<!\\)\|', s)]
+    return cells
+
+
 def format_markdown_table_lines(lines: List[str]) -> Tuple[List[str], List[str]]:
     """Format, pad, and align Markdown pipe table lines. Returns (formatted_lines, col_alignments)."""
     parsed_rows = []
@@ -1060,11 +1076,7 @@ def format_markdown_table_lines(lines: List[str]) -> Tuple[List[str], List[str]]
         s = line.strip()
         if not s:
             continue
-        if s.startswith('|'):
-            s = s[1:]
-        if s.endswith('|'):
-            s = s[:-1]
-        cells = [c.strip() for c in s.split('|')]
+        cells = _split_md_table_row(s)
         if cells and all(re.match(r'^:?-+:?$', c) for c in cells if c):
             sep_indices.add(len(parsed_rows))
         parsed_rows.append(cells)
@@ -1142,22 +1154,34 @@ def parse_spreadsheet_tsv_to_markdown(tsv_text: str) -> Optional[str]:
     """Convert spreadsheet clipboard text (Excel, Google Sheets, Calc TSV) into a formatted Markdown table."""
     if not tsv_text or '\t' not in tsv_text:
         return None
-    lines = [ln for ln in tsv_text.splitlines() if ln.strip()]
-    if not lines:
+    raw_lines = [ln for ln in tsv_text.splitlines() if ln.strip()]
+    if not raw_lines:
         return None
-    tab_count = sum(1 for ln in lines if '\t' in ln)
-    if tab_count < 2 and not (len(lines) == 1 and lines[0].count('\t') >= 2):
+    tab_count = sum(1 for ln in raw_lines if '\t' in ln)
+    if tab_count < 2 and not (len(raw_lines) == 1 and raw_lines[0].count('\t') >= 2):
         return None
 
     import csv
     import io
     try:
-        reader = csv.reader(io.StringIO(tsv_text.strip()), delimiter='\t')
+        use_csv_reader = (tsv_text.count('"') % 2 == 0) and ('"' in tsv_text)
         rows = []
-        for raw_row in reader:
-            cleaned_row = [re.sub(r'[\r\n]+', ' ', c).replace('|', '\\|').strip() for c in raw_row]
-            if any(cleaned_row):
-                rows.append(cleaned_row)
+        if use_csv_reader:
+            try:
+                reader = csv.reader(io.StringIO(tsv_text.strip()), delimiter='\t', quotechar='"')
+                for raw_row in reader:
+                    cleaned_row = [re.sub(r'[\r\n]+', ' ', c).replace('|', '\\|').strip() for c in raw_row]
+                    if any(cleaned_row):
+                        rows.append(cleaned_row)
+            except Exception:
+                rows = []
+
+        if not rows:
+            for ln in raw_lines:
+                cleaned_row = [c.replace('|', '\\|').strip() for c in ln.split('\t')]
+                if any(cleaned_row):
+                    rows.append(cleaned_row)
+
         if not rows:
             return None
 
@@ -1258,6 +1282,414 @@ def format_existing_pipe_table_on_paste(text: str) -> Optional[str]:
             formatted, _ = format_markdown_table_lines(lines)
             return "\n" + "\n".join(formatted) + "\n"
     return None
+
+
+class VisualTableWidget(tk.Frame):
+    """
+    Interactive, styled MS Word-like grid widget embedded into the document canvas.
+    Supports in-place cell editing, Tab/Shift-Tab cell navigation, auto-row appending on last Tab,
+    context menu for inserting/deleting rows & columns, column alignment, and copying as TSV.
+    """
+    def __init__(self, parent, on_change_callback, table_lines: List[str], is_dark: bool = False,
+                 visual_font: str = None, visual_font_size: int = 11, content_width: int = 600, **kwargs):
+        super().__init__(parent, bd=1, relief=tk.SOLID, **kwargs)
+        self.on_change_callback = on_change_callback
+        self.raw_table_lines = list(table_lines)
+        self.is_dark = is_dark
+        self.visual_font = visual_font or VISUAL_FONT or SANS_FONT
+        self.visual_font_size = visual_font_size
+        self.content_width = content_width
+
+        # Styling
+        self.tbl_border = "#475569" if is_dark else "#cbd5e1"
+        self.header_bg = "#334155" if is_dark else "#f1f5f9"
+        self.header_fg = "#f8fafc" if is_dark else "#0f172a"
+        self.row_bg = "#1e293b" if is_dark else "#ffffff"
+        self.row_alt_bg = "#0f172a" if is_dark else "#f8fafc"
+        self.cell_fg = "#e2e8f0" if is_dark else "#1e293b"
+        self.config(bg=self.tbl_border)
+
+        self._build_table_ui()
+
+    def _build_table_ui(self):
+        for w in self.winfo_children():
+            w.destroy()
+
+        parsed_rows = []
+        sep_indices = set()
+        for i, row in enumerate(self.raw_table_lines):
+            cells = _split_md_table_row(row)
+            if cells and all(re.match(r'^:?-+:?$', c) for c in cells if c):
+                sep_indices.add(len(parsed_rows))
+            parsed_rows.append(cells)
+
+        if not parsed_rows:
+            return
+
+        num_cols = max(len(row) for row in parsed_rows)
+        for r in parsed_rows:
+            while len(r) < num_cols:
+                r.append('')
+
+        self.col_alignments = ['left'] * num_cols
+        for sep_idx in sep_indices:
+            for c_idx, cell in enumerate(parsed_rows[sep_idx]):
+                c_str = cell.strip()
+                if c_str.startswith(':') and c_str.endswith(':'):
+                    self.col_alignments[c_idx] = 'center'
+                elif c_str.endswith(':'):
+                    self.col_alignments[c_idx] = 'right'
+                else:
+                    self.col_alignments[c_idx] = 'left'
+
+        non_sep_rows = [r for idx, r in enumerate(parsed_rows) if idx not in sep_indices]
+        if not non_sep_rows:
+            return
+
+        self.headers = non_sep_rows[0]
+        self.data_rows = non_sep_rows[1:] if len(non_sep_rows) > 1 else []
+
+        cell_font = (self.visual_font, max(8, int(self.visual_font_size * 0.95)))
+        head_font = (self.visual_font, max(8, int(self.visual_font_size * 0.95)), "bold")
+
+        col_weights = []
+        for c in range(num_cols):
+            w = len(self.headers[c]) if c < len(self.headers) else 3
+            for r in self.data_rows:
+                if c < len(r):
+                    w = max(w, len(r[c]))
+            col_weights.append(max(4, min(28, w)))
+
+        for col_idx, weight in enumerate(col_weights):
+            self.grid_columnconfigure(col_idx, weight=weight)
+
+        justify_map = {'left': tk.LEFT, 'center': tk.CENTER, 'right': tk.RIGHT}
+
+        def _clean_for_display(val: str) -> str:
+            v = val.strip().replace(r'\|', '|')
+            v = re.sub(r'^\*\*(.*?)\*\*$', r'\1', v)
+            v = re.sub(r'^\*(.*?)\*$', r'\1', v)
+            v = re.sub(r'^`(.*?)`$', r'\1', v)
+            return v
+
+        self.cell_entries = []
+
+        # Header row
+        header_row_entries = []
+        for col_idx, h in enumerate(self.headers):
+            h_var = tk.StringVar(value=_clean_for_display(h))
+            entry = tk.Entry(
+                self, textvariable=h_var, font=head_font,
+                bg=self.header_bg, fg=self.header_fg, relief=tk.FLAT, bd=0,
+                justify=justify_map.get(self.col_alignments[col_idx], tk.LEFT),
+                width=max(4, min(28, col_weights[col_idx]))
+            )
+            entry.grid(row=0, column=col_idx, sticky="nsew", padx=1, pady=1, ipady=3)
+            entry.bind("<FocusOut>", lambda e, c=col_idx, v=h_var: self._on_cell_commit(0, c, v.get()))
+            entry.bind("<Return>", lambda e, c=col_idx, v=h_var: self._on_cell_commit(0, c, v.get()))
+            entry.bind("<Button-3>", lambda e, c=col_idx: self._show_context_menu(e, 0, c))
+            header_row_entries.append(entry)
+        self.cell_entries.append(header_row_entries)
+
+        # Data rows
+        for row_idx, row in enumerate(self.data_rows):
+            while len(row) < num_cols:
+                row.append('')
+            c_bg = self.row_alt_bg if (row_idx % 2 == 1) else self.row_bg
+            row_entries = []
+            for col_idx, cell in enumerate(row):
+                cell_var = tk.StringVar(value=_clean_for_display(cell))
+                entry = tk.Entry(
+                    self, textvariable=cell_var, font=cell_font,
+                    bg=c_bg, fg=self.cell_fg, relief=tk.FLAT, bd=0,
+                    justify=justify_map.get(self.col_alignments[col_idx], tk.LEFT),
+                    width=max(4, min(28, col_weights[col_idx]))
+                )
+                entry.grid(row=row_idx + 1, column=col_idx, sticky="nsew", padx=1, pady=1, ipady=3)
+                entry.bind("<FocusOut>", lambda e, r=row_idx + 1, c=col_idx, v=cell_var: self._on_cell_commit(r, c, v.get()))
+                entry.bind("<Return>", lambda e, r=row_idx + 1, c=col_idx, v=cell_var: self._on_cell_commit(r, c, v.get()))
+                entry.bind("<Button-3>", lambda e, r=row_idx + 1, c=col_idx: self._show_context_menu(e, r, c))
+                row_entries.append(entry)
+            self.cell_entries.append(row_entries)
+
+        total_r = len(self.cell_entries)
+        for r in range(total_r):
+            for c in range(num_cols):
+                def _make_nav(curr_r, curr_c):
+                    def _nav_tab(e):
+                        if curr_c + 1 < num_cols:
+                            self.cell_entries[curr_r][curr_c + 1].focus_set()
+                        elif curr_r + 1 < total_r:
+                            self.cell_entries[curr_r + 1][0].focus_set()
+                        else:
+                            self.insert_row(len(self.data_rows))
+                        return "break"
+
+                    def _nav_shift_tab(e):
+                        if curr_c > 0:
+                            self.cell_entries[curr_r][curr_c - 1].focus_set()
+                        elif curr_r > 0:
+                            self.cell_entries[curr_r - 1][num_cols - 1].focus_set()
+                        return "break"
+
+                    self.cell_entries[curr_r][curr_c].bind("<Tab>", _nav_tab)
+                    self.cell_entries[curr_r][curr_c].bind("<Shift-Tab>", _nav_shift_tab)
+                    try:
+                        self.cell_entries[curr_r][curr_c].bind("<ISO_Left_Tab>", _nav_shift_tab)
+                    except tk.TclError:
+                        pass
+                _make_nav(r, c)
+
+    def _sync(self):
+        lines = ["| " + " | ".join(h.replace('|', r'\|') for h in self.headers) + " |"]
+        seps = []
+        for al in self.col_alignments:
+            if al == 'center': seps.append(':---:')
+            elif al == 'right': seps.append('---:')
+            else: seps.append(':---')
+        lines.append("| " + " | ".join(seps) + " |")
+        for row in self.data_rows:
+            lines.append("| " + " | ".join(c.replace('|', r'\|') for c in row) + " |")
+
+        formatted, _ = format_markdown_table_lines(lines)
+        old_str = "\n".join(self.raw_table_lines)
+        new_str = "\n".join(formatted)
+        if old_str != new_str:
+            self.raw_table_lines[:] = formatted
+            if self.on_change_callback:
+                self.on_change_callback(old_str, new_str)
+
+    def _on_cell_commit(self, r, c, val):
+        clean_val = val.strip().replace('|', r'\|')
+        if r == 0:
+            if c < len(self.headers) and self.headers[c] != clean_val:
+                self.headers[c] = clean_val
+                self._sync()
+        else:
+            d_idx = r - 1
+            if 0 <= d_idx < len(self.data_rows) and c < len(self.data_rows[d_idx]) and self.data_rows[d_idx][c] != clean_val:
+                self.data_rows[d_idx][c] = clean_val
+                self._sync()
+
+    def insert_row(self, insert_idx):
+        new_row = ['' for _ in self.headers]
+        self.data_rows.insert(max(0, min(len(self.data_rows), insert_idx)), new_row)
+        self._sync()
+        self._build_table_ui()
+        target_r = min(len(self.cell_entries) - 1, insert_idx + 1)
+        if target_r < len(self.cell_entries) and self.cell_entries[target_r]:
+            self.cell_entries[target_r][0].focus_set()
+
+    def delete_row(self, row_idx):
+        if 0 <= row_idx < len(self.data_rows):
+            del self.data_rows[row_idx]
+            self._sync()
+            self._build_table_ui()
+
+    def insert_column(self, col_idx):
+        self.headers.insert(col_idx, f"Header {len(self.headers) + 1}")
+        self.col_alignments.insert(col_idx, 'left')
+        for r in self.data_rows:
+            r.insert(col_idx, '')
+        self._sync()
+        self._build_table_ui()
+
+    def delete_column(self, col_idx):
+        if len(self.headers) > 1 and 0 <= col_idx < len(self.headers):
+            del self.headers[col_idx]
+            del self.col_alignments[col_idx]
+            for r in self.data_rows:
+                if col_idx < len(r):
+                    del r[col_idx]
+            self._sync()
+            self._build_table_ui()
+
+    def set_column_alignment(self, col_idx, align):
+        if 0 <= col_idx < len(self.col_alignments):
+            self.col_alignments[col_idx] = align
+            self._sync()
+            self._build_table_ui()
+
+    def copy_table_tsv(self):
+        rows = [self.headers] + self.data_rows
+        tsv = "\n".join(["\t".join(r) for r in rows])
+        self.clipboard_clear()
+        self.clipboard_append(tsv)
+
+    def _show_context_menu(self, event, r, c):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Insert Row Above", command=lambda: self.insert_row(max(0, r - 1)))
+        menu.add_command(label="Insert Row Below", command=lambda: self.insert_row(r))
+        menu.add_separator()
+        menu.add_command(label="Insert Column Left", command=lambda: self.insert_column(c))
+        menu.add_command(label="Insert Column Right", command=lambda: self.insert_column(c + 1))
+        menu.add_separator()
+        if r > 0:
+            menu.add_command(label="Delete Row", command=lambda: self.delete_row(r - 1))
+        if len(self.headers) > 1:
+            menu.add_command(label="Delete Column", command=lambda: self.delete_column(c))
+        menu.add_separator()
+        menu.add_command(label="Align Column Left", command=lambda: self.set_column_alignment(c, 'left'))
+        menu.add_command(label="Align Column Center", command=lambda: self.set_column_alignment(c, 'center'))
+        menu.add_command(label="Align Column Right", command=lambda: self.set_column_alignment(c, 'right'))
+        menu.add_separator()
+        menu.add_command(label="Copy Table as TSV (Excel)", command=self.copy_table_tsv)
+        menu.tk_popup(event.x_root, event.y_root)
+
+
+class VisualFigureWidget(tk.Frame):
+    """
+    Interactive figure widget with image thumbnail, alignment, academic caption, and context menu.
+    Updates canonical markdown syntax in-place when aligned, resized, or captioned.
+    """
+    def __init__(self, parent, on_change_callback, raw_match: str, img_info: dict, image_handler,
+                 is_dark: bool = False, visual_font: str = None, visual_font_size: int = 11,
+                 content_width: int = 600, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.on_change_callback = on_change_callback
+        self.raw_match = raw_match
+        self.img_info = dict(img_info)
+        self.image_handler = image_handler
+        self.is_dark = is_dark
+        self.visual_font = visual_font or VISUAL_FONT or SANS_FONT
+        self.visual_font_size = visual_font_size
+        self.content_width = content_width
+
+        bg_col = "#1e293b" if is_dark else "#ffffff"
+        self.config(bg=bg_col)
+        self._photo = None
+        self._build_figure_ui()
+
+    def _build_figure_ui(self):
+        for w in self.winfo_children():
+            w.destroy()
+
+        image = self.image_handler.load_image(self.img_info)
+        align = self.img_info.get('align', 'center')
+        if align not in ('left', 'center', 'right'):
+            align = 'center'
+
+        align_anchor = {'left': 'w', 'center': 'center', 'right': 'e'}.get(align, 'center')
+        bg_col = "#1e293b" if self.is_dark else "#ffffff"
+        cap_fg = "#94a3b8" if self.is_dark else "#64748b"
+
+        container = tk.Frame(self, bg=bg_col)
+        container.pack(anchor=align_anchor, padx=12, pady=6)
+
+        if image:
+            orig_w, orig_h = image.size
+            disp_w = self.img_info.get('width')
+            disp_h = self.img_info.get('height')
+
+            if disp_w and disp_h:
+                target_w, target_h = disp_w, disp_h
+            elif disp_w:
+                target_w = disp_w
+                target_h = max(1, int(orig_h * disp_w / orig_w))
+            elif disp_h:
+                target_h = disp_h
+                target_w = max(1, int(orig_w * disp_h / orig_h))
+            else:
+                target_w = min(orig_w, 550)
+                target_h = max(1, int(orig_h * target_w / orig_w))
+
+            max_w = max(80, self.content_width - 30)
+            if target_w > max_w:
+                target_h = max(1, int(target_h * max_w / target_w))
+                target_w = max_w
+
+            display = image
+            if (target_w, target_h) != image.size:
+                try:
+                    display = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                except Exception:
+                    display = image
+
+            self._photo = self.image_handler.get_photo_image(display, thumbnail=False)
+            if self._photo:
+                img_lbl = tk.Label(container, image=self._photo, bg=bg_col, bd=0, relief=tk.FLAT)
+                img_lbl.pack(anchor=align_anchor)
+                img_lbl.bind("<Button-3>", self._show_context_menu)
+                img_lbl.bind("<Double-Button-1>", lambda e: ImageViewerWindow(self.winfo_toplevel(), image, self.img_info.get('alt', 'Image')))
+        else:
+            alt = self.img_info.get('alt', 'Image')
+            ph_lbl = tk.Label(container, text=f"[🖼️ {alt}]", bg=bg_col, fg=cap_fg, font=(self.visual_font, 10, 'italic'))
+            ph_lbl.pack(anchor=align_anchor)
+            ph_lbl.bind("<Button-3>", self._show_context_menu)
+
+        cap = self.img_info.get('caption')
+        if not cap:
+            alt_text = self.img_info.get('alt', '')
+            if alt_text and alt_text.lower() not in ('image', 'img', 'figure', 'pic'):
+                cap = alt_text
+
+        if cap:
+            cap_lbl = tk.Label(
+                container, text=cap, bg=bg_col, fg=cap_fg,
+                font=(self.visual_font, max(8, int(self.visual_font_size * 0.85)), 'italic'),
+                justify=tk.CENTER
+            )
+            cap_lbl.pack(anchor=align_anchor, pady=(3, 0))
+            cap_lbl.bind("<Button-3>", self._show_context_menu)
+
+    def _set_prop(self, prop, val):
+        full_match = self.raw_match
+        m = re.match(r'!\[([^\]]*)\]\(([^)]+)\)', full_match)
+        if not m:
+            return
+        meta_str = m.group(1)
+        path = m.group(2)
+        parsed = self.image_handler._parse_extended_alt(meta_str)
+
+        if prop == 'width':
+            parsed['width'] = int(val) if val is not None else None
+        elif prop == 'align':
+            parsed['align'] = str(val) if val else 'center'
+        elif prop == 'caption':
+            parsed['caption'] = str(val).strip() if val else None
+
+        base_alt = parsed.get('alt', '')
+        params = []
+        if parsed.get('width'):
+            params.append(f"width={parsed['width']}")
+        if parsed.get('align') and parsed['align'] != 'center':
+            params.append(f"align={parsed['align']}")
+        if parsed.get('caption'):
+            params.append(f'caption="{parsed["caption"]}"')
+
+        new_match = f"![{base_alt}|{','.join(params)}]({path})" if params else f"![{base_alt}]({path})"
+
+        old_match = self.raw_match
+        self.raw_match = new_match
+        self.img_info['width'] = parsed.get('width')
+        self.img_info['align'] = parsed.get('align', 'center')
+        self.img_info['caption'] = parsed.get('caption')
+        self._build_figure_ui()
+
+        if self.on_change_callback:
+            self.on_change_callback(old_match, new_match)
+
+    def _prompt_caption(self):
+        curr_cap = self.img_info.get('caption') or self.img_info.get('alt', '')
+        from tkinter import simpledialog
+        new_cap = simpledialog.askstring("Figure Caption", "Enter figure caption:", initialvalue=curr_cap, parent=self)
+        if new_cap is not None:
+            self._set_prop('caption', new_cap.strip())
+
+    def _show_context_menu(self, event):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Align Left", command=lambda: self._set_prop('align', 'left'))
+        menu.add_command(label="Align Center", command=lambda: self._set_prop('align', 'center'))
+        menu.add_command(label="Align Right", command=lambda: self._set_prop('align', 'right'))
+        menu.add_separator()
+        menu.add_command(label="Size: 25%", command=lambda: self._set_prop('width', int(self.content_width * 0.25)))
+        menu.add_command(label="Size: 50%", command=lambda: self._set_prop('width', int(self.content_width * 0.50)))
+        menu.add_command(label="Size: 75%", command=lambda: self._set_prop('width', int(self.content_width * 0.75)))
+        menu.add_command(label="Size: 100% (Full Width)", command=lambda: self._set_prop('width', int(self.content_width)))
+        menu.add_command(label="Size: Original", command=lambda: self._set_prop('width', None))
+        menu.add_separator()
+        menu.add_command(label="Edit Caption...", command=self._prompt_caption)
+        menu.tk_popup(event.x_root, event.y_root)
 
 
 
@@ -1839,379 +2271,44 @@ class MarkdownVisualWidget(tk.Frame):
         """Render a markdown table as an interactive, styled MS Word-like grid frame inside the text widget."""
         if not table_rows:
             return
-
-        orig_table_md = list(table_rows)
-        # Parse table structure
-        parsed_rows = []
-        sep_indices = set()
-        for i, row in enumerate(table_rows):
-            cells = [c.strip() for c in row.split('|')]
-            if cells and cells[0] == '':
-                cells = cells[1:]
-            if cells and cells[-1] == '':
-                cells = cells[:-1]
-            if all(re.match(r'^[-:]+$', c) for c in cells if c):
-                sep_indices.add(len(parsed_rows))
-            parsed_rows.append(cells)
-
-        if not parsed_rows:
-            return
-
-        num_cols = max(len(row) for row in parsed_rows)
-        for r in parsed_rows:
-            while len(r) < num_cols:
-                r.append('')
-
-        # Determine column alignments
-        col_alignments = ['left'] * num_cols
-        for sep_idx in sep_indices:
-            for c_idx, cell in enumerate(parsed_rows[sep_idx]):
-                c_str = cell.strip()
-                if c_str.startswith(':') and c_str.endswith(':'):
-                    col_alignments[c_idx] = 'center'
-                elif c_str.endswith(':'):
-                    col_alignments[c_idx] = 'right'
-                else:
-                    col_alignments[c_idx] = 'left'
-
-        # Filter out separator rows for display and editing
-        non_sep_rows = [r for idx, r in enumerate(parsed_rows) if idx not in sep_indices]
-        if not non_sep_rows:
-            return
-
-        headers = non_sep_rows[0]
-        data_rows = non_sep_rows[1:] if len(non_sep_rows) > 1 else []
-
-        # Theme-derived table colors
-        bg_col = self.text_widget.cget('bg')
-        is_dark = self._is_dark(bg_col)
-
-        tbl_border = "#475569" if is_dark else "#cbd5e1"
-        header_bg = "#334155" if is_dark else "#f1f5f9"
-        header_fg = "#f8fafc" if is_dark else "#0f172a"
-        row_bg = "#1e293b" if is_dark else "#ffffff"
-        row_alt_bg = "#0f172a" if is_dark else "#f8fafc"
-        cell_fg = "#e2e8f0" if is_dark else "#1e293b"
-
+        is_dark = self._is_dark(self.text_widget.cget('bg'))
         font_family = (self.current_theme.get('visual_font') if self.current_theme else None) or VISUAL_FONT or SANS_FONT
         font_size = self.current_theme.get('visual_font_size', 11) if self.current_theme else 11
-        cell_font = (font_family, self._px(font_size * 0.95))
-        head_font = (font_family, self._px(font_size * 0.95), "bold")
-        pad_x, pad_y = self._s(8), self._s(4)
 
-        table_frame = tk.Frame(self.text_widget, bg=tbl_border, bd=1, relief=tk.SOLID)
-
-        # Proportional column weights based on content length
-        col_weights = []
-        for c in range(num_cols):
-            w = len(headers[c]) if c < len(headers) else 3
-            for r in data_rows:
-                if c < len(r):
-                    w = max(w, len(r[c]))
-            col_weights.append(max(4, min(45, w)))
-        for col_idx, weight in enumerate(col_weights):
-            table_frame.grid_columnconfigure(col_idx, weight=weight)
-
-        anchor_map = {'left': 'w', 'center': 'center', 'right': 'e'}
-        justify_map = {'left': tk.LEFT, 'center': tk.CENTER, 'right': tk.RIGHT}
-
-        cell_entries = []
-
-        def _clean_for_display(val: str) -> str:
-            v = val.strip()
-            # Clean markdown bold/italic/code markers for display
-            v = re.sub(r'^\*\*(.*?)\*\*$', r'\1', v)
-            v = re.sub(r'^\*(.*?)\*$', r'\1', v)
-            v = re.sub(r'^`(.*?)`$', r'\1', v)
-            return v
-
-        # Header row
-        header_row_entries = []
-        for col_idx, h in enumerate(headers):
-            h_var = tk.StringVar(value=_clean_for_display(h))
-            entry = tk.Entry(
-                table_frame, textvariable=h_var, font=head_font,
-                bg=header_bg, fg=header_fg, relief=tk.FLAT, bd=0,
-                justify=justify_map.get(col_alignments[col_idx], tk.LEFT)
-            )
-            entry.grid(row=0, column=col_idx, sticky="nsew", padx=1, pady=1, ipady=pad_y)
-            entry.bind("<FocusOut>", lambda e, c=col_idx, v=h_var: self._on_table_cell_commit(orig_table_md, headers, col_alignments, data_rows, 0, c, v.get()))
-            entry.bind("<Return>", lambda e, c=col_idx, v=h_var: self._on_table_cell_commit(orig_table_md, headers, col_alignments, data_rows, 0, c, v.get()))
-            entry.bind("<Button-3>", lambda e, c=col_idx: self._show_table_context_menu(e, orig_table_md, headers, col_alignments, data_rows, 0, c))
-            header_row_entries.append(entry)
-        cell_entries.append(header_row_entries)
-
-        # Data rows
-        for row_idx, row in enumerate(data_rows):
-            while len(row) < num_cols:
-                row.append('')
-            c_bg = row_alt_bg if (row_idx % 2 == 1) else row_bg
-            row_entries = []
-            for col_idx, cell in enumerate(row):
-                cell_var = tk.StringVar(value=_clean_for_display(cell))
-                entry = tk.Entry(
-                    table_frame, textvariable=cell_var, font=cell_font,
-                    bg=c_bg, fg=cell_fg, relief=tk.FLAT, bd=0,
-                    justify=justify_map.get(col_alignments[col_idx], tk.LEFT)
-                )
-                entry.grid(row=row_idx + 1, column=col_idx, sticky="nsew", padx=1, pady=1, ipady=pad_y)
-                entry.bind("<FocusOut>", lambda e, r=row_idx + 1, c=col_idx, v=cell_var: self._on_table_cell_commit(orig_table_md, headers, col_alignments, data_rows, r, c, v.get()))
-                entry.bind("<Return>", lambda e, r=row_idx + 1, c=col_idx, v=cell_var: self._on_table_cell_commit(orig_table_md, headers, col_alignments, data_rows, r, c, v.get()))
-                entry.bind("<Button-3>", lambda e, r=row_idx + 1, c=col_idx: self._show_table_context_menu(e, orig_table_md, headers, col_alignments, data_rows, r, c))
-                row_entries.append(entry)
-            cell_entries.append(row_entries)
-
-        # Connect Tab / Shift+Tab keyboard navigation across table cells
-        total_r = len(cell_entries)
-        for r in range(total_r):
-            for c in range(num_cols):
-                def _make_nav(curr_r, curr_c):
-                    def _nav_tab(e):
-                        if curr_c + 1 < num_cols:
-                            cell_entries[curr_r][curr_c + 1].focus_set()
-                        elif curr_r + 1 < total_r:
-                            cell_entries[curr_r + 1][0].focus_set()
-                        else:
-                            # At last cell, insert a new row automatically!
-                            self._table_insert_row(orig_table_md, headers, col_alignments, data_rows, len(data_rows))
-                        return "break"
-
-                    def _nav_shift_tab(e):
-                        if curr_c > 0:
-                            cell_entries[curr_r][curr_c - 1].focus_set()
-                        elif curr_r > 0:
-                            cell_entries[curr_r - 1][num_cols - 1].focus_set()
-                        return "break"
-
-                    cell_entries[curr_r][curr_c].bind("<Tab>", _nav_tab)
-                    cell_entries[curr_r][curr_c].bind("<Shift-Tab>", _nav_shift_tab)
-                _make_nav(r, c)
-
-        window_pad = self._s(6)
+        tbl_widget = VisualTableWidget(
+            self.text_widget,
+            on_change_callback=lambda old, new: self.on_content_change(old, new) if self.on_content_change else None,
+            table_lines=table_rows,
+            is_dark=is_dark,
+            visual_font=font_family,
+            visual_font_size=font_size,
+            content_width=self.content_width_px()
+        )
         self.text_widget.insert(tk.END, '\n')
-        self.text_widget.window_create(tk.END, window=table_frame, padx=window_pad, pady=self._s(8))
+        self.text_widget.window_create(tk.END, window=tbl_widget, padx=self._s(6), pady=self._s(8))
         self.text_widget.insert(tk.END, '\n\n')
-
-    def _on_table_cell_commit(self, orig_table_md, headers, col_alignments, data_rows, r, c, new_val):
-        """Commit a cell edit and update the underlying markdown table in the document."""
-        if r == 0:
-            if c < len(headers) and headers[c] != new_val:
-                headers[c] = new_val
-                self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
-        else:
-            d_idx = r - 1
-            if 0 <= d_idx < len(data_rows) and c < len(data_rows[d_idx]) and data_rows[d_idx][c] != new_val:
-                data_rows[d_idx][c] = new_val
-                self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
-
-    def _sync_table_to_source(self, orig_table_lines, headers, col_alignments, data_rows):
-        """Build formatted Markdown table lines and update canonical document."""
-        lines = ["| " + " | ".join(headers) + " |"]
-        seps = []
-        for al in col_alignments:
-            if al == 'center':
-                seps.append(':---:')
-            elif al == 'right':
-                seps.append('---:')
-            else:
-                seps.append(':---')
-        lines.append("| " + " | ".join(seps) + " |")
-        for row in data_rows:
-            lines.append("| " + " | ".join(row) + " |")
-        formatted, _ = format_markdown_table_lines(lines)
-        new_table_str = "\n".join(formatted)
-        old_table_str = "\n".join(orig_table_lines)
-        if self.on_content_change:
-            self.on_content_change(old_table_str, new_table_str)
-
-    def _show_table_context_menu(self, event, orig_table_md, headers, col_alignments, data_rows, r, c):
-        """Show context menu for table manipulation (Insert/Delete rows, columns, alignment, copy)."""
-        menu = tk.Menu(self.text_widget, tearoff=0)
-        menu.add_command(label="Insert Row Above", command=lambda: self._table_insert_row(orig_table_md, headers, col_alignments, data_rows, max(0, r - 1)))
-        menu.add_command(label="Insert Row Below", command=lambda: self._table_insert_row(orig_table_md, headers, col_alignments, data_rows, r))
-        menu.add_separator()
-        menu.add_command(label="Insert Column Left", command=lambda: self._table_insert_col(orig_table_md, headers, col_alignments, data_rows, c))
-        menu.add_command(label="Insert Column Right", command=lambda: self._table_insert_col(orig_table_md, headers, col_alignments, data_rows, c + 1))
-        menu.add_separator()
-        if r > 0:
-            menu.add_command(label="Delete Row", command=lambda: self._table_delete_row(orig_table_md, headers, col_alignments, data_rows, r - 1))
-        if len(headers) > 1:
-            menu.add_command(label="Delete Column", command=lambda: self._table_delete_col(orig_table_md, headers, col_alignments, data_rows, c))
-        menu.add_separator()
-        menu.add_command(label="Align Column Left", command=lambda: self._table_set_align(orig_table_md, headers, col_alignments, data_rows, c, 'left'))
-        menu.add_command(label="Align Column Center", command=lambda: self._table_set_align(orig_table_md, headers, col_alignments, data_rows, c, 'center'))
-        menu.add_command(label="Align Column Right", command=lambda: self._table_set_align(orig_table_md, headers, col_alignments, data_rows, c, 'right'))
-        menu.add_separator()
-        menu.add_command(label="Copy Table as TSV (Excel)", command=lambda: self._copy_table_tsv(headers, data_rows))
-        menu.tk_popup(event.x_root, event.y_root)
-
-    def _table_insert_row(self, orig_table_md, headers, col_alignments, data_rows, insert_idx):
-        new_row = ['' for _ in headers]
-        data_rows.insert(max(0, min(len(data_rows), insert_idx)), new_row)
-        self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
-
-    def _table_delete_row(self, orig_table_md, headers, col_alignments, data_rows, row_idx):
-        if 0 <= row_idx < len(data_rows):
-            del data_rows[row_idx]
-            self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
-
-    def _table_insert_col(self, orig_table_md, headers, col_alignments, data_rows, col_idx):
-        headers.insert(col_idx, f"Header {len(headers) + 1}")
-        col_alignments.insert(col_idx, 'left')
-        for r in data_rows:
-            r.insert(col_idx, '')
-        self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
-
-    def _table_delete_col(self, orig_table_md, headers, col_alignments, data_rows, col_idx):
-        if len(headers) > 1 and 0 <= col_idx < len(headers):
-            del headers[col_idx]
-            del col_alignments[col_idx]
-            for r in data_rows:
-                if col_idx < len(r):
-                    del r[col_idx]
-            self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
-
-    def _table_set_align(self, orig_table_md, headers, col_alignments, data_rows, col_idx, align):
-        if 0 <= col_idx < len(col_alignments):
-            col_alignments[col_idx] = align
-            self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
-
-    def _copy_table_tsv(self, headers, data_rows):
-        rows = [headers] + data_rows
-        tsv = "\n".join(["\t".join(r) for r in rows])
-        self.clipboard_clear()
-        self.clipboard_append(tsv)
 
     def _insert_image_inline(self, img_info):
         """Insert an image inline in the text widget with true alignment, academic captions, and context controls"""
-        image = self.image_handler.load_image(img_info)
-        
-        if image:
-            display_width = img_info.get('width')
-            display_height = img_info.get('height')
-            align = img_info.get('align', 'center')
-            caption_text = img_info.get('caption')
-            alt_text = img_info.get('alt', '')
-            raw_match = img_info.get('full_match', '')
+        raw_match = img_info.get('full_match', '')
+        is_dark = self._is_dark(self.text_widget.cget('bg'))
+        font_family = (self.current_theme.get('visual_font') if self.current_theme else None) or VISUAL_FONT or SANS_FONT
+        font_size = self.current_theme.get('visual_font_size', 11) if self.current_theme else 11
 
-            orig_w, orig_h = image.size
-            
-            if display_width or display_height:
-                if display_width and display_height:
-                    target_w, target_h = display_width, display_height
-                elif display_width:
-                    target_w = display_width
-                    target_h = max(1, int(orig_h * display_width / orig_w))
-                else:
-                    target_h = display_height
-                    target_w = max(1, int(orig_w * display_height / orig_h))
-                target_w, target_h = min(target_w, 1000), min(target_h, 800)
-            else:
-                # Natural size, capped at 550px at 100% zoom
-                target_w = min(orig_w, 550)
-                target_h = max(1, int(orig_h * target_w / orig_w))
-
-            # Scale with zoom/dpi, then keep the image inside the text column
-            k = self.page_view.dpi() / 96.0 * self.zoom
-            target_w, target_h = max(1, int(target_w * k)), max(1, int(target_h * k))
-            max_w = max(80, self.content_width_px() - 2 * self._s(15))
-            if target_w > max_w:
-                target_h = max(1, int(target_h * max_w / target_w))
-                target_w = max_w
-
-            display = image
-            if (target_w, target_h) != image.size:
-                try:
-                    display = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                except Exception:
-                    display = image
-            photo = self.image_handler.get_photo_image(display, thumbnail=False)
-            
-            if photo:
-                align_tag = f"image_{align}" if f"image_{align}" in ('image_left', 'image_right', 'image_center') else "image_center"
-                self.text_widget.tag_configure("image_left", justify=tk.LEFT)
-                self.text_widget.tag_configure("image_center", justify=tk.CENTER)
-                self.text_widget.tag_configure("image_right", justify=tk.RIGHT)
-                
-                # Center/Align image using line tag applied to the entire image line range
-                img_start = self.text_widget.index(tk.END)
-                self.text_widget.insert(tk.END, '\n')
-                self.text_widget.image_create(tk.END, image=photo, padx=self._s(15), pady=self._s(8))
-                self.text_widget.insert(tk.END, '\n')
-                img_end = self.text_widget.index(tk.END)
-                self.text_widget.tag_add(align_tag, img_start, img_end)
-                
-                index = self.text_widget.index(tk.END + "-2c")
-                self.embedded_images[index] = (photo, image, alt_text or caption_text or '')
-
-                # Format clean academic caption (no ugly pixel noise)
-                caption = caption_text or (alt_text if alt_text and alt_text.lower() not in ('image', 'img', 'figure') else '')
-                if caption:
-                    cap_start = self.text_widget.index(tk.END)
-                    self.text_widget.insert(tk.END, caption + '\n\n', ("image_caption", align_tag))
-                else:
-                    self.text_widget.insert(tk.END, '\n', align_tag)
-
-                # Context menu for image
-                def _show_image_menu(event, info=img_info):
-                    menu = tk.Menu(self.text_widget, tearoff=0)
-                    menu.add_command(label="Align Left", command=lambda: self._set_image_prop(info, 'align', 'left'))
-                    menu.add_command(label="Align Center", command=lambda: self._set_image_prop(info, 'align', 'center'))
-                    menu.add_command(label="Align Right", command=lambda: self._set_image_prop(info, 'align', 'right'))
-                    menu.add_separator()
-                    menu.add_command(label="Size: 25%", command=lambda: self._set_image_prop(info, 'width', int(self.content_width_px() * 0.25)))
-                    menu.add_command(label="Size: 50%", command=lambda: self._set_image_prop(info, 'width', int(self.content_width_px() * 0.50)))
-                    menu.add_command(label="Size: 75%", command=lambda: self._set_image_prop(info, 'width', int(self.content_width_px() * 0.75)))
-                    menu.add_command(label="Size: 100% (Full Width)", command=lambda: self._set_image_prop(info, 'width', int(self.content_width_px())))
-                    menu.add_command(label="Size: Original", command=lambda: self._set_image_prop(info, 'width', None))
-                    menu.add_separator()
-                    menu.add_command(label="Edit Caption...", command=lambda: self._prompt_image_caption(info))
-                    menu.tk_popup(event.x_root, event.y_root)
-
-                self.text_widget.tag_bind(align_tag, "<Button-3>", _show_image_menu)
-                return
-        
-        # Fallback placeholder
-        alt = img_info.get('alt', 'image')
-        self.text_widget.insert(tk.END, f"\n[🖼️ {alt}]\n\n", "image_placeholder")
-
-    def _set_image_prop(self, info, prop, val):
-        """Update an image property in the canonical markdown text."""
-        full_match = info.get('full_match', '')
-        if not full_match or not self.on_content_change:
-            return
-        m = re.match(r'!\[([^\]]*)\]\(([^)]+)\)', full_match)
-        if not m:
-            return
-        meta_str = m.group(1)
-        path = m.group(2)
-        parts = meta_str.split('|')
-        base_alt = parts[0].strip()
-        params = {}
-        for p in parts[1:]:
-            if '=' in p:
-                k, v = p.split('=', 1)
-                params[k.strip().lower()] = v.strip()
-
-        if val is None:
-            params.pop(prop, None)
-        else:
-            params[prop] = str(val)
-
-        new_parts = [base_alt]
-        for k, v in params.items():
-            new_parts.append(f"{k}={v}")
-        new_match = f"![{'|'.join(new_parts)}]({path})"
-
-        self.on_content_change(full_match, new_match)
-
-    def _prompt_image_caption(self, info):
-        """Prompt user for a figure caption and update the markdown."""
-        curr_cap = info.get('caption') or info.get('alt', '')
-        from tkinter import simpledialog
-        new_cap = simpledialog.askstring("Figure Caption", "Enter figure caption:", initialvalue=curr_cap, parent=self)
-        if new_cap is not None:
-            self._set_image_prop(info, 'caption', new_cap.strip())
+        fig_widget = VisualFigureWidget(
+            self.text_widget,
+            on_change_callback=lambda old, new: self.on_content_change(old, new) if self.on_content_change else None,
+            raw_match=raw_match,
+            img_info=img_info,
+            image_handler=self.image_handler,
+            is_dark=is_dark,
+            visual_font=font_family,
+            visual_font_size=font_size,
+            content_width=self.content_width_px()
+        )
+        self.text_widget.insert(tk.END, '\n')
+        self.text_widget.window_create(tk.END, window=fig_widget, padx=self._s(6), pady=self._s(8))
+        self.text_widget.insert(tk.END, '\n\n')
 
     
     def _on_image_click(self, event):
@@ -2599,10 +2696,13 @@ class DocumentTab(ttk.Frame):
         # Document state
         self.file_path = None
         self.is_modified = False
-        self.current_mode = "source"
+        self.current_mode = "visual"
         self.word_wrap = True
         self.zoom = 1.0
         self.snapshots = []
+        self._embedded_windows = []
+        self._updating_from_widget = False
+        self._last_active_line = None
         
         desk_bg = theme.get('desk_bg', '#d9dce1')
         
@@ -2617,22 +2717,23 @@ class DocumentTab(ttk.Frame):
             undo=True,
             padx=15,
             pady=12,
-            bg=theme['source_bg'],
-            fg=theme['source_fg'],
-            insertbackground=theme['source_fg'],
+            bg=theme.get('visual_bg', '#ffffff'),
+            fg=theme.get('visual_fg', '#1a1a1a'),
+            insertbackground=theme.get('visual_fg', '#1a1a1a'),
             insertwidth=2,
             selectbackground="#b3d9ff",
             selectforeground="#000000",
             inactiveselectbackground="#b3d9ff",
-            spacing1=1,
-            spacing3=1,
+            spacing1=2,
+            spacing2=3,
+            spacing3=6,
         )
         self.source_page.attach_text(self.source_editor)
         self.source_page.pack(fill=tk.BOTH, expand=True)
         self._setup_syntax_tags()
         self.source_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Visual mode viewer
+        # Visual mode viewer (retained for backward compatibility and image handler)
         self.visual_frame = ttk.Frame(self)
         self.visual_viewer = MarkdownVisualWidget(
             self.visual_frame,
@@ -2643,7 +2744,7 @@ class DocumentTab(ttk.Frame):
         self.visual_viewer.apply_theme(theme)
         self.apply_page_settings()
         
-        # Setup modification tracking, Ctrl+Click navigation, autocomplete, and table Tab navigation
+        # Setup modification tracking, Ctrl+Click navigation, autocomplete, active line elision, and table Tab navigation
         self._ac_job = None
         self._ac_popup = None
         self._ac_listbox = None
@@ -2651,6 +2752,8 @@ class DocumentTab(ttk.Frame):
         self.source_editor.bind("<<Modified>>", self._on_text_modified)
         self.source_editor.bind("<Control-Button-1>", self._on_source_ctrl_click)
         self.source_editor.bind("<KeyRelease>", self._on_autocomplete_key_release, add='+')
+        self.source_editor.bind("<KeyRelease>", self._update_active_line_elision, add='+')
+        self.source_editor.bind("<ButtonRelease-1>", self._update_active_line_elision, add='+')
         self.source_editor.bind("<Down>", self._on_ac_down)
         self.source_editor.bind("<Up>", self._on_ac_up)
         self.source_editor.bind("<Return>", self._on_ac_return)
@@ -2708,15 +2811,202 @@ class DocumentTab(ttk.Frame):
             if self.on_modified:
                 self.on_modified()
     
-    def _on_visual_edit(self, old_or_new, new_text=None):
+    def clear_embedded_widgets(self):
+        """Remove any embedded visual table/figure widgets from source_editor without polluting undo stack."""
+        if not getattr(self, '_embedded_windows', None):
+            return
+        prev_undo = self.source_editor.cget('undo')
+        self.source_editor.config(undo=False)
+        try:
+            for win in list(self._embedded_windows):
+                try:
+                    idx = self.source_editor.index(str(win))
+                    self.source_editor.delete(idx)
+                except tk.TclError:
+                    pass
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+            self._embedded_windows.clear()
+        finally:
+            self.source_editor.config(undo=prev_undo)
+
+    def _on_embedded_block_edit(self, old_text, new_text):
+        """Handle cell edits, structural changes, or figure edits from embedded widgets."""
+        self._updating_from_widget = True
+        try:
+            pos = self.source_editor.search(old_text, "1.0", tk.END)
+            if pos:
+                end_pos = f"{pos} + {len(old_text)}c"
+                self.source_editor.delete(pos, end_pos)
+                self.source_editor.insert(pos, new_text)
+                new_end_pos = f"{pos} + {len(new_text)}c"
+                self.source_editor.tag_add("syn_block_elide", pos, new_end_pos)
+                self.is_modified = True
+                if self.on_modified:
+                    self.on_modified()
+                if self.on_content_change_callback:
+                    self.on_content_change_callback(self.get_content())
+        finally:
+            self._updating_from_widget = False
+
+    def _render_embedded_blocks(self):
+        """Embed interactive VisualTableWidget and VisualFigureWidget for tables and images in visual mode."""
+        if self.current_mode != "visual" or getattr(self, '_updating_from_widget', False):
+            return
+
+        self.clear_embedded_widgets()
+
+        content = self.source_editor.get("1.0", tk.END)
+        lines = content.split('\n')
+        dark = _is_dark_color(self.theme.get('visual_bg', '#ffffff'))
+        font_family = self.theme.get('visual_font') or VISUAL_FONT or SANS_FONT
+        font_size = self.theme.get('visual_font_size', 11)
+        content_w = getattr(self.source_page, 'content_width', 600)
+
+        in_table = False
+        table_lines = []
+        table_start_line = 0
+
+        for lineno, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if stripped.startswith('|') and stripped.endswith('|'):
+                if not in_table:
+                    in_table = True
+                    table_lines = [stripped]
+                    table_start_line = lineno
+                else:
+                    table_lines.append(stripped)
+            else:
+                if in_table:
+                    if any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl) for tl in table_lines):
+                        end_line = lineno - 1
+                        self.source_editor.tag_add("syn_block_elide", f"{table_start_line}.0", f"{end_line}.end")
+                        tbl_widget = VisualTableWidget(
+                            self.source_editor,
+                            on_change_callback=self._on_embedded_block_edit,
+                            table_lines=table_lines,
+                            is_dark=dark,
+                            visual_font=font_family,
+                            visual_font_size=font_size,
+                            content_width=content_w
+                        )
+                        self.source_editor.window_create(f"{table_start_line}.0", window=tbl_widget)
+                        self._embedded_windows.append(tbl_widget)
+                    in_table = False
+                    table_lines = []
+
+            m_img = re.match(r'^\s*(!\[([^\]]*)\]\(([^)]+)\))\s*$', line)
+            if m_img and not in_table:
+                raw_match = m_img.group(1)
+                alt_meta = m_img.group(2)
+                img_path = m_img.group(3)
+                img_info = self.visual_viewer.image_handler._parse_extended_alt(alt_meta)
+                img_info['path'] = img_path
+                img_info['type'] = 'file'
+                img_info['full_match'] = raw_match
+
+                self.source_editor.tag_add("syn_block_elide", f"{lineno}.0", f"{lineno}.end")
+                fig_widget = VisualFigureWidget(
+                    self.source_editor,
+                    on_change_callback=self._on_embedded_block_edit,
+                    raw_match=raw_match,
+                    img_info=img_info,
+                    image_handler=self.visual_viewer.image_handler,
+                    is_dark=dark,
+                    visual_font=font_family,
+                    visual_font_size=font_size,
+                    content_width=content_w
+                )
+                self.source_editor.window_create(f"{lineno}.0", window=fig_widget)
+                self._embedded_windows.append(fig_widget)
+
+        if in_table and any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl) for tl in table_lines):
+            end_line = len(lines)
+            self.source_editor.tag_add("syn_block_elide", f"{table_start_line}.0", f"{end_line}.end")
+            tbl_widget = VisualTableWidget(
+                self.source_editor,
+                on_change_callback=self._on_embedded_block_edit,
+                table_lines=table_lines,
+                is_dark=dark,
+                visual_font=font_family,
+                visual_font_size=font_size,
+                content_width=content_w
+            )
+            self.source_editor.window_create(f"{table_start_line}.0", window=tbl_widget)
+            self._embedded_windows.append(tbl_widget)
+
+    def _update_active_line_elision(self, event=None):
+        """Reveal syntax delimiters on the active cursor line and elide them on other lines in visual mode."""
+        if self.current_mode != "visual":
+            return
+        try:
+            curr_line = self.source_editor.index(tk.INSERT).split('.')[0]
+            if getattr(self, '_last_active_line', None) != curr_line:
+                old_line = getattr(self, '_last_active_line', None)
+                self._last_active_line = curr_line
+                if old_line:
+                    line_start = f'{old_line}.0'
+                    line_end = f'{old_line}.end'
+                    line_text = self.source_editor.get(line_start, line_end)
+                    h_m = re.match(r'^(#{1,6}\s+)', line_text)
+                    if h_m:
+                        self.source_editor.tag_add('syn_delimiter', line_start, f'{old_line}.{len(h_m.group(1))}')
+                    bq_m = re.match(r'^(>\s?)', line_text)
+                    if bq_m:
+                        self.source_editor.tag_add('syn_delimiter', line_start, f'{old_line}.{len(bq_m.group(1))}')
+                    for m in re.finditer(r'(\*\*\*|___)(.+?)\1', line_text):
+                        p_len = len(m.group(1))
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start()}', f'{old_line}.{m.start() + p_len}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.end() - p_len}', f'{old_line}.{m.end()}')
+                    for m in re.finditer(r'(?<!\*)\*\*([^\*\n]+?)\*\*(?!\*)', line_text):
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start()}', f'{old_line}.{m.start() + 2}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.end() - 2}', f'{old_line}.{m.end()}')
+                    for m in re.finditer(r'(?<!\*)\*([^\*\n]+?)\*(?!\*)', line_text):
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start()}', f'{old_line}.{m.start() + 1}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.end() - 1}', f'{old_line}.{m.end()}')
+                    for m in re.finditer(r'==([^=\n]+)==', line_text):
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start()}', f'{old_line}.{m.start() + 2}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.end() - 2}', f'{old_line}.{m.end()}')
+                    for m in re.finditer(r'`([^`\n]+)`', line_text):
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start()}', f'{old_line}.{m.start() + 1}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.end() - 1}', f'{old_line}.{m.end()}')
+                    for m in re.finditer(r'(?<!!)(\[)([^\]\n]+)(\])\(([^\)\n]+)\)', line_text):
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start(1)}', f'{old_line}.{m.end(1)}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start(3)}', f'{old_line}.{m.end(4)}')
+
+                self.source_editor.tag_remove('syn_delimiter', f'{curr_line}.0', f'{curr_line}.end')
+        except Exception:
+            pass
+
+    def switch_mode(self, mode, theme=None):
+        """Switch between unified visual mode and raw source mode."""
+        if mode == self.current_mode:
+            return
+        self.current_mode = mode
+        if mode == "source":
+            self.clear_embedded_widgets()
+        if theme:
+            self.apply_theme(theme)
+        else:
+            self.apply_theme(self.theme)
+
+    def _on_visual_edit(self, old_or_new, new_text=None, rerender=False):
         """Handle visual editor changes: replaces old_text with new_text in canonical source."""
         if new_text is not None:
             old_text = old_or_new
             curr = self.source_editor.get("1.0", "end-1c")
             if old_text in curr:
-                updated = curr.replace(old_text, new_text, 1)
-                self.source_editor.delete("1.0", tk.END)
-                self.source_editor.insert("1.0", updated)
+                pos = self.source_editor.search(old_text, "1.0", tk.END)
+                if pos:
+                    end_pos = f"{pos} + {len(old_text)}c"
+                    self.source_editor.delete(pos, end_pos)
+                    self.source_editor.insert(pos, new_text)
+                else:
+                    updated = curr.replace(old_text, new_text, 1)
+                    self.source_editor.delete("1.0", tk.END)
+                    self.source_editor.insert("1.0", updated)
                 self.is_modified = True
                 if self.on_modified:
                     self.on_modified()
@@ -2727,17 +3017,19 @@ class DocumentTab(ttk.Frame):
                 self.on_modified()
         if self.on_content_change_callback:
             self.on_content_change_callback(self.get_content())
-    
+        if rerender:
+            self._apply_syntax_highlighting()
+
     def get_display_name(self):
         """Get display title for tab"""
         if self.file_path:
             return os.path.basename(self.file_path)
         return "Untitled"
-    
+
     def get_content(self):
         """Get canonical document content from source editor"""
-        return self.source_editor.get(1.0, tk.END).rstrip()
-    
+        return self.source_editor.get("1.0", "end-1c").replace("\ufffc", "").rstrip()
+
     def set_content(self, content):
         """Set document content and refresh visual viewer if active"""
         self.source_editor.delete(1.0, tk.END)
@@ -2745,34 +3037,67 @@ class DocumentTab(ttk.Frame):
         self.source_editor.edit_modified(False)
         self.is_modified = False
         if self.current_mode == "visual":
-            self.visual_viewer.set_content(content)
-    
+            self._apply_syntax_highlighting()
+        self.visual_viewer.set_content(content)
+
     def apply_theme(self, theme):
         """Apply theme to this tab"""
         self.theme = theme
-        self.source_editor.config(
-            bg=theme['source_bg'],
-            fg=theme['source_fg'],
-            insertbackground=theme['source_fg'],
-            font=self._source_font()
-        )
-        self.source_page.set_colors(theme.get('desk_bg', '#d9dce1'), theme['source_bg'])
+        is_visual = (self.current_mode == "visual")
+        if is_visual:
+            v_font = theme.get('visual_font') or VISUAL_FONT or SANS_FONT or 'Segoe UI'
+            v_sz = theme.get('visual_font_size', 11)
+            px = max(4, round(v_sz * self.source_page.dpi() / 72.0 * self.zoom))
+            self.source_editor.config(
+                bg=theme.get('visual_bg', '#ffffff'),
+                fg=theme.get('visual_fg', '#1a1a1a'),
+                insertbackground=theme.get('visual_fg', '#1a1a1a'),
+                font=(v_font, -px),
+                spacing1=2,
+                spacing2=3,
+                spacing3=6,
+            )
+            self.source_page.set_colors(theme.get('desk_bg', '#d9dce1'), theme.get('visual_bg', '#ffffff'))
+        else:
+            self.source_editor.config(
+                bg=theme['source_bg'],
+                fg=theme['source_fg'],
+                insertbackground=theme['source_fg'],
+                font=self._source_font(),
+                spacing1=1,
+                spacing2=2,
+                spacing3=2,
+            )
+            self.source_page.set_colors(theme.get('desk_bg', '#d9dce1'), theme['source_bg'])
+
         self._setup_syntax_tags()
         self._apply_syntax_highlighting()
         self.visual_viewer.apply_theme(theme)
         self.apply_page_settings()
 
     def _setup_syntax_tags(self):
-        """Configure colour/font tags for source-mode syntax highlighting (zoom aware)."""
-        sz = self.theme.get('source_font_size', 12)
-        mono = self.theme.get('source_font') or MONO_FONT
-        dpi_k = self.source_page.dpi() / 72.0 * self.zoom
+        """Configure colour/font tags for visual or source mode syntax highlighting (zoom aware)."""
+        is_visual = (self.current_mode == "visual")
+        editor = self.source_editor
 
+        if is_visual:
+            sz = self.theme.get('visual_font_size', 11)
+            font_family = self.theme.get('visual_font') or VISUAL_FONT or SANS_FONT or 'Segoe UI'
+            bg_col = self.theme.get('visual_bg', '#ffffff')
+            fg_col = self.theme.get('visual_fg', '#1a1a1a')
+        else:
+            sz = self.theme.get('source_font_size', 11)
+            font_family = self.theme.get('source_font') or MONO_FONT
+            bg_col = self.theme.get('source_bg', '#ffffff')
+            fg_col = self.theme.get('source_fg', '#1a1a1a')
+
+        dpi_k = self.source_page.dpi() / 72.0 * self.zoom
         def px(pt):
             return -max(4, round(pt * dpi_k))
 
         k96 = self.source_page.dpi() / 96.0 * self.zoom
-        dark = _is_dark_color(self.theme.get('source_bg', '#ffffff'))
+        dark = _is_dark_color(bg_col)
+
         if dark:
             heads = ('#f8fafc', '#e2e8f0', '#cbd5e1', '#cbd5e1')
             bold_fg, italic_fg, link_fg, quote_fg, hr_fg = '#ff7b72', '#d2a8ff', '#79c0ff', '#9ca3af', '#6b7280'
@@ -2783,26 +3108,43 @@ class DocumentTab(ttk.Frame):
             bold_fg, italic_fg, link_fg, quote_fg, hr_fg = '#d73a49', '#6f42c1', '#0066cc', '#6c757d', '#aaaaaa'
             code_bg, code_fg = '#f0f0f0', '#c7254e'
             hl_bg, hl_fg = '#fef08a', '#1a1a1a'
-        editor = self.source_editor
+
+        # Delimiters and block elision tags
+        editor.tag_configure('syn_delimiter', elide=is_visual, foreground='#94a3b8' if dark else '#94a3b8')
+        editor.tag_configure('syn_block_elide', elide=is_visual)
+
         # Headers
-        editor.tag_configure('syn_h1', font=(mono, px(sz + 8), 'bold'), foreground=heads[0])
-        editor.tag_configure('syn_h2', font=(mono, px(sz + 5), 'bold'), foreground=heads[1])
-        editor.tag_configure('syn_h3', font=(mono, px(sz + 3), 'bold'), foreground=heads[2])
-        editor.tag_configure('syn_h4', font=(mono, px(sz + 1), 'bold'), foreground=heads[3])
-        # Inline
-        editor.tag_configure('syn_bold',        foreground=bold_fg)
-        editor.tag_configure('syn_italic',      foreground=italic_fg)
-        editor.tag_configure('syn_highlight',   background=hl_bg, foreground=hl_fg)
-        editor.tag_configure('syn_code_inline', font=(mono, px(sz)), background=code_bg, foreground=code_fg)
-        editor.tag_configure('syn_code_block',  font=(mono, px(sz)), background='#282c34', foreground='#abb2bf',
-                             lmargin1=int(20 * k96))
-        editor.tag_configure('syn_link',        foreground=link_fg, underline=True)
+        h_font = font_family if is_visual else (self.theme.get('source_font') or MONO_FONT)
+        editor.tag_configure('syn_h1', font=(h_font, px(sz + (10 if is_visual else 8)), 'bold'),
+                             foreground=heads[0], spacing1=8 if is_visual else 1, spacing3=4 if is_visual else 1)
+        editor.tag_configure('syn_h2', font=(h_font, px(sz + (7 if is_visual else 5)), 'bold'),
+                             foreground=heads[1], spacing1=6 if is_visual else 1, spacing3=3 if is_visual else 1)
+        editor.tag_configure('syn_h3', font=(h_font, px(sz + (4 if is_visual else 3)), 'bold'),
+                             foreground=heads[2], spacing1=4 if is_visual else 1, spacing3=2 if is_visual else 1)
+        editor.tag_configure('syn_h4', font=(h_font, px(sz + (2 if is_visual else 1)), 'bold'),
+                             foreground=heads[3], spacing1=3 if is_visual else 1, spacing3=2 if is_visual else 1)
+
+        # Inline styles
+        b_font = font_family
+        editor.tag_configure('syn_bold', font=(b_font, px(sz), 'bold'), foreground=bold_fg)
+        editor.tag_configure('syn_italic', font=(b_font, px(sz), 'italic'), foreground=italic_fg)
+        editor.tag_configure('syn_bold_italic', font=(b_font, px(sz), 'bold italic'), foreground=bold_fg)
+        editor.tag_configure('syn_highlight', background=hl_bg, foreground=hl_fg)
+
+        mono_font = self.theme.get('source_font') or MONO_FONT
+        editor.tag_configure('syn_code_inline', font=(mono_font, px(sz * 0.95)), background=code_bg, foreground=code_fg)
+        editor.tag_configure('syn_code_block', font=(mono_font, px(sz * 0.95)), background='#282c34', foreground='#abb2bf',
+                             lmargin1=int(20 * k96), lmargin2=int(20 * k96), rmargin=int(20 * k96),
+                             spacing1=4, spacing3=4)
+        editor.tag_configure('syn_link', foreground=link_fg, underline=True)
         anc_fg = '#c084fc' if dark else '#7c3aed'
-        editor.tag_configure('syn_anchor',      foreground=anc_fg, font=(mono, px(sz), 'bold'))
-        editor.tag_configure('syn_footnote',    foreground='#38bdf8' if dark else '#0284c7', font=(mono, px(sz), 'bold'))
-        editor.tag_configure('syn_math',        foreground='#5eead4' if dark else '#0f766e', background=code_bg, font=(mono, px(sz), 'italic'))
-        editor.tag_configure('syn_flash',       background=hl_bg, foreground=hl_fg)
-        bq_font = self.theme.get('blockquote_font') or mono
+        editor.tag_configure('syn_anchor', foreground=anc_fg, font=(b_font, px(sz), 'bold'))
+        editor.tag_configure('syn_footnote', foreground='#38bdf8' if dark else '#0284c7', font=(b_font, px(sz), 'bold'))
+        math_font = "Cambria Math" if os.name == "nt" else font_family
+        editor.tag_configure('syn_math', foreground='#5eead4' if dark else '#0f766e', background=code_bg, font=(math_font, px(sz), 'italic'))
+        editor.tag_configure('syn_flash', background=hl_bg, foreground=hl_fg)
+
+        bq_font = self.theme.get('blockquote_font') or b_font
         bq_size_val = self.theme.get('blockquote_size')
         try:
             bq_sz = int(bq_size_val) if bq_size_val and int(bq_size_val) > 0 else sz
@@ -2826,20 +3168,22 @@ class DocumentTab(ttk.Frame):
             'lmargin2': int(max(20, bq_pad + 12) * k96),
             'rmargin': int(max(12, bq_pad) * k96),
             'justify': bq_justify,
+            'spacing1': 4 if is_visual else 1,
+            'spacing3': 4 if is_visual else 1,
         }
         if bq_bg:
             bq_kwargs['background'] = bq_bg
-        editor.tag_configure('syn_blockquote',  **bq_kwargs)
-        editor.tag_configure('syn_list_marker', font=(mono, px(sz), 'bold'), foreground=link_fg)
-        editor.tag_configure('syn_hr',          foreground=hr_fg)
+        editor.tag_configure('syn_blockquote', **bq_kwargs)
+        editor.tag_configure('syn_list_marker', font=(b_font, px(sz), 'bold'), foreground=link_fg)
+        editor.tag_configure('syn_hr', foreground=hr_fg)
 
     def _apply_syntax_highlighting(self):
-        """Apply markdown syntax highlighting tags to the source editor."""
+        """Apply markdown syntax highlighting and visual elision/widgets to the source editor."""
         editor = self.source_editor
         for tag in ('syn_h1', 'syn_h2', 'syn_h3', 'syn_h4', 'syn_bold', 'syn_italic',
-                    'syn_highlight', 'syn_code_inline', 'syn_code_block', 'syn_link',
-                    'syn_anchor', 'syn_footnote', 'syn_math', 'syn_flash', 'syn_blockquote',
-                    'syn_list_marker', 'syn_hr'):
+                    'syn_bold_italic', 'syn_highlight', 'syn_code_inline', 'syn_code_block',
+                    'syn_link', 'syn_anchor', 'syn_footnote', 'syn_math', 'syn_flash',
+                    'syn_blockquote', 'syn_list_marker', 'syn_hr', 'syn_delimiter', 'syn_block_elide'):
             editor.tag_remove(tag, '1.0', tk.END)
 
         content = editor.get('1.0', tk.END)
@@ -2859,37 +3203,66 @@ class DocumentTab(ttk.Frame):
                 editor.tag_add('syn_code_block', line_start, line_end)
                 continue
 
-            if   re.match(r'^# [^#]',    line): editor.tag_add('syn_h1', line_start, line_end)
-            elif re.match(r'^## [^#]',   line): editor.tag_add('syn_h2', line_start, line_end)
-            elif re.match(r'^### [^#]',  line): editor.tag_add('syn_h3', line_start, line_end)
-            elif re.match(r'^#{4,6} ',   line): editor.tag_add('syn_h4', line_start, line_end)
+            h_match = re.match(r'^(#{1,6}\s+)(.*)$', line)
+            if h_match:
+                pfx_len = len(h_match.group(1))
+                h_lvl = min(len(h_match.group(1).strip()), 4)
+                editor.tag_add('syn_delimiter', line_start, f'{lineno}.{pfx_len}')
+                editor.tag_add(f'syn_h{h_lvl}', f'{lineno}.{pfx_len}', line_end)
             elif line.strip() in ('---', '***', '___'):
                 editor.tag_add('syn_hr', line_start, line_end)
             elif line.startswith('>'):
+                bq_match = re.match(r'^(>\s?)(.*)$', line)
+                if bq_match:
+                    pfx_len = len(bq_match.group(1))
+                    editor.tag_add('syn_delimiter', line_start, f'{lineno}.{pfx_len}')
                 editor.tag_add('syn_blockquote', line_start, line_end)
             else:
                 m = re.match(r'^(\s*)([-*+]|\d+\.)\s', line)
                 if m:
                     editor.tag_add('syn_list_marker', line_start, f'{lineno}.{m.end()}')
 
-            for m in re.finditer(r'(\*\*|__)(.+?)\1', line):
-                editor.tag_add('syn_bold',    f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
-            for m in re.finditer(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', line):
-                editor.tag_add('syn_italic',  f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'(\*\*\*|___)(.+?)\1', line):
+                p_len = len(m.group(1))
+                editor.tag_add('syn_delimiter', f'{lineno}.{m.start()}', f'{lineno}.{m.start() + p_len}')
+                editor.tag_add('syn_bold_italic', f'{lineno}.{m.start() + p_len}', f'{lineno}.{m.end() - p_len}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{m.end() - p_len}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'(?<!\*)\*\*([^\*\n]+?)\*\*(?!\*)', line):
+                editor.tag_add('syn_delimiter', f'{lineno}.{m.start()}', f'{lineno}.{m.start() + 2}')
+                editor.tag_add('syn_bold', f'{lineno}.{m.start() + 2}', f'{lineno}.{m.end() - 2}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{m.end() - 2}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'(?<!\*)\*([^\*\n]+?)\*(?!\*)', line):
+                editor.tag_add('syn_delimiter', f'{lineno}.{m.start()}', f'{lineno}.{m.start() + 1}')
+                editor.tag_add('syn_italic', f'{lineno}.{m.start() + 1}', f'{lineno}.{m.end() - 1}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{m.end() - 1}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'==([^=\n]+)==', line):
-                editor.tag_add('syn_highlight', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
-            for m in re.finditer(r'`([^`]+)`', line):
-                editor.tag_add('syn_code_inline', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{m.start()}', f'{lineno}.{m.start() + 2}')
+                editor.tag_add('syn_highlight', f'{lineno}.{m.start() + 2}', f'{lineno}.{m.end() - 2}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{m.end() - 2}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'`([^`\n]+)`', line):
+                editor.tag_add('syn_delimiter', f'{lineno}.{m.start()}', f'{lineno}.{m.start() + 1}')
+                editor.tag_add('syn_code_inline', f'{lineno}.{m.start() + 1}', f'{lineno}.{m.end() - 1}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{m.end() - 1}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'\$\$(.+?)\$\$|(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)', line):
                 editor.tag_add('syn_math', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'\[\^([^\]\n]+)\]', line):
                 editor.tag_add('syn_footnote', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', line):
-                editor.tag_add('syn_anchor',  f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+                editor.tag_add('syn_anchor', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
             for m in re.finditer(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', line):
-                editor.tag_add('syn_link',    f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
-            for m in re.finditer(r'\[([^\]]+)\]\([^\)]+\)', line):
-                editor.tag_add('syn_link',    f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+                editor.tag_add('syn_link', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
+            for m in re.finditer(r'(?<!!)(\[)([^\]\n]+)(\])\(([^\)\n]+)\)', line):
+                editor.tag_add('syn_delimiter', f'{lineno}.{m.start(1)}', f'{lineno}.{m.end(1)}')
+                editor.tag_add('syn_link', f'{lineno}.{m.start(2)}', f'{lineno}.{m.end(2)}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{m.start(3)}', f'{lineno}.{m.end(4)}')
+
+        if self.current_mode == "visual":
+            try:
+                curr_line = editor.index(tk.INSERT).split('.')[0]
+                editor.tag_remove('syn_delimiter', f'{curr_line}.0', f'{curr_line}.end')
+            except Exception:
+                pass
+            self._render_embedded_blocks()
 
     def _on_source_ctrl_click(self, event):
         """Handle Ctrl+Click on links, anchor references, or footnotes in source mode to jump to target."""
@@ -3756,8 +4129,6 @@ class DockedFindReplaceBar(ttk.Frame):
         tab = self.notepad.current_tab
         if not tab:
             return None
-        if tab.current_mode == "visual":
-            return tab.visual_viewer.text_widget
         return tab.source_editor
 
     def _ensure_highlight_tags(self, widget):
@@ -3896,10 +4267,6 @@ class DockedFindReplaceBar(ttk.Frame):
         tab = self.notepad.current_tab
         if not tab:
             return "break"
-        if tab.current_mode == "visual":
-            # Switch to source mode or replace directly in canonical source
-            self.replace_all()
-            return "break"
         if not self._matches or self._active_idx < 0:
             self._on_query_change()
             return "break"
@@ -4035,6 +4402,8 @@ class MarkdownNotepad(tk.Tk):
         self.page_size_var = tk.StringVar(value=self.theme.get('page_size', 'Letter'))
         self.page_margin_var = tk.StringVar(value=self.theme.get('page_margin', 'Normal'))
         self.typewriter_var = tk.BooleanVar(value=bool(self.theme.get('typewriter_scrolling', False)))
+        self.source_view_var = tk.BooleanVar(value=False)
+        self.mode_var = tk.StringVar(value="visual")
         self._setup_ui()
         self._setup_bindings()
         self._restore_session()
@@ -4439,8 +4808,6 @@ class MarkdownNotepad(tk.Tk):
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
         
         # 2. Unified View / Source View Checkbox
-        self.source_view_var = tk.BooleanVar(value=False)
-        self.mode_var = tk.StringVar(value="visual")
         mode_frame = ttk.Frame(toolbar)
         mode_frame.pack(side=tk.LEFT, padx=1)
         
@@ -4604,6 +4971,8 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-z>", self._doc_shortcut(self.undo))
         self.bind("<Control-y>", self._doc_shortcut(self.redo))
         self.bind("<Control-a>", self._doc_shortcut(self.select_all))
+        self.bind("<Control-v>", self._doc_shortcut(self.paste))
+        self.bind("<Control-V>", self._doc_shortcut(self.paste))
         self.bind("<Control-f>", lambda e: self.find_text())
         self.bind("<Control-h>", lambda e: self.find_replace())
         self.bind("<Control-g>", lambda e: self.goto_line())
@@ -4685,15 +5054,13 @@ class MarkdownNotepad(tk.Tk):
     def _jump_to_line(self, lineno: int):
         if not self.current_tab:
             return
-        if self.current_tab.current_mode == 'source':
-            editor = self.current_tab.source_editor
+        editor = self.current_tab.source_editor
+        try:
             editor.see(f'{lineno}.0')
             editor.mark_set(tk.INSERT, f'{lineno}.0')
             editor.focus_set()
-        else:
-            content = self.current_tab.get_content()
-            total   = max(content.count('\n') + 1, 1)
-            self.current_tab.visual_viewer.text_widget.yview_moveto((lineno - 1) / total)
+        except Exception:
+            pass
 
     def _toggle_outline_panel(self):
         if self.outline_visible:
@@ -4773,12 +5140,9 @@ class MarkdownNotepad(tk.Tk):
                     
                     # Show correct mode
                     if tab_state.current_mode == "visual":
-                        tab.visual_frame.pack(fill=tk.BOTH, expand=True)
-                        tab.source_frame.pack_forget()
-                        tab.visual_viewer.set_content(tab.get_content())
+                        tab.switch_mode("visual", self.theme)
                     else:
-                        tab.source_frame.pack(fill=tk.BOTH, expand=True)
-                        tab.visual_frame.pack_forget()
+                        tab.switch_mode("source", self.theme)
                 
                 # Select the active tab
                 if state.active_tab_index < len(self.tabs):
@@ -5041,8 +5405,8 @@ class MarkdownNotepad(tk.Tk):
         except tk.TclError:
             pass
         
-        # Formatting actions (source mode with selection)
-        if has_selection and self.current_tab and self.current_tab.current_mode == "source":
+        # Formatting actions
+        if has_selection and self.current_tab:
             menu.add_separator()
             menu.add_command(label="Bold", command=lambda: self._insert_format("**", "**"), accelerator="Ctrl+B")
             menu.add_command(label="Italic", command=lambda: self._insert_format("*", "*"), accelerator="Ctrl+I")
@@ -5211,9 +5575,9 @@ class MarkdownNotepad(tk.Tk):
         default_mode = "replace"
         if original_text is None or start_index is None:
             # Check if the user currently has text selected in the active editor
-            editor = self.current_tab.source_editor if self.current_tab.current_mode == "source" else self.current_tab.visual_viewer.text_widget
+            editor = self.current_tab.source_editor
             sel_text, sel_start, sel_end = self._get_selection_info(editor)
-            if sel_text and self.current_tab.current_mode == "source":
+            if sel_text:
                 original_text = sel_text
                 start_index = sel_start
                 end_index = sel_end
@@ -5803,22 +6167,12 @@ class MarkdownNotepad(tk.Tk):
         if not self.current_tab:
             return
 
-        try:
-            scroll_pos = self.current_tab.visual_viewer.text_widget.yview()[0]
-        except Exception:
-            scroll_pos = 0.0
-
-        self.current_tab.visual_frame.pack_forget()
-        self.current_tab.source_frame.pack(fill=tk.BOTH, expand=True)
-        self.current_tab.current_mode = "source"
+        self.current_tab.switch_mode("source", self.theme)
         self.source_view_var.set(True)
         self.mode_var.set("source")
-        self.mode_label.config(text="Source View")
+        if hasattr(self, 'mode_label'):
+            self.mode_label.config(text="Source View")
         self._set_format_buttons_enabled(True)
-        try:
-            self.current_tab.source_editor.yview_moveto(scroll_pos)
-        except Exception:
-            pass
         self.current_tab.source_editor.focus_set()
         if getattr(self, 'find_bar', None) and self.find_bar.is_visible:
             self.find_bar._on_query_change()
@@ -5829,27 +6183,13 @@ class MarkdownNotepad(tk.Tk):
         if not self.current_tab:
             return
 
-        try:
-            scroll_pos = self.current_tab.source_editor.yview()[0]
-        except Exception:
-            scroll_pos = 0.0
-
-        self.current_tab.source_frame.pack_forget()
-        self.current_tab.visual_frame.pack(fill=tk.BOTH, expand=True)
-        self.current_tab.current_mode = "visual"
+        self.current_tab.switch_mode("visual", self.theme)
         self.source_view_var.set(False)
         self.mode_var.set("visual")
-        self.mode_label.config(text="Visual View")
+        if hasattr(self, 'mode_label'):
+            self.mode_label.config(text="Visual View")
         self._set_format_buttons_enabled(True)
-        
-        self.update_idletasks()
-        content = self.current_tab.source_editor.get("1.0", tk.END).rstrip()
-        self.current_tab.visual_viewer.set_content(content)
-        try:
-            self.current_tab.visual_viewer.text_widget.yview_moveto(scroll_pos)
-        except Exception:
-            pass
-        self.current_tab.visual_viewer.text_widget.focus_set()
+        self.current_tab.source_editor.focus_set()
         if getattr(self, 'find_bar', None) and self.find_bar.is_visible:
             self.find_bar._on_query_change()
         self._set_status("Visual View — formatted document canvas")
@@ -5907,10 +6247,7 @@ class MarkdownNotepad(tk.Tk):
     def _focus_active_editor(self):
         if not self.current_tab:
             return
-        if self.current_tab.current_mode == "source":
-            self.current_tab.source_editor.focus_set()
-        else:
-            self.current_tab.visual_viewer.text_widget.focus_set()
+        self.current_tab.source_editor.focus_set()
 
     def _enter_focus_mode(self):
         """Enter distraction-free full screen: hide all chrome and show the same page widgets on a dark desk."""
@@ -6504,34 +6841,6 @@ class MarkdownNotepad(tk.Tk):
         editor = tab.source_editor
         p_len = len(prefix)
         s_len = len(suffix)
-
-        # Handle visual mode selection if present
-        if tab.current_mode == "visual":
-            try:
-                v_text = tab.visual_viewer.text_widget
-                if v_text.tag_ranges(tk.SEL):
-                    first = v_text.index(tk.SEL_FIRST)
-                    last = v_text.index(tk.SEL_LAST)
-                    selected = v_text.get(first, last)
-                    if selected:
-                        content = editor.get("1.0", tk.END)
-                        wrapped = f"{prefix}{selected}{suffix}"
-                        if wrapped in content:
-                            new_content = content.replace(wrapped, selected, 1)
-                            tab.set_content(new_content)
-                            tab.is_modified = True
-                            self._update_tab_title(tab)
-                            self._refresh_active_visual_view()
-                            return "break"
-                        elif selected in content:
-                            new_content = content.replace(selected, wrapped, 1)
-                            tab.set_content(new_content)
-                            tab.is_modified = True
-                            self._update_tab_title(tab)
-                            self._refresh_active_visual_view()
-                            return "break"
-            except Exception:
-                pass
         
         try:
             first = editor.index(tk.SEL_FIRST)
