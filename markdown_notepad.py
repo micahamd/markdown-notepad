@@ -1048,6 +1048,219 @@ def _latex_to_unicode(expr: str) -> str:
     return out
 
 
+# =============================================================================
+# Markdown Table & Spreadsheet Conversion Helpers
+# =============================================================================
+
+def format_markdown_table_lines(lines: List[str]) -> Tuple[List[str], List[str]]:
+    """Format, pad, and align Markdown pipe table lines. Returns (formatted_lines, col_alignments)."""
+    parsed_rows = []
+    sep_indices = set()
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith('|'):
+            s = s[1:]
+        if s.endswith('|'):
+            s = s[:-1]
+        cells = [c.strip() for c in s.split('|')]
+        if cells and all(re.match(r'^:?-+:?$', c) for c in cells if c):
+            sep_indices.add(len(parsed_rows))
+        parsed_rows.append(cells)
+
+    if not parsed_rows:
+        return lines, []
+
+    num_cols = max(len(r) for r in parsed_rows)
+    for r in parsed_rows:
+        while len(r) < num_cols:
+            r.append('')
+
+    col_alignments = ['left'] * num_cols
+    for sep_idx in sep_indices:
+        for c_idx, cell in enumerate(parsed_rows[sep_idx]):
+            c_str = cell.strip()
+            if c_str.startswith(':') and c_str.endswith(':'):
+                col_alignments[c_idx] = 'center'
+            elif c_str.endswith(':'):
+                col_alignments[c_idx] = 'right'
+            else:
+                col_alignments[c_idx] = 'left'
+
+    # If no separator row was in the input, synthesize one after row 0
+    if not sep_indices:
+        sep_row = []
+        for al in col_alignments:
+            if al == 'center':
+                sep_row.append(':---:')
+            elif al == 'right':
+                sep_row.append('---:')
+            else:
+                sep_row.append(':---')
+        parsed_rows.insert(1, sep_row)
+        sep_indices.add(1)
+
+    # Calculate column widths across all non-separator rows
+    col_widths = [3] * num_cols
+    for r_idx, row in enumerate(parsed_rows):
+        if r_idx in sep_indices:
+            continue
+        for c_idx in range(num_cols):
+            col_widths[c_idx] = max(col_widths[c_idx], len(row[c_idx]))
+
+    formatted_lines = []
+    for r_idx, row in enumerate(parsed_rows):
+        cells_out = []
+        if r_idx in sep_indices:
+            for c_idx in range(num_cols):
+                w = max(3, col_widths[c_idx])
+                al = col_alignments[c_idx]
+                if al == 'center':
+                    cells_out.append(':' + '-' * max(1, w - 2) + ':')
+                elif al == 'right':
+                    cells_out.append('-' * max(1, w - 1) + ':')
+                else:
+                    cells_out.append(':' + '-' * max(1, w - 1) if row[c_idx].startswith(':') else '-' * w)
+        else:
+            for c_idx in range(num_cols):
+                w = col_widths[c_idx]
+                val = row[c_idx]
+                al = col_alignments[c_idx]
+                if al == 'center':
+                    cells_out.append(val.center(w))
+                elif al == 'right':
+                    cells_out.append(val.rjust(w))
+                else:
+                    cells_out.append(val.ljust(w))
+        formatted_lines.append("| " + " | ".join(cells_out) + " |")
+
+    return formatted_lines, col_alignments
+
+
+def parse_spreadsheet_tsv_to_markdown(tsv_text: str) -> Optional[str]:
+    """Convert spreadsheet clipboard text (Excel, Google Sheets, Calc TSV) into a formatted Markdown table."""
+    if not tsv_text or '\t' not in tsv_text:
+        return None
+    lines = [ln for ln in tsv_text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    tab_count = sum(1 for ln in lines if '\t' in ln)
+    if tab_count < 2 and not (len(lines) == 1 and lines[0].count('\t') >= 2):
+        return None
+
+    import csv
+    import io
+    try:
+        reader = csv.reader(io.StringIO(tsv_text.strip()), delimiter='\t')
+        rows = []
+        for raw_row in reader:
+            cleaned_row = [re.sub(r'[\r\n]+', ' ', c).replace('|', '\\|').strip() for c in raw_row]
+            if any(cleaned_row):
+                rows.append(cleaned_row)
+        if not rows:
+            return None
+
+        max_cols = max(len(r) for r in rows)
+        while max_cols > 0 and all(len(r) <= max_cols - 1 or not r[max_cols - 1] for r in rows):
+            max_cols -= 1
+        if max_cols < 1:
+            return None
+
+        for r in rows:
+            while len(r) < max_cols:
+                r.append('')
+            if len(r) > max_cols:
+                del r[max_cols:]
+
+        col_align = []
+        num_pattern = re.compile(r'^[\$\€\£\¥]?\s*[-+]?\d[\d,]*(\.\d+)?\s*%?$')
+        for c in range(max_cols):
+            vals = [rows[r][c] for r in range(1 if len(rows) > 1 else 0, len(rows)) if rows[r][c]]
+            if vals and all(num_pattern.match(v) for v in vals):
+                col_align.append('---:')
+            else:
+                col_align.append(':---')
+
+        header = rows[0]
+        data = rows[1:] if len(rows) > 1 else []
+        table_lines = [
+            "| " + " | ".join(header) + " |",
+            "| " + " | ".join(col_align) + " |"
+        ]
+        for d in data:
+            table_lines.append("| " + " | ".join(d) + " |")
+
+        formatted, _ = format_markdown_table_lines(table_lines)
+        return "\n" + "\n".join(formatted) + "\n"
+    except Exception:
+        return None
+
+
+def parse_html_table_to_markdown(html_text: str) -> Optional[str]:
+    """Convert HTML <table> markup from clipboard into a clean Markdown table."""
+    if not html_text or '<table' not in html_text.lower() or '</table>' not in html_text.lower():
+        return None
+    try:
+        row_matches = re.findall(r'<tr[^>]*>(.*?)</tr>', html_text, re.IGNORECASE | re.DOTALL)
+        if not row_matches:
+            return None
+        rows = []
+        for r_html in row_matches:
+            cells = re.findall(r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>', r_html, re.IGNORECASE | re.DOTALL)
+            cleaned_cells = []
+            for c in cells:
+                c = re.sub(r'<(?:b|strong)[^>]*>(.*?)</(?:b|strong)>', r'**\1**', c, flags=re.IGNORECASE | re.DOTALL)
+                c = re.sub(r'<(?:i|em)[^>]*>(.*?)</(?:i|em)>', r'*\1*', c, flags=re.IGNORECASE | re.DOTALL)
+                c = re.sub(r'<(?:code)[^>]*>(.*?)</(?:code)>', r'`\1`', c, flags=re.IGNORECASE | re.DOTALL)
+                c = re.sub(r'<[^>]+>', '', c)
+                c = re.sub(r'[\r\n]+', ' ', c).replace('|', '\\|').strip()
+                cleaned_cells.append(c)
+            if any(cleaned_cells):
+                rows.append(cleaned_cells)
+        if not rows:
+            return None
+        num_cols = max(len(r) for r in rows)
+        if num_cols < 1:
+            return None
+        for r in rows:
+            while len(r) < num_cols:
+                r.append('')
+
+        num_pattern = re.compile(r'^[\$\€\£\¥]?\s*[-+]?\d[\d,]*(\.\d+)?\s*%?$')
+        col_align = []
+        for c in range(num_cols):
+            vals = [rows[r][c] for r in range(1 if len(rows) > 1 else 0, len(rows)) if rows[r][c]]
+            if vals and all(num_pattern.match(v) for v in vals):
+                col_align.append('---:')
+            else:
+                col_align.append(':---')
+
+        header = rows[0]
+        data = rows[1:] if len(rows) > 1 else []
+        table_lines = [
+            "| " + " | ".join(header) + " |",
+            "| " + " | ".join(col_align) + " |"
+        ]
+        for d in data:
+            table_lines.append("| " + " | ".join(d) + " |")
+        formatted, _ = format_markdown_table_lines(table_lines)
+        return "\n" + "\n".join(formatted) + "\n"
+    except Exception:
+        return None
+
+
+def format_existing_pipe_table_on_paste(text: str) -> Optional[str]:
+    """If clipboard text is already a Markdown pipe table, align and pad it cleanly."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) >= 2 and all(ln.startswith('|') and ln.endswith('|') for ln in lines):
+        if any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', ln) for ln in lines):
+            formatted, _ = format_markdown_table_lines(lines)
+            return "\n" + "\n".join(formatted) + "\n"
+    return None
+
+
+
 class MarkdownVisualWidget(tk.Frame):
     """
     A widget for rendering markdown visually with image support.
@@ -1623,39 +1836,56 @@ class MarkdownVisualWidget(tk.Frame):
         return False
 
     def _render_table(self, table_rows):
-        """Render a markdown table as a styled native grid frame inside the text widget"""
+        """Render a markdown table as an interactive, styled MS Word-like grid frame inside the text widget."""
         if not table_rows:
             return
-        
+
+        orig_table_md = list(table_rows)
         # Parse table structure
         parsed_rows = []
-        separator_idx = -1
-        
+        sep_indices = set()
         for i, row in enumerate(table_rows):
             cells = [c.strip() for c in row.split('|')]
             if cells and cells[0] == '':
                 cells = cells[1:]
             if cells and cells[-1] == '':
                 cells = cells[:-1]
-            
             if all(re.match(r'^[-:]+$', c) for c in cells if c):
-                separator_idx = i
-            else:
-                parsed_rows.append(cells)
-        
+                sep_indices.add(len(parsed_rows))
+            parsed_rows.append(cells)
+
         if not parsed_rows:
             return
-        
-        headers = parsed_rows[0]
-        data_rows = parsed_rows[1:]
+
         num_cols = max(len(row) for row in parsed_rows)
-        while len(headers) < num_cols:
-            headers.append('')
+        for r in parsed_rows:
+            while len(r) < num_cols:
+                r.append('')
+
+        # Determine column alignments
+        col_alignments = ['left'] * num_cols
+        for sep_idx in sep_indices:
+            for c_idx, cell in enumerate(parsed_rows[sep_idx]):
+                c_str = cell.strip()
+                if c_str.startswith(':') and c_str.endswith(':'):
+                    col_alignments[c_idx] = 'center'
+                elif c_str.endswith(':'):
+                    col_alignments[c_idx] = 'right'
+                else:
+                    col_alignments[c_idx] = 'left'
+
+        # Filter out separator rows for display and editing
+        non_sep_rows = [r for idx, r in enumerate(parsed_rows) if idx not in sep_indices]
+        if not non_sep_rows:
+            return
+
+        headers = non_sep_rows[0]
+        data_rows = non_sep_rows[1:] if len(non_sep_rows) > 1 else []
 
         # Theme-derived table colors
         bg_col = self.text_widget.cget('bg')
         is_dark = self._is_dark(bg_col)
-        
+
         tbl_border = "#475569" if is_dark else "#cbd5e1"
         header_bg = "#334155" if is_dark else "#f1f5f9"
         header_fg = "#f8fafc" if is_dark else "#0f172a"
@@ -1667,40 +1897,193 @@ class MarkdownVisualWidget(tk.Frame):
         font_size = self.current_theme.get('visual_font_size', 11) if self.current_theme else 11
         cell_font = (font_family, self._px(font_size * 0.95))
         head_font = (font_family, self._px(font_size * 0.95), "bold")
-        pad_x, pad_y = self._s(12), self._s(6)
-
-        # Keep the table inside the text column: wrap long cell text
-        window_pad = self._s(6)
-        avail = self.content_width_px() - 2 * window_pad - 2
-        wrap = max(60, avail // max(1, num_cols) - 2 * pad_x - 2)
+        pad_x, pad_y = self._s(8), self._s(4)
 
         table_frame = tk.Frame(self.text_widget, bg=tbl_border, bd=1, relief=tk.SOLID)
 
+        # Proportional column weights based on content length
+        col_weights = []
+        for c in range(num_cols):
+            w = len(headers[c]) if c < len(headers) else 3
+            for r in data_rows:
+                if c < len(r):
+                    w = max(w, len(r[c]))
+            col_weights.append(max(4, min(45, w)))
+        for col_idx, weight in enumerate(col_weights):
+            table_frame.grid_columnconfigure(col_idx, weight=weight)
+
+        anchor_map = {'left': 'w', 'center': 'center', 'right': 'e'}
+        justify_map = {'left': tk.LEFT, 'center': tk.CENTER, 'right': tk.RIGHT}
+
+        cell_entries = []
+
+        def _clean_for_display(val: str) -> str:
+            v = val.strip()
+            # Clean markdown bold/italic/code markers for display
+            v = re.sub(r'^\*\*(.*?)\*\*$', r'\1', v)
+            v = re.sub(r'^\*(.*?)\*$', r'\1', v)
+            v = re.sub(r'^`(.*?)`$', r'\1', v)
+            return v
+
         # Header row
+        header_row_entries = []
         for col_idx, h in enumerate(headers):
-            lbl = tk.Label(table_frame, text=h, font=head_font, wraplength=wrap,
-                           bg=header_bg, fg=header_fg, padx=pad_x, pady=pad_y + 1, anchor="w", justify=tk.LEFT)
-            lbl.grid(row=0, column=col_idx, sticky="nsew", padx=1, pady=1)
+            h_var = tk.StringVar(value=_clean_for_display(h))
+            entry = tk.Entry(
+                table_frame, textvariable=h_var, font=head_font,
+                bg=header_bg, fg=header_fg, relief=tk.FLAT, bd=0,
+                justify=justify_map.get(col_alignments[col_idx], tk.LEFT)
+            )
+            entry.grid(row=0, column=col_idx, sticky="nsew", padx=1, pady=1, ipady=pad_y)
+            entry.bind("<FocusOut>", lambda e, c=col_idx, v=h_var: self._on_table_cell_commit(orig_table_md, headers, col_alignments, data_rows, 0, c, v.get()))
+            entry.bind("<Return>", lambda e, c=col_idx, v=h_var: self._on_table_cell_commit(orig_table_md, headers, col_alignments, data_rows, 0, c, v.get()))
+            entry.bind("<Button-3>", lambda e, c=col_idx: self._show_table_context_menu(e, orig_table_md, headers, col_alignments, data_rows, 0, c))
+            header_row_entries.append(entry)
+        cell_entries.append(header_row_entries)
 
         # Data rows
         for row_idx, row in enumerate(data_rows):
             while len(row) < num_cols:
                 row.append('')
             c_bg = row_alt_bg if (row_idx % 2 == 1) else row_bg
+            row_entries = []
             for col_idx, cell in enumerate(row):
-                lbl = tk.Label(table_frame, text=cell, font=cell_font, wraplength=wrap,
-                               bg=c_bg, fg=cell_fg, padx=pad_x, pady=pad_y, anchor="w", justify=tk.LEFT)
-                lbl.grid(row=row_idx + 1, column=col_idx, sticky="nsew", padx=1, pady=1)
+                cell_var = tk.StringVar(value=_clean_for_display(cell))
+                entry = tk.Entry(
+                    table_frame, textvariable=cell_var, font=cell_font,
+                    bg=c_bg, fg=cell_fg, relief=tk.FLAT, bd=0,
+                    justify=justify_map.get(col_alignments[col_idx], tk.LEFT)
+                )
+                entry.grid(row=row_idx + 1, column=col_idx, sticky="nsew", padx=1, pady=1, ipady=pad_y)
+                entry.bind("<FocusOut>", lambda e, r=row_idx + 1, c=col_idx, v=cell_var: self._on_table_cell_commit(orig_table_md, headers, col_alignments, data_rows, r, c, v.get()))
+                entry.bind("<Return>", lambda e, r=row_idx + 1, c=col_idx, v=cell_var: self._on_table_cell_commit(orig_table_md, headers, col_alignments, data_rows, r, c, v.get()))
+                entry.bind("<Button-3>", lambda e, r=row_idx + 1, c=col_idx: self._show_table_context_menu(e, orig_table_md, headers, col_alignments, data_rows, r, c))
+                row_entries.append(entry)
+            cell_entries.append(row_entries)
 
-        for col_idx in range(num_cols):
-            table_frame.grid_columnconfigure(col_idx, weight=1)
+        # Connect Tab / Shift+Tab keyboard navigation across table cells
+        total_r = len(cell_entries)
+        for r in range(total_r):
+            for c in range(num_cols):
+                def _make_nav(curr_r, curr_c):
+                    def _nav_tab(e):
+                        if curr_c + 1 < num_cols:
+                            cell_entries[curr_r][curr_c + 1].focus_set()
+                        elif curr_r + 1 < total_r:
+                            cell_entries[curr_r + 1][0].focus_set()
+                        else:
+                            # At last cell, insert a new row automatically!
+                            self._table_insert_row(orig_table_md, headers, col_alignments, data_rows, len(data_rows))
+                        return "break"
 
+                    def _nav_shift_tab(e):
+                        if curr_c > 0:
+                            cell_entries[curr_r][curr_c - 1].focus_set()
+                        elif curr_r > 0:
+                            cell_entries[curr_r - 1][num_cols - 1].focus_set()
+                        return "break"
+
+                    cell_entries[curr_r][curr_c].bind("<Tab>", _nav_tab)
+                    cell_entries[curr_r][curr_c].bind("<Shift-Tab>", _nav_shift_tab)
+                _make_nav(r, c)
+
+        window_pad = self._s(6)
         self.text_widget.insert(tk.END, '\n')
         self.text_widget.window_create(tk.END, window=table_frame, padx=window_pad, pady=self._s(8))
         self.text_widget.insert(tk.END, '\n\n')
-    
+
+    def _on_table_cell_commit(self, orig_table_md, headers, col_alignments, data_rows, r, c, new_val):
+        """Commit a cell edit and update the underlying markdown table in the document."""
+        if r == 0:
+            if c < len(headers) and headers[c] != new_val:
+                headers[c] = new_val
+                self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
+        else:
+            d_idx = r - 1
+            if 0 <= d_idx < len(data_rows) and c < len(data_rows[d_idx]) and data_rows[d_idx][c] != new_val:
+                data_rows[d_idx][c] = new_val
+                self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
+
+    def _sync_table_to_source(self, orig_table_lines, headers, col_alignments, data_rows):
+        """Build formatted Markdown table lines and update canonical document."""
+        lines = ["| " + " | ".join(headers) + " |"]
+        seps = []
+        for al in col_alignments:
+            if al == 'center':
+                seps.append(':---:')
+            elif al == 'right':
+                seps.append('---:')
+            else:
+                seps.append(':---')
+        lines.append("| " + " | ".join(seps) + " |")
+        for row in data_rows:
+            lines.append("| " + " | ".join(row) + " |")
+        formatted, _ = format_markdown_table_lines(lines)
+        new_table_str = "\n".join(formatted)
+        old_table_str = "\n".join(orig_table_lines)
+        if self.on_content_change:
+            self.on_content_change(old_table_str, new_table_str)
+
+    def _show_table_context_menu(self, event, orig_table_md, headers, col_alignments, data_rows, r, c):
+        """Show context menu for table manipulation (Insert/Delete rows, columns, alignment, copy)."""
+        menu = tk.Menu(self.text_widget, tearoff=0)
+        menu.add_command(label="Insert Row Above", command=lambda: self._table_insert_row(orig_table_md, headers, col_alignments, data_rows, max(0, r - 1)))
+        menu.add_command(label="Insert Row Below", command=lambda: self._table_insert_row(orig_table_md, headers, col_alignments, data_rows, r))
+        menu.add_separator()
+        menu.add_command(label="Insert Column Left", command=lambda: self._table_insert_col(orig_table_md, headers, col_alignments, data_rows, c))
+        menu.add_command(label="Insert Column Right", command=lambda: self._table_insert_col(orig_table_md, headers, col_alignments, data_rows, c + 1))
+        menu.add_separator()
+        if r > 0:
+            menu.add_command(label="Delete Row", command=lambda: self._table_delete_row(orig_table_md, headers, col_alignments, data_rows, r - 1))
+        if len(headers) > 1:
+            menu.add_command(label="Delete Column", command=lambda: self._table_delete_col(orig_table_md, headers, col_alignments, data_rows, c))
+        menu.add_separator()
+        menu.add_command(label="Align Column Left", command=lambda: self._table_set_align(orig_table_md, headers, col_alignments, data_rows, c, 'left'))
+        menu.add_command(label="Align Column Center", command=lambda: self._table_set_align(orig_table_md, headers, col_alignments, data_rows, c, 'center'))
+        menu.add_command(label="Align Column Right", command=lambda: self._table_set_align(orig_table_md, headers, col_alignments, data_rows, c, 'right'))
+        menu.add_separator()
+        menu.add_command(label="Copy Table as TSV (Excel)", command=lambda: self._copy_table_tsv(headers, data_rows))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _table_insert_row(self, orig_table_md, headers, col_alignments, data_rows, insert_idx):
+        new_row = ['' for _ in headers]
+        data_rows.insert(max(0, min(len(data_rows), insert_idx)), new_row)
+        self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
+
+    def _table_delete_row(self, orig_table_md, headers, col_alignments, data_rows, row_idx):
+        if 0 <= row_idx < len(data_rows):
+            del data_rows[row_idx]
+            self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
+
+    def _table_insert_col(self, orig_table_md, headers, col_alignments, data_rows, col_idx):
+        headers.insert(col_idx, f"Header {len(headers) + 1}")
+        col_alignments.insert(col_idx, 'left')
+        for r in data_rows:
+            r.insert(col_idx, '')
+        self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
+
+    def _table_delete_col(self, orig_table_md, headers, col_alignments, data_rows, col_idx):
+        if len(headers) > 1 and 0 <= col_idx < len(headers):
+            del headers[col_idx]
+            del col_alignments[col_idx]
+            for r in data_rows:
+                if col_idx < len(r):
+                    del r[col_idx]
+            self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
+
+    def _table_set_align(self, orig_table_md, headers, col_alignments, data_rows, col_idx, align):
+        if 0 <= col_idx < len(col_alignments):
+            col_alignments[col_idx] = align
+            self._sync_table_to_source(orig_table_md, headers, col_alignments, data_rows)
+
+    def _copy_table_tsv(self, headers, data_rows):
+        rows = [headers] + data_rows
+        tsv = "\n".join(["\t".join(r) for r in rows])
+        self.clipboard_clear()
+        self.clipboard_append(tsv)
+
     def _insert_image_inline(self, img_info):
-        """Insert an image inline in the text widget with extended sizing, alignment, and captions"""
+        """Insert an image inline in the text widget with true alignment, academic captions, and context controls"""
         image = self.image_handler.load_image(img_info)
         
         if image:
@@ -1709,6 +2092,7 @@ class MarkdownVisualWidget(tk.Frame):
             align = img_info.get('align', 'center')
             caption_text = img_info.get('caption')
             alt_text = img_info.get('alt', '')
+            raw_match = img_info.get('full_match', '')
 
             orig_w, orig_h = image.size
             
@@ -1745,32 +2129,90 @@ class MarkdownVisualWidget(tk.Frame):
             
             if photo:
                 align_tag = f"image_{align}" if f"image_{align}" in ('image_left', 'image_right', 'image_center') else "image_center"
+                self.text_widget.tag_configure("image_left", justify=tk.LEFT)
+                self.text_widget.tag_configure("image_center", justify=tk.CENTER)
+                self.text_widget.tag_configure("image_right", justify=tk.RIGHT)
                 
-                # Center/Align image using line tag
+                # Center/Align image using line tag applied to the entire image line range
+                img_start = self.text_widget.index(tk.END)
                 self.text_widget.insert(tk.END, '\n')
                 self.text_widget.image_create(tk.END, image=photo, padx=self._s(15), pady=self._s(8))
-                self.text_widget.insert(tk.END, '\n', align_tag)
+                self.text_widget.insert(tk.END, '\n')
+                img_end = self.text_widget.index(tk.END)
+                self.text_widget.tag_add(align_tag, img_start, img_end)
                 
                 index = self.text_widget.index(tk.END + "-2c")
                 self.embedded_images[index] = (photo, image, alt_text or caption_text or '')
-                
-                display_size = f"{photo.width()}×{photo.height()}"
-                
-                # Format caption
-                if caption_text:
-                    full_caption = f"{caption_text} ({display_size})"
-                elif alt_text:
-                    full_caption = f"{alt_text} ({display_size})"
+
+                # Format clean academic caption (no ugly pixel noise)
+                caption = caption_text or (alt_text if alt_text and alt_text.lower() not in ('image', 'img', 'figure') else '')
+                if caption:
+                    cap_start = self.text_widget.index(tk.END)
+                    self.text_widget.insert(tk.END, caption + '\n\n', ("image_caption", align_tag))
                 else:
-                    full_caption = f"({display_size})"
-                
-                self.text_widget.insert(tk.END, full_caption + '\n\n', "image_caption")
-                self.text_widget.tag_bind("image", "<Button-1>", self._on_image_click)
+                    self.text_widget.insert(tk.END, '\n', align_tag)
+
+                # Context menu for image
+                def _show_image_menu(event, info=img_info):
+                    menu = tk.Menu(self.text_widget, tearoff=0)
+                    menu.add_command(label="Align Left", command=lambda: self._set_image_prop(info, 'align', 'left'))
+                    menu.add_command(label="Align Center", command=lambda: self._set_image_prop(info, 'align', 'center'))
+                    menu.add_command(label="Align Right", command=lambda: self._set_image_prop(info, 'align', 'right'))
+                    menu.add_separator()
+                    menu.add_command(label="Size: 25%", command=lambda: self._set_image_prop(info, 'width', int(self.content_width_px() * 0.25)))
+                    menu.add_command(label="Size: 50%", command=lambda: self._set_image_prop(info, 'width', int(self.content_width_px() * 0.50)))
+                    menu.add_command(label="Size: 75%", command=lambda: self._set_image_prop(info, 'width', int(self.content_width_px() * 0.75)))
+                    menu.add_command(label="Size: 100% (Full Width)", command=lambda: self._set_image_prop(info, 'width', int(self.content_width_px())))
+                    menu.add_command(label="Size: Original", command=lambda: self._set_image_prop(info, 'width', None))
+                    menu.add_separator()
+                    menu.add_command(label="Edit Caption...", command=lambda: self._prompt_image_caption(info))
+                    menu.tk_popup(event.x_root, event.y_root)
+
+                self.text_widget.tag_bind(align_tag, "<Button-3>", _show_image_menu)
                 return
         
         # Fallback placeholder
         alt = img_info.get('alt', 'image')
         self.text_widget.insert(tk.END, f"\n[🖼️ {alt}]\n\n", "image_placeholder")
+
+    def _set_image_prop(self, info, prop, val):
+        """Update an image property in the canonical markdown text."""
+        full_match = info.get('full_match', '')
+        if not full_match or not self.on_content_change:
+            return
+        m = re.match(r'!\[([^\]]*)\]\(([^)]+)\)', full_match)
+        if not m:
+            return
+        meta_str = m.group(1)
+        path = m.group(2)
+        parts = meta_str.split('|')
+        base_alt = parts[0].strip()
+        params = {}
+        for p in parts[1:]:
+            if '=' in p:
+                k, v = p.split('=', 1)
+                params[k.strip().lower()] = v.strip()
+
+        if val is None:
+            params.pop(prop, None)
+        else:
+            params[prop] = str(val)
+
+        new_parts = [base_alt]
+        for k, v in params.items():
+            new_parts.append(f"{k}={v}")
+        new_match = f"![{'|'.join(new_parts)}]({path})"
+
+        self.on_content_change(full_match, new_match)
+
+    def _prompt_image_caption(self, info):
+        """Prompt user for a figure caption and update the markdown."""
+        curr_cap = info.get('caption') or info.get('alt', '')
+        from tkinter import simpledialog
+        new_cap = simpledialog.askstring("Figure Caption", "Enter figure caption:", initialvalue=curr_cap, parent=self)
+        if new_cap is not None:
+            self._set_image_prop(info, 'caption', new_cap.strip())
+
     
     def _on_image_click(self, event):
         """Handle click on embedded image"""
@@ -2266,13 +2708,25 @@ class DocumentTab(ttk.Frame):
             if self.on_modified:
                 self.on_modified()
     
-    def _on_visual_edit(self, content):
-        """Handle visual editor changes"""
-        self.is_modified = True
-        if self.on_modified:
-            self.on_modified()
+    def _on_visual_edit(self, old_or_new, new_text=None):
+        """Handle visual editor changes: replaces old_text with new_text in canonical source."""
+        if new_text is not None:
+            old_text = old_or_new
+            curr = self.source_editor.get("1.0", "end-1c")
+            if old_text in curr:
+                updated = curr.replace(old_text, new_text, 1)
+                self.source_editor.delete("1.0", tk.END)
+                self.source_editor.insert("1.0", updated)
+                self.is_modified = True
+                if self.on_modified:
+                    self.on_modified()
+        else:
+            self.set_content(old_or_new)
+            self.is_modified = True
+            if self.on_modified:
+                self.on_modified()
         if self.on_content_change_callback:
-            self.on_content_change_callback(content)
+            self.on_content_change_callback(self.get_content())
     
     def get_display_name(self):
         """Get display title for tab"""
@@ -3839,10 +4293,8 @@ class MarkdownNotepad(tk.Tk):
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="View", menu=view_menu)
-        view_menu.add_command(label="Source Mode", command=self._show_source_mode, accelerator="Ctrl+1")
-        view_menu.add_command(label="Visual Mode", command=self._show_visual_mode, accelerator="Ctrl+2")
-        view_menu.add_separator()
-        view_menu.add_command(label="Toggle Mode", command=self._toggle_mode, accelerator="Ctrl+E")
+        view_menu.add_checkbutton(label="Source View", variable=self.source_view_var,
+                                  command=self._on_source_view_toggle, accelerator="Ctrl+E")
         view_menu.add_separator()
         
         # Word wrap toggle
@@ -3986,24 +4438,18 @@ class MarkdownNotepad(tk.Tk):
         
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
         
-        # 2. Mode Toggle Group (segmented Source | Visual)
-        self.mode_var = tk.StringVar(value="source")
+        # 2. Unified View / Source View Checkbox
+        self.source_view_var = tk.BooleanVar(value=False)
+        self.mode_var = tk.StringVar(value="visual")
         mode_frame = ttk.Frame(toolbar)
         mode_frame.pack(side=tk.LEFT, padx=1)
         
-        self.source_btn = ttk.Radiobutton(
-            mode_frame, text="Source", variable=self.mode_var, style="Toolbar.Toolbutton",
-            value="source", command=self._show_source_mode
+        self.source_view_cb = ttk.Checkbutton(
+            mode_frame, text="Source View", variable=self.source_view_var, style="Toolbar.Toolbutton",
+            command=self._on_source_view_toggle
         )
-        self.source_btn.pack(side=tk.LEFT)
-        ToolTip(self.source_btn, "Source Mode — Edit raw Markdown (Ctrl+1)")
-        
-        self.visual_btn = ttk.Radiobutton(
-            mode_frame, text="Visual", variable=self.mode_var, style="Toolbar.Toolbutton",
-            value="visual", command=self._show_visual_mode
-        )
-        self.visual_btn.pack(side=tk.LEFT)
-        ToolTip(self.visual_btn, "Visual Mode — Rendered presentation view (Ctrl+2)")
+        self.source_view_cb.pack(side=tk.LEFT)
+        ToolTip(self.source_view_cb, "Toggle raw Markdown syntax view (Ctrl+E)")
         
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
         
@@ -4074,10 +4520,13 @@ class MarkdownNotepad(tk.Tk):
         find_btn.pack(side=tk.RIGHT, padx=1)
         ToolTip(find_btn, "Find & Replace in Document (Ctrl+F / Ctrl+H)")
     
-    def _set_format_buttons_enabled(self, enabled):
-        """Formatting buttons only make sense in Source mode (Visual mode is read-only)"""
+    def _set_format_buttons_enabled(self, enabled=True):
+        """Formatting buttons remain active across both Source View and Visual View."""
         for btn in getattr(self, '_format_buttons', []):
-            btn.state(['!disabled'] if enabled else ['disabled'])
+            try:
+                btn.state(['!disabled'])
+            except Exception:
+                pass
     
     def _create_status_bar(self):
         """Create the status bar"""
@@ -5210,8 +5659,9 @@ class MarkdownNotepad(tk.Tk):
         if self.current_tab:
             mode = self.current_tab.current_mode
             self.mode_var.set(mode)
-            self.mode_label.config(text=f"{mode.capitalize()} Mode")
-            self._set_format_buttons_enabled(mode == "source")
+            self.source_view_var.set(mode == "source")
+            self.mode_label.config(text="Source View" if mode == "source" else "Visual View")
+            self._set_format_buttons_enabled(True)
     
     def _set_status(self, message):
         """Set status bar message"""
@@ -5349,53 +5799,97 @@ class MarkdownNotepad(tk.Tk):
         self._save_theme()
     
     def _show_source_mode(self):
-        """Switch current tab to source editing mode"""
+        """Switch current tab to raw Markdown source editing view"""
         if not self.current_tab:
             return
+
+        try:
+            scroll_pos = self.current_tab.visual_viewer.text_widget.yview()[0]
+        except Exception:
+            scroll_pos = 0.0
 
         self.current_tab.visual_frame.pack_forget()
         self.current_tab.source_frame.pack(fill=tk.BOTH, expand=True)
         self.current_tab.current_mode = "source"
+        self.source_view_var.set(True)
         self.mode_var.set("source")
-        self.mode_label.config(text="Source Mode")
+        self.mode_label.config(text="Source View")
         self._set_format_buttons_enabled(True)
+        try:
+            self.current_tab.source_editor.yview_moveto(scroll_pos)
+        except Exception:
+            pass
+        self.current_tab.source_editor.focus_set()
         if getattr(self, 'find_bar', None) and self.find_bar.is_visible:
             self.find_bar._on_query_change()
-        self._set_status("Source mode - edit raw markdown")
-    
+        self._set_status("Source View — raw Markdown syntax")
+
     def _show_visual_mode(self):
-        """Switch current tab to visual reading presentation mode"""
+        """Switch current tab to formatted visual presentation view"""
         if not self.current_tab:
             return
-            
+
+        try:
+            scroll_pos = self.current_tab.source_editor.yview()[0]
+        except Exception:
+            scroll_pos = 0.0
+
         self.current_tab.source_frame.pack_forget()
         self.current_tab.visual_frame.pack(fill=tk.BOTH, expand=True)
         self.current_tab.current_mode = "visual"
-        
-        # Lay out the page first so tables/images/rules are sized to the real column width
-        self.update_idletasks()
-        content = self.current_tab.source_editor.get(1.0, tk.END).rstrip()
-        self.current_tab.visual_viewer.set_content(content)
-        
+        self.source_view_var.set(False)
         self.mode_var.set("visual")
-        self.mode_label.config(text="Visual Mode")
-        self._set_format_buttons_enabled(False)
+        self.mode_label.config(text="Visual View")
+        self._set_format_buttons_enabled(True)
+        
+        self.update_idletasks()
+        content = self.current_tab.source_editor.get("1.0", tk.END).rstrip()
+        self.current_tab.visual_viewer.set_content(content)
+        try:
+            self.current_tab.visual_viewer.text_widget.yview_moveto(scroll_pos)
+        except Exception:
+            pass
+        self.current_tab.visual_viewer.text_widget.focus_set()
         if getattr(self, 'find_bar', None) and self.find_bar.is_visible:
             self.find_bar._on_query_change()
-        self._set_status("Visual mode - reading presentation view")
-    
-    def _on_visual_edit(self, content):
-        """Called when visual editor content changes (read-only presentation view)"""
-        pass
-    
-    def _toggle_mode(self):
-        """Toggle between source and visual mode"""
+        self._set_status("Visual View — formatted document canvas")
+
+    def _on_source_view_toggle(self):
+        """Toggle callback for the Source View checkbox"""
         if not self.current_tab:
             return
-        if self.current_tab.current_mode == "source":
-            self._show_visual_mode()
-        else:
+        if self.source_view_var.get():
             self._show_source_mode()
+        else:
+            self._show_visual_mode()
+
+    def toggle_source_view(self):
+        """Shortcut action for Ctrl+E"""
+        self.source_view_var.set(not self.source_view_var.get())
+        self._on_source_view_toggle()
+        return "break"
+
+    def _toggle_mode(self):
+        """Toggle between source view and visual view"""
+        return self.toggle_source_view()
+
+    def _refresh_active_visual_view(self):
+        """Refresh visual viewer content if currently in visual mode"""
+        if self.current_tab and self.current_tab.current_mode == "visual":
+            try:
+                ypos = self.current_tab.visual_viewer.text_widget.yview()[0]
+            except Exception:
+                ypos = 0.0
+            content = self.current_tab.source_editor.get("1.0", tk.END).rstrip()
+            self.current_tab.visual_viewer.set_content(content)
+            try:
+                self.current_tab.visual_viewer.text_widget.yview_moveto(ypos)
+            except Exception:
+                pass
+
+    def _on_visual_edit(self, content):
+        """Called when visual editor content changes"""
+        pass
     
     # === Focus Mode ===
     
@@ -5822,9 +6316,116 @@ class MarkdownNotepad(tk.Tk):
             self.current_tab.source_editor.event_generate("<<Copy>>")
     
     def paste(self):
-        """Paste from clipboard"""
+        """Paste from clipboard with smart detection of tables and images"""
         if self.current_tab:
-            self.current_tab.source_editor.event_generate("<<Paste>>")
+            return self._handle_smart_paste()
+        return "break"
+
+    def _insert_smart_pasted_text(self, editor, text_to_insert):
+        try:
+            if editor.tag_ranges(tk.SEL):
+                editor.delete(tk.SEL_FIRST, tk.SEL_LAST)
+        except Exception:
+            pass
+        editor.insert(tk.INSERT, text_to_insert)
+        self.current_tab.is_modified = True
+        self._update_tab_title(self.current_tab)
+        self._schedule_syntax_highlight()
+        self._refresh_active_visual_view()
+        editor.see(tk.INSERT)
+
+    def _get_document_assets_dir(self):
+        if self.current_tab and self.current_tab.file_path:
+            doc_dir = os.path.dirname(self.current_tab.file_path)
+            stem = os.path.splitext(os.path.basename(self.current_tab.file_path))[0]
+            return os.path.join(doc_dir, f"{stem}_assets")
+        home = os.path.expanduser("~")
+        return os.path.join(home, ".markitdown_assets")
+
+    def _compute_relative_asset_path(self, fpath):
+        if self.current_tab and self.current_tab.file_path:
+            doc_dir = os.path.dirname(self.current_tab.file_path)
+            try:
+                return os.path.relpath(fpath, doc_dir).replace('\\', '/')
+            except ValueError:
+                pass
+        return fpath.replace('\\', '/')
+
+    def _handle_smart_paste(self, event=None):
+        """Smart paste: converts Excel/Sheets/Calc TSV tables, HTML tables, pipe tables, or clipboard images."""
+        if not self.current_tab:
+            return "break"
+        editor = self.current_tab.source_editor
+
+        # 1. Try clipboard text first
+        clip_text = None
+        try:
+            clip_text = self.clipboard_get()
+        except tk.TclError:
+            pass
+
+        if clip_text:
+            # HTML table detection
+            html_table = parse_html_table_to_markdown(clip_text)
+            if html_table:
+                self._insert_smart_pasted_text(editor, html_table)
+                self._set_status("Pasted formatted table from HTML")
+                return "break"
+
+            # Spreadsheet TSV detection (Excel / Google Sheets / Calc)
+            tsv_table = parse_spreadsheet_tsv_to_markdown(clip_text)
+            if tsv_table:
+                self._insert_smart_pasted_text(editor, tsv_table)
+                self._set_status("Pasted spreadsheet cells as Markdown table")
+                return "break"
+
+            # Existing messy pipe table detection
+            pipe_table = format_existing_pipe_table_on_paste(clip_text)
+            if pipe_table:
+                self._insert_smart_pasted_text(editor, pipe_table)
+                self._set_status("Pasted and auto-aligned Markdown table")
+                return "break"
+
+            # Standard text paste
+            self._insert_smart_pasted_text(editor, clip_text)
+            return "break"
+
+        # 2. Check for clipboard image (screenshots)
+        if PIL_AVAILABLE:
+            try:
+                from PIL import ImageGrab
+                img = ImageGrab.grabclipboard()
+                if img is not None:
+                    if hasattr(img, 'save'):
+                        assets_dir = self._get_document_assets_dir()
+                        os.makedirs(assets_dir, exist_ok=True)
+                        import time
+                        ts = int(time.time() * 1000)
+                        fname = f"figure_{ts}.png"
+                        fpath = os.path.join(assets_dir, fname)
+                        img.save(fpath, format="PNG")
+                        rel_path = self._compute_relative_asset_path(fpath)
+                        img_md = f"\n![Figure|width=550,align=center]({rel_path})\n\n"
+                        self._insert_smart_pasted_text(editor, img_md)
+                        self._set_status("Pasted image from clipboard into document assets")
+                        return "break"
+                    elif isinstance(img, list) and img:
+                        inserted_any = False
+                        for p in img:
+                            if isinstance(p, str) and os.path.splitext(p)[1].lower() in ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'):
+                                rel_p = self._compute_relative_asset_path(p)
+                                stem = os.path.splitext(os.path.basename(p))[0]
+                                img_md = f"\n![{stem}|width=550,align=center]({rel_p})\n\n"
+                                self._insert_smart_pasted_text(editor, img_md)
+                                inserted_any = True
+                        if inserted_any:
+                            self._set_status("Pasted image file(s) as Markdown figure(s)")
+                            return "break"
+            except Exception as e:
+                print(f"Error grabbing clipboard image: {e}")
+
+        editor.event_generate("<<Paste>>")
+        return "break"
     
     def select_all(self):
         """Select all text"""
@@ -5896,12 +6497,41 @@ class MarkdownNotepad(tk.Tk):
     
     def _insert_format(self, prefix, suffix):
         """Insert formatting around selected text, or toggle formatting if already applied."""
-        if not self.current_tab or self.current_tab.current_mode != "source":
+        if not self.current_tab:
             return "break"
         
-        editor = self.current_tab.source_editor
+        tab = self.current_tab
+        editor = tab.source_editor
         p_len = len(prefix)
         s_len = len(suffix)
+
+        # Handle visual mode selection if present
+        if tab.current_mode == "visual":
+            try:
+                v_text = tab.visual_viewer.text_widget
+                if v_text.tag_ranges(tk.SEL):
+                    first = v_text.index(tk.SEL_FIRST)
+                    last = v_text.index(tk.SEL_LAST)
+                    selected = v_text.get(first, last)
+                    if selected:
+                        content = editor.get("1.0", tk.END)
+                        wrapped = f"{prefix}{selected}{suffix}"
+                        if wrapped in content:
+                            new_content = content.replace(wrapped, selected, 1)
+                            tab.set_content(new_content)
+                            tab.is_modified = True
+                            self._update_tab_title(tab)
+                            self._refresh_active_visual_view()
+                            return "break"
+                        elif selected in content:
+                            new_content = content.replace(selected, wrapped, 1)
+                            tab.set_content(new_content)
+                            tab.is_modified = True
+                            self._update_tab_title(tab)
+                            self._refresh_active_visual_view()
+                            return "break"
+            except Exception:
+                pass
         
         try:
             first = editor.index(tk.SEL_FIRST)
@@ -5925,6 +6555,7 @@ class MarkdownNotepad(tk.Tk):
                 self.current_tab.is_modified = True
                 self._update_tab_title(self.current_tab)
                 self._schedule_syntax_highlight()
+                self._refresh_active_visual_view()
                 return "break"
 
             # Case B: Prefix and suffix are immediately outside the selection (toggle off)
@@ -5950,6 +6581,7 @@ class MarkdownNotepad(tk.Tk):
                 self.current_tab.is_modified = True
                 self._update_tab_title(self.current_tab)
                 self._schedule_syntax_highlight()
+                self._refresh_active_visual_view()
                 return "break"
 
             # Case C: Apply formatting around selected text
@@ -5963,6 +6595,7 @@ class MarkdownNotepad(tk.Tk):
             self.current_tab.is_modified = True
             self._update_tab_title(self.current_tab)
             self._schedule_syntax_highlight()
+            self._refresh_active_visual_view()
             return "break"
 
         except tk.TclError:
@@ -5975,36 +6608,58 @@ class MarkdownNotepad(tk.Tk):
             self.current_tab.is_modified = True
             self._update_tab_title(self.current_tab)
             self._schedule_syntax_highlight()
+            self._refresh_active_visual_view()
             return "break"
     
     def _insert_line_prefix(self, prefix):
-        """Insert prefix at the beginning of the current line"""
-        if not self.current_tab or self.current_tab.current_mode != "source":
+        """Insert prefix at the beginning of the current line (with toggle/replace support)"""
+        if not self.current_tab:
             return "break"
         
         editor = self.current_tab.source_editor
         pos = editor.index(tk.INSERT)
         line = pos.split('.')[0]
-        editor.insert(f"{line}.0", prefix)
+        line_text = editor.get(f"{line}.0", f"{line}.end")
+        
+        heading_match = re.match(r'^(#{1,6}\s+)(.*)$', line_text)
+        if prefix.startswith('#'):
+            if heading_match:
+                old_prefix, rest = heading_match.groups()
+                if old_prefix == prefix:
+                    editor.delete(f"{line}.0", f"{line}.{len(old_prefix)}")
+                else:
+                    editor.delete(f"{line}.0", f"{line}.{len(old_prefix)}")
+                    editor.insert(f"{line}.0", prefix)
+            else:
+                editor.insert(f"{line}.0", prefix)
+        elif prefix in ("> ", "- ", "1. "):
+            if line_text.startswith(prefix):
+                editor.delete(f"{line}.0", f"{line}.{len(prefix)}")
+            else:
+                editor.insert(f"{line}.0", prefix)
+        else:
+            editor.insert(f"{line}.0", prefix)
+
         self.current_tab.is_modified = True
         self._update_tab_title(self.current_tab)
         self._schedule_syntax_highlight()
+        self._refresh_active_visual_view()
         return "break"
     
     def _insert_text(self, text):
         """Insert text at cursor position"""
-        if not self.current_tab or self.current_tab.current_mode != "source":
+        if not self.current_tab:
             return "break"
         self.current_tab.source_editor.insert(tk.INSERT, text)
         self.current_tab.is_modified = True
         self._update_tab_title(self.current_tab)
         self._schedule_syntax_highlight()
+        self._refresh_active_visual_view()
         return "break"
 
     def insert_table(self):
         """Open dialog to insert a formatted Markdown table with configurable rows, columns, and header."""
-        if not self.current_tab or self.current_tab.current_mode != "source":
-            self._set_status("Switch to Source Mode to insert a table")
+        if not self.current_tab:
             return "break"
         InsertTableDialog(self, self.current_tab.source_editor, self._on_table_inserted)
         return "break"
@@ -6015,12 +6670,12 @@ class MarkdownNotepad(tk.Tk):
             self._update_tab_title(self.current_tab)
             self._schedule_syntax_highlight()
             self._schedule_outline_update()
+            self._refresh_active_visual_view()
             self._set_status("Markdown table inserted (use Tab / Shift+Tab to navigate & align cells)")
 
     def insert_footnote(self):
         """Insert a numbered footnote citation [^n] at cursor and append [^n]: definition at bottom."""
-        if not self.current_tab or self.current_tab.current_mode != "source":
-            self._set_status("Switch to Source Mode to insert a footnote")
+        if not self.current_tab:
             return "break"
         editor = self.current_tab.source_editor
         content = editor.get("1.0", tk.END)
@@ -6048,13 +6703,13 @@ class MarkdownNotepad(tk.Tk):
         self._update_tab_title(self.current_tab)
         self._schedule_syntax_highlight()
         self._schedule_outline_update()
+        self._refresh_active_visual_view()
         self._set_status(f"Inserted footnote {ref_token} — enter footnote text below")
         return "break"
 
     def open_math_symbol_picker(self):
         """Open the non-modal Math & Unicode Symbol palette."""
-        if not self.current_tab or self.current_tab.current_mode != "source":
-            self._set_status("Switch to Source Mode to insert math & symbols")
+        if not self.current_tab:
             return "break"
         if hasattr(self, '_math_picker_win') and self._math_picker_win and self._math_picker_win.winfo_exists():
             self._math_picker_win.lift()
@@ -6082,9 +6737,6 @@ class MarkdownNotepad(tk.Tk):
     def insert_image(self):
         """Insert an image into the document with proper asset management"""
         if not self.current_tab:
-            return
-        if self.current_tab.current_mode != "source":
-            messagebox.showinfo("Info", "Please switch to Source mode to insert images.")
             return
         
         # Open image insert dialog
@@ -6929,6 +7581,10 @@ class InsertImageDialog(tk.Toplevel):
         
         # Insert into editor
         self.text_widget.insert(tk.INSERT, markdown)
+        if hasattr(self.parent, '_schedule_syntax_highlight'):
+            self.parent._schedule_syntax_highlight()
+        if hasattr(self.parent, '_refresh_active_visual_view'):
+            self.parent._refresh_active_visual_view()
         
         # Update status
         if hasattr(self.parent, '_set_status'):
@@ -7784,16 +8440,17 @@ class MathSymbolDialog(tk.Toplevel):
         ttk.Button(footer, text="Close", command=self.destroy, width=8).pack(side=tk.RIGHT)
 
     def _insert_symbol(self, sym: str):
-        if self.notepad.current_tab and self.notepad.current_tab.current_mode == "source":
+        if self.notepad.current_tab:
             editor = self.notepad.current_tab.source_editor
             editor.insert(tk.INSERT, sym)
             self.notepad.current_tab.is_modified = True
             self.notepad._update_tab_title(self.notepad.current_tab)
             self.notepad._schedule_syntax_highlight()
+            self.notepad._refresh_active_visual_view()
             editor.focus_set()
 
     def _insert_template(self, prefix: str, suffix: str):
-        if self.notepad.current_tab and self.notepad.current_tab.current_mode == "source":
+        if self.notepad.current_tab:
             if suffix:
                 self.notepad._insert_format(prefix, suffix)
             else:
