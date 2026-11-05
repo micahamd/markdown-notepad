@@ -305,8 +305,10 @@ class AISettings:
                     self.settings.update(saved)
                 # Sanitize stale cached AGY models from older fallback lists
                 cached_agy = self.settings.get('cached_agy_models', [])
-                if cached_agy and all(m in self.DEPRECATED_AGY_MODELS for m in cached_agy):
-                    self.settings['cached_agy_models'] = []
+                if cached_agy:
+                    self.settings['cached_agy_models'] = [
+                        m for m in cached_agy if m not in self.DEPRECATED_AGY_MODELS
+                    ]
                 if self.settings.get('agy_model') in self.DEPRECATED_AGY_MODELS:
                     self.settings['agy_model'] = self.AGY_MODELS[0]
                 if (self.settings.get('provider') in ('agy', 'antigravity')
@@ -369,7 +371,11 @@ class AISettings:
     
     @property
     def max_tokens(self) -> int:
-        return self.settings.get('max_tokens', 4096)
+        val = self.settings.get('max_tokens', 4096)
+        try:
+            return max(256, min(8192, int(val)))
+        except (ValueError, TypeError):
+            return 4096
     
     @max_tokens.setter
     def max_tokens(self, value: int):
@@ -473,7 +479,7 @@ class AISettings:
 
     @property
     def agy_model(self) -> str:
-        return self.settings.get('agy_model', 'gemini-2.5-flash')
+        return self.settings.get('agy_model', self.AGY_MODELS[0])
 
     @agy_model.setter
     def agy_model(self, value: str):
@@ -726,8 +732,10 @@ class AnthropicClient(LLMClient):
         self.api_key = api_key
         self.client = None
         self._cached_models = None
+        self._client_api_key = None
         if ANTHROPIC_AVAILABLE and api_key:
             self.client = anthropic.Anthropic(api_key=api_key)
+            self._client_api_key = api_key
     
     def _convert_messages_to_api_format(self, messages: List[ChatMessage]) -> List[Dict]:
         """Convert ChatMessage objects to Anthropic API format"""
@@ -774,8 +782,12 @@ class AnthropicClient(LLMClient):
         on_chunk: Optional[Callable[[str], None]] = None
     ) -> str:
         """Send messages to Claude and get response"""
-        if not self.client:
-            raise ValueError("Anthropic client not initialized. Check API key.")
+        if not self.client or getattr(self, '_client_api_key', None) != self.api_key:
+            if ANTHROPIC_AVAILABLE and self.api_key:
+                self.client = anthropic.Anthropic(api_key=self.api_key)
+                self._client_api_key = self.api_key
+            else:
+                raise ValueError("Anthropic client not initialized. Check API key.")
         
         api_messages = self._convert_messages_to_api_format(messages)
         
@@ -899,10 +911,11 @@ class AnthropicClient(LLMClient):
         model: Optional[str] = None
     ) -> Iterator[str]:
         """Send messages and stream the response"""
-        if not self.client:
+        if not self.client or getattr(self, '_client_api_key', None) != self.api_key:
             # Reinitialize client if API key was updated
             if ANTHROPIC_AVAILABLE and self.api_key:
                 self.client = anthropic.Anthropic(api_key=self.api_key)
+                self._client_api_key = self.api_key
             else:
                 raise ValueError("Anthropic client not initialized. Check API key.")
         
@@ -913,7 +926,7 @@ class AnthropicClient(LLMClient):
         api_messages = []
         for msg in messages:
             if isinstance(msg, dict):
-                api_messages.append(msg)
+                api_messages.append(dict(msg))
             elif isinstance(msg, ChatMessage):
                 api_messages.append({"role": msg.role, "content": msg.content})
         
@@ -1043,8 +1056,10 @@ class GeminiClient(LLMClient):
         self.api_key = api_key
         self.client = None
         self._cached_models = None
+        self._client_api_key = None
         if GEMINI_AVAILABLE and api_key:
             self.client = genai.Client(api_key=api_key)
+            self._client_api_key = api_key
     
     def _convert_messages_to_api_format(self, messages: List[ChatMessage]) -> List[Dict]:
         """Convert ChatMessage objects to Gemini API format"""
@@ -1089,8 +1104,12 @@ class GeminiClient(LLMClient):
         on_chunk: Optional[Callable[[str], None]] = None
     ) -> str:
         """Send messages to Gemini and get response"""
-        if not self.client:
-            raise ValueError("Gemini client not initialized. Check API key.")
+        if not self.client or getattr(self, '_client_api_key', None) != self.api_key:
+            if GEMINI_AVAILABLE and self.api_key:
+                self.client = genai.Client(api_key=self.api_key)
+                self._client_api_key = self.api_key
+            else:
+                raise ValueError("Gemini client not initialized. Check API key.")
         
         api_messages = self._convert_messages_to_api_format(messages)
         
@@ -1178,10 +1197,11 @@ class GeminiClient(LLMClient):
         model: Optional[str] = None
     ) -> Iterator[str]:
         """Send messages and stream the response"""
-        if not self.client:
+        if not self.client or getattr(self, '_client_api_key', None) != self.api_key:
             # Reinitialize client if API key was updated
             if GEMINI_AVAILABLE and self.api_key:
                 self.client = genai.Client(api_key=self.api_key)
+                self._client_api_key = self.api_key
             else:
                 raise ValueError("Gemini client not initialized. Check API key.")
         
@@ -1548,10 +1568,12 @@ class DeepSeekClient(LLMClient):
         self.api_key = api_key
         self.client = None
         self._cached_models = []
+        self._client_api_key = None
         
         if OPENAI_AVAILABLE and api_key:
             try:
                 self.client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+                self._client_api_key = api_key
             except Exception as e:
                 print(f"Error initializing DeepSeek client: {e}")
     
@@ -1594,8 +1616,12 @@ class DeepSeekClient(LLMClient):
         on_chunk: Optional[Callable[[str], None]] = None
     ) -> str:
         """Send a message and get a response"""
-        if not self.client:
-            raise ValueError("DeepSeek client not initialized. Check API key.")
+        if not self.client or getattr(self, '_client_api_key', None) != self.api_key:
+            if OPENAI_AVAILABLE and self.api_key:
+                self.client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+                self._client_api_key = self.api_key
+            else:
+                raise ValueError("DeepSeek client not initialized. Check API key.")
         
         api_messages = self._convert_messages_to_api_format(messages)
         
@@ -1655,10 +1681,11 @@ class DeepSeekClient(LLMClient):
         model: Optional[str] = None
     ) -> Iterator[str]:
         """Send messages and stream the response"""
-        if not self.client:
+        if not self.client or getattr(self, '_client_api_key', None) != self.api_key:
             # Reinitialize client if API key was updated
             if OPENAI_AVAILABLE and self.api_key:
                 self.client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com")
+                self._client_api_key = self.api_key
             else:
                 raise ValueError("DeepSeek client not initialized.")
         
@@ -1670,28 +1697,15 @@ class DeepSeekClient(LLMClient):
             api_messages.append({"role": "system", "content": system_prompt})
         
         for msg in messages:
-            content = []
-            
-            # Add text
-            if msg.get('content'):
-                content.append({
-                    "type": "text",
-                    "text": msg['content']
-                })
-            
-            # Add images
-            if images:
-                for img_b64 in images:
-                    content.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{img_b64}"
-                        }
-                    })
-            
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                content = "\n".join(
+                    part.get('text', '') for part in content
+                    if isinstance(part, dict) and part.get('type') == 'text'
+                )
             api_messages.append({
-                "role": msg.get('role', 'user'),
-                "content": content if len(content) > 1 else msg.get('content', '')
+                'role': msg.get('role', 'user'),
+                'content': str(content or '')
             })
         
         try:
@@ -2761,7 +2775,7 @@ def get_llm_client(settings: AISettings) -> Optional[LLMClient]:
     
     if provider in ('agy', 'antigravity'):
         cli_cmd = settings.agy_path or find_antigravity_cli_command()
-        model = settings.agy_model or 'gemini-2.5-flash'
+        model = settings.agy_model or AISettings.AGY_MODELS[0]
         effort = settings.agy_effort or 'low'
         return AgyClient(model=model, effort=effort, cli_command=cli_cmd)
 

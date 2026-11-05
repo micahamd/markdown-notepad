@@ -4560,12 +4560,12 @@ class MarkdownNotepad(tk.Tk):
             messagebox.showwarning("AI Chat Unavailable", 
                 "AI chat module not available.\nEnsure ai_chat.py is present.")
             return
-        
-        AISettingsDialog(self)
-        
-        # Reload settings in sidebar if it exists
-        if self.ai_sidebar:
-            self.ai_sidebar.reload_settings()
+
+        def _on_settings_saved():
+            if self.ai_sidebar:
+                self.ai_sidebar.reload_settings()
+
+        AISettingsDialog(self, on_save=_on_settings_saved)
 
     # === Right-Click Context Menu ===
 
@@ -5861,11 +5861,11 @@ class MarkdownNotepad(tk.Tk):
             messagebox.showwarning("Feature Unavailable", "Text cleaner module is not available.")
             return
 
-        # Determine active text widget based on current tab mode
-        if self.current_tab.current_mode == "visual":
-            text_widget = self.current_tab.visual_viewer.text_widget
-        else:
-            text_widget = self.current_tab.source_editor.text_widget
+        if not self.current_tab:
+            return
+
+        # Canonical editor widget
+        text_widget = self.current_tab.source_editor
 
         try:
             sel_start = text_widget.index(tk.SEL_FIRST)
@@ -5883,6 +5883,7 @@ class MarkdownNotepad(tk.Tk):
         text_widget.insert(sel_start, cleaned)
         self.current_tab.is_modified = True
         self._update_tab_title(self.current_tab)
+        self._schedule_syntax_highlight()
         self._set_status("Selected text cleaned and reflowed")
     
     def find_text(self):
