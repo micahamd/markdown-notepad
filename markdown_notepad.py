@@ -207,18 +207,25 @@ def _is_dark_color(hex_color):
 # =============================================================================
 
 class ToolTip:
-    """Simple tooltip widget for tkinter"""
+    """Rich, screen-edge-clamped tooltip widget with multi-line wrap and dynamic text updates."""
     
-    def __init__(self, widget, text, delay=500):
+    def __init__(self, widget, text, delay=400):
         self.widget = widget
         self.text = text
         self.delay = delay
         self.tooltip_window = None
         self.scheduled_id = None
+        self.label = None
         
-        widget.bind('<Enter>', self._on_enter)
-        widget.bind('<Leave>', self._on_leave)
-        widget.bind('<Button>', self._on_leave)
+        widget.bind('<Enter>', self._on_enter, add=True)
+        widget.bind('<Leave>', self._on_leave, add=True)
+        widget.bind('<Button>', self._on_leave, add=True)
+    
+    def set_text(self, text):
+        """Dynamically update tooltip text while widget is alive."""
+        self.text = text
+        if self.label and self.tooltip_window and self.tooltip_window.winfo_exists():
+            self.label.config(text=text)
     
     def _on_enter(self, event=None):
         self._cancel_scheduled()
@@ -230,32 +237,307 @@ class ToolTip:
     
     def _cancel_scheduled(self):
         if self.scheduled_id:
-            self.widget.after_cancel(self.scheduled_id)
+            try:
+                self.widget.after_cancel(self.scheduled_id)
+            except Exception:
+                pass
             self.scheduled_id = None
     
     def _show_tooltip(self):
-        if self.tooltip_window:
+        if self.tooltip_window or not self.widget.winfo_exists():
             return
         
-        x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
-        
+        try:
+            wx = self.widget.winfo_rootx()
+            wy = self.widget.winfo_rooty()
+            ww = self.widget.winfo_width()
+            wh = self.widget.winfo_height()
+        except Exception:
+            return
+
         self.tooltip_window = tw = tk.Toplevel(self.widget)
         tw.wm_overrideredirect(True)
-        tw.wm_geometry(f"+{x}+{y}")
         
-        label = tk.Label(
+        # Word 2010 Royal Purple / Plum themed tooltip with high contrast
+        self.label = tk.Label(
             tw, text=self.text, justify=tk.LEFT,
-            background="#ffffcc", foreground="#000000",
+            background="#2e1065", foreground="#faf5ff",
             relief=tk.SOLID, borderwidth=1,
-            font=(SANS_FONT, 9), padx=6, pady=3
+            font=(SANS_FONT, 9), padx=8, pady=5,
+            wraplength=340
         )
-        label.pack()
+        self.label.pack()
+        tw.update_idletasks()
+        
+        tip_w = tw.winfo_reqwidth()
+        tip_h = tw.winfo_reqheight()
+        
+        x = wx + (ww - tip_w) // 2
+        y = wy + wh + 6
+        
+        screen_w = tw.winfo_screenwidth()
+        screen_h = tw.winfo_screenheight()
+        
+        if x + tip_w > screen_w - 12:
+            x = screen_w - tip_w - 12
+        if x < 12:
+            x = 12
+        
+        if y + tip_h > screen_h - 12:
+            y = wy - tip_h - 6
+            if y < 12:
+                y = 12
+        
+        tw.wm_geometry(f"+{x}+{y}")
     
     def _hide_tooltip(self):
         if self.tooltip_window:
-            self.tooltip_window.destroy()
+            try:
+                self.tooltip_window.destroy()
+            except Exception:
+                pass
             self.tooltip_window = None
+            self.label = None
+
+
+class FloatingMiniToolbar:
+    """
+    Floating Word-style mini selection toolbar that appears above selected text.
+    Provides fast inline formatting (Bold, Italic, Highlight, Code, Link, Ask AI).
+    """
+    def __init__(self, tab):
+        self.tab = tab
+        self.editor = tab.source_editor
+        self.window = None
+        self._check_job = None
+        
+        self.editor.bind("<ButtonRelease-1>", self._on_mouse_release, add=True)
+        self.editor.bind("<KeyPress>", self._on_key_press, add=True)
+        self.editor.bind("<FocusOut>", lambda e: self.hide(), add=True)
+
+    def _on_mouse_release(self, event=None):
+        if self._check_job:
+            self.editor.after_cancel(self._check_job)
+        self._check_job = self.editor.after(120, self._check_and_show)
+
+    def _on_key_press(self, event=None):
+        self.hide()
+
+    def _check_and_show(self):
+        self._check_job = None
+        try:
+            if not self.editor.tag_ranges(tk.SEL):
+                self.hide()
+                return
+            
+            sel_text = self.editor.get(tk.SEL_FIRST, tk.SEL_LAST)
+            if not sel_text or len(sel_text.strip()) == 0:
+                self.hide()
+                return
+            
+            bbox = self.editor.bbox(tk.SEL_FIRST)
+            if not bbox:
+                return
+            
+            bx, by, bw, bh = bbox
+            root_x = self.editor.winfo_rootx() + bx
+            root_y = self.editor.winfo_rooty() + by - 36
+            
+            if self.window and self.window.winfo_exists():
+                self.window.geometry(f"+{max(10, root_x)}+{max(10, root_y)}")
+                return
+            
+            self.window = win = tk.Toplevel(self.editor)
+            win.wm_overrideredirect(True)
+            win.configure(bg="#3b1d6e", padx=2, pady=2)
+            
+            frame = tk.Frame(win, bg="#f3effa", bd=1, relief=tk.SOLID)
+            frame.pack(fill=tk.BOTH, expand=True)
+            
+            def _wrap_fmt(prefix, suffix):
+                try:
+                    notepad = self.editor.winfo_toplevel()
+                    if hasattr(notepad, '_insert_format'):
+                        notepad._insert_format(prefix, suffix)
+                finally:
+                    self.hide()
+
+            def _ask_ai():
+                try:
+                    notepad = self.editor.winfo_toplevel()
+                    if hasattr(notepad, '_on_ask_ai_selection'):
+                        notepad._on_ask_ai_selection()
+                    elif hasattr(notepad, 'ai_sidebar') and notepad.ai_sidebar:
+                        if not getattr(notepad, 'ai_sidebar_visible', False):
+                            notepad._toggle_ai_sidebar()
+                        notepad.ai_sidebar.set_input_text(f"Explain or improve this text:\n\n{sel_text}")
+                finally:
+                    self.hide()
+
+            btn_defs = [
+                ("𝐁", lambda: _wrap_fmt("**", "**"), "Bold (Ctrl+B)"),
+                ("𝐼", lambda: _wrap_fmt("*", "*"), "Italic (Ctrl+I)"),
+                ("🖍", lambda: _wrap_fmt("==", "=="), "Highlight (Ctrl+Shift+H)"),
+                ("`", lambda: _wrap_fmt("`", "`"), "Inline Code (Ctrl+`)"),
+                ("🔗", lambda: _wrap_fmt("[", "](url)"), "Insert Link (Ctrl+K)"),
+                ("💬 AI", _ask_ai, "Ask AI about this selection"),
+            ]
+            
+            for text, cmd, tip in btn_defs:
+                b = tk.Button(
+                    frame, text=text, command=cmd, font=(SANS_FONT, 9, "bold" if text in ("𝐁", "💬 AI") else "normal"),
+                    bg="#f3effa", fg="#2e1065", activebackground="#ede9fe", activeforeground="#4c1d95",
+                    relief=tk.FLAT, bd=0, padx=5, pady=2, cursor="hand2"
+                )
+                b.pack(side=tk.LEFT, padx=1, pady=1)
+                ToolTip(b, tip, delay=250)
+            
+            win.update_idletasks()
+            win_w = win.winfo_reqwidth()
+            target_x = max(10, root_x - (win_w // 4))
+            target_y = max(10, root_y)
+            win.geometry(f"+{target_x}+{target_y}")
+        except Exception:
+            pass
+
+    def hide(self):
+        if self._check_job:
+            try:
+                self.editor.after_cancel(self._check_job)
+            except Exception:
+                pass
+            self._check_job = None
+        if self.window:
+            try:
+                self.window.destroy()
+            except Exception:
+                pass
+            self.window = None
+
+
+class DocumentStatisticsDialog(tk.Toplevel):
+    """Comprehensive Document Statistics dialog displaying counts, structure, and reading times."""
+    
+    def __init__(self, parent, tab):
+        super().__init__(parent)
+        self.parent = parent
+        self.tab = tab
+        
+        self.title("Document Statistics")
+        self.geometry("460x540")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        
+        self.configure(bg="#f8f7fc")
+        
+        # Center dialog
+        self.update_idletasks()
+        try:
+            x = parent.winfo_rootx() + (parent.winfo_width() - 460) // 2
+            y = parent.winfo_rooty() + (parent.winfo_height() - 540) // 2
+            self.geometry(f"+{max(10, x)}+{max(10, y)}")
+        except Exception:
+            pass
+        
+        self._build_ui()
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _build_ui(self):
+        content = self.tab.get_content() if self.tab else ""
+        sel_text = ""
+        try:
+            if self.tab.source_editor.tag_ranges(tk.SEL):
+                sel_text = self.tab.source_editor.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except Exception:
+            pass
+        
+        # Header banner in Royal Purple Word style
+        header = tk.Frame(self, bg="#3b1d6e", padx=16, pady=14)
+        header.pack(fill=tk.X)
+        tk.Label(
+            header, text="Document Statistics", font=(SANS_FONT, 13, "bold"),
+            bg="#3b1d6e", fg="#ffffff"
+        ).pack(anchor=tk.W)
+        doc_name = self.tab.get_display_name() if self.tab else "Current Document"
+        tk.Label(
+            header, text=f"Overview metrics for {doc_name}", font=(SANS_FONT, 9),
+            bg="#3b1d6e", fg="#ddd6fe"
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        body = ttk.Frame(self, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        def calc_metrics(txt):
+            words = len(txt.split())
+            chars_with_spaces = len(txt)
+            chars_no_spaces = len(re.sub(r'\s+', '', txt))
+            lines = len(txt.splitlines()) if txt else 0
+            paras = len([p for p in txt.split('\n\n') if p.strip()]) if txt else 0
+            headings = len(re.findall(r'(?m)^#{1,6}\s+.+$', txt))
+            tables = len(re.findall(r'(?m)^\|(?:\s*:?-+:?\s*\|)+$', txt))
+            figures = len(re.findall(r'!\[[^\]]*\]\([^)]+\)', txt))
+            read_mins = max(1, round(words / 200)) if words > 100 else (1 if words > 0 else 0)
+            speak_mins = max(1, round(words / 130)) if words > 60 else (1 if words > 0 else 0)
+            return {
+                'words': words, 'chars_ws': chars_with_spaces, 'chars_ns': chars_no_spaces,
+                'lines': lines, 'paras': paras, 'headings': headings,
+                'tables': tables, 'figures': figures,
+                'read_time': f"~{read_mins} min" if read_mins else "0 min",
+                'speak_time': f"~{speak_mins} min" if speak_mins else "0 min"
+            }
+
+        full_m = calc_metrics(content)
+        has_sel = bool(sel_text.strip())
+        sel_m = calc_metrics(sel_text) if has_sel else None
+
+        stats_frame = ttk.LabelFrame(body, text="Counts & Proportions", padding=10)
+        stats_frame.pack(fill=tk.X, pady=(0, 10))
+
+        rows = [
+            ("Words:", full_m['words'], sel_m['words'] if has_sel else None),
+            ("Characters (no spaces):", full_m['chars_ns'], sel_m['chars_ns'] if has_sel else None),
+            ("Characters (with spaces):", full_m['chars_ws'], sel_m['chars_ws'] if has_sel else None),
+            ("Paragraphs:", full_m['paras'], sel_m['paras'] if has_sel else None),
+            ("Lines:", full_m['lines'], sel_m['lines'] if has_sel else None),
+        ]
+
+        ttk.Label(stats_frame, text="Metric", font=(SANS_FONT, 9, "bold")).grid(row=0, column=0, sticky=tk.W, pady=2)
+        if has_sel:
+            ttk.Label(stats_frame, text="Selection", font=(SANS_FONT, 9, "bold")).grid(row=0, column=1, sticky=tk.E, padx=12, pady=2)
+            ttk.Label(stats_frame, text="Full Document", font=(SANS_FONT, 9, "bold")).grid(row=0, column=2, sticky=tk.E, pady=2)
+        else:
+            ttk.Label(stats_frame, text="Full Document", font=(SANS_FONT, 9, "bold")).grid(row=0, column=1, sticky=tk.E, padx=20, pady=2)
+
+        for idx, (label, full_val, sel_val) in enumerate(rows, start=1):
+            ttk.Label(stats_frame, text=label).grid(row=idx, column=0, sticky=tk.W, pady=2)
+            if has_sel:
+                ttk.Label(stats_frame, text=f"{sel_val:,}").grid(row=idx, column=1, sticky=tk.E, padx=12, pady=2)
+                ttk.Label(stats_frame, text=f"{full_val:,}").grid(row=idx, column=2, sticky=tk.E, pady=2)
+            else:
+                ttk.Label(stats_frame, text=f"{full_val:,}").grid(row=idx, column=1, sticky=tk.E, padx=20, pady=2)
+
+        # Structure & Reading Time Frame
+        more_frame = ttk.LabelFrame(body, text="Structure & Reading Estimates", padding=10)
+        more_frame.pack(fill=tk.X, pady=(0, 10))
+
+        struct_rows = [
+            ("Section Headings:", f"{full_m['headings']}"),
+            ("Embedded Tables:", f"{full_m['tables']}"),
+            ("Figures & Images:", f"{full_m['figures']}"),
+            ("Estimated Reading Time (200 wpm):", f"{full_m['read_time']}"),
+            ("Estimated Speaking Time (130 wpm):", f"{full_m['speak_time']}"),
+        ]
+
+        for idx, (label, val_str) in enumerate(struct_rows):
+            ttk.Label(more_frame, text=label).grid(row=idx, column=0, sticky=tk.W, pady=2)
+            ttk.Label(more_frame, text=val_str, font=(SANS_FONT, 9, "bold")).grid(row=idx, column=1, sticky=tk.E, padx=20, pady=2)
+
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill=tk.X, side=tk.BOTTOM)
+        close_btn = ttk.Button(btn_row, text="Close", command=self.destroy, width=10)
+        close_btn.pack(side=tk.RIGHT)
+        close_btn.focus_set()
 
 
 class ImageExtractor:
@@ -1349,6 +1631,36 @@ class VisualTableWidget(tk.Frame):
         self.headers = non_sep_rows[0]
         self.data_rows = non_sep_rows[1:] if len(non_sep_rows) > 1 else []
 
+        # Action strip atop the table
+        self.top_strip = tk.Frame(self, bg=self.header_bg)
+        self.top_strip.pack(side=tk.TOP, fill=tk.X)
+
+        strip_lbl = tk.Label(
+            self.top_strip, text=f" ⊞ Table ({len(self.headers)} cols × {len(self.data_rows)} rows)",
+            font=(self.visual_font, max(8, int(self.visual_font_size * 0.8)), "bold"),
+            bg=self.header_bg, fg=self.header_fg
+        )
+        strip_lbl.pack(side=tk.LEFT, padx=4, pady=2)
+
+        def _make_strip_btn(txt, cmd, tip):
+            b = tk.Button(
+                self.top_strip, text=txt, command=cmd,
+                font=(self.visual_font, max(8, int(self.visual_font_size * 0.8))),
+                bg=self.header_bg, fg=self.header_fg, activebackground=self.row_alt_bg,
+                relief=tk.FLAT, bd=0, padx=4, pady=1, cursor="hand2"
+            )
+            b.pack(side=tk.RIGHT, padx=2, pady=1)
+            ToolTip(b, tip, delay=300)
+            return b
+
+        _make_strip_btn("📋 TSV", self.copy_table_tsv, "Copy table data as TSV (tab-separated values) to clipboard for Excel or Sheets.")
+        _make_strip_btn("⇄ Align", self.cycle_all_alignment, "Cycle table column alignment between left, center, and right.")
+        _make_strip_btn("+ Col", lambda: self.insert_column(len(self.headers)), "Insert a new blank column to the right side of the table.")
+        _make_strip_btn("+ Row", lambda: self.insert_row(len(self.data_rows)), "Append a new blank row at the end of the table.")
+
+        self.table_body = tk.Frame(self, bg=self.tbl_border)
+        self.table_body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
         cell_font = (self.visual_font, max(8, int(self.visual_font_size * 0.95)))
         head_font = (self.visual_font, max(8, int(self.visual_font_size * 0.95)), "bold")
 
@@ -1361,7 +1673,7 @@ class VisualTableWidget(tk.Frame):
             col_weights.append(max(4, min(28, w)))
 
         for col_idx, weight in enumerate(col_weights):
-            self.grid_columnconfigure(col_idx, weight=weight)
+            self.table_body.grid_columnconfigure(col_idx, weight=weight)
 
         justify_map = {'left': tk.LEFT, 'center': tk.CENTER, 'right': tk.RIGHT}
 
@@ -1379,7 +1691,7 @@ class VisualTableWidget(tk.Frame):
         for col_idx, h in enumerate(self.headers):
             h_var = tk.StringVar(value=_clean_for_display(h))
             entry = tk.Entry(
-                self, textvariable=h_var, font=head_font,
+                self.table_body, textvariable=h_var, font=head_font,
                 bg=self.header_bg, fg=self.header_fg, relief=tk.FLAT, bd=0,
                 justify=justify_map.get(self.col_alignments[col_idx], tk.LEFT),
                 width=max(4, min(28, col_weights[col_idx]))
@@ -1400,7 +1712,7 @@ class VisualTableWidget(tk.Frame):
             for col_idx, cell in enumerate(row):
                 cell_var = tk.StringVar(value=_clean_for_display(cell))
                 entry = tk.Entry(
-                    self, textvariable=cell_var, font=cell_font,
+                    self.table_body, textvariable=cell_var, font=cell_font,
                     bg=c_bg, fg=self.cell_fg, relief=tk.FLAT, bd=0,
                     justify=justify_map.get(self.col_alignments[col_idx], tk.LEFT),
                     width=max(4, min(28, col_weights[col_idx]))
@@ -1503,6 +1815,14 @@ class VisualTableWidget(tk.Frame):
                     del r[col_idx]
             self._sync()
             self._build_table_ui()
+
+    def cycle_all_alignment(self):
+        """Cycle column alignments across left, center, and right."""
+        curr = self.col_alignments[0] if self.col_alignments else 'left'
+        nxt = 'center' if curr == 'left' else ('right' if curr == 'center' else 'left')
+        self.col_alignments = [nxt] * len(self.headers)
+        self._sync()
+        self._build_table_ui()
 
     def set_column_alignment(self, col_idx, align):
         if 0 <= col_idx < len(self.col_alignments):
@@ -2766,6 +3086,8 @@ class DocumentTab(ttk.Frame):
             self.source_editor.bind("<ISO_Left_Tab>", self._on_source_shift_tab)
         except tk.TclError:
             pass
+        self._last_embedded_sig = None
+        self._mini_toolbar = FloatingMiniToolbar(self)
 
     # --- page / zoom -----------------------------------------------------------
 
@@ -2805,6 +3127,9 @@ class DocumentTab(ttk.Frame):
     
     def _on_text_modified(self, event=None):
         """Handle text modification"""
+        if getattr(self, '_updating_from_widget', False):
+            self.source_editor.edit_modified(False)
+            return
         if self.source_editor.edit_modified():
             self.is_modified = True
             self.source_editor.edit_modified(False)
@@ -2829,6 +3154,7 @@ class DocumentTab(ttk.Frame):
                 except Exception:
                     pass
             self._embedded_windows.clear()
+            self._last_embedded_sig = None
         finally:
             self.source_editor.config(undo=prev_undo)
 
@@ -2856,8 +3182,6 @@ class DocumentTab(ttk.Frame):
         if self.current_mode != "visual" or getattr(self, '_updating_from_widget', False):
             return
 
-        self.clear_embedded_widgets()
-
         content = self.source_editor.get("1.0", tk.END)
         lines = content.split('\n')
         dark = _is_dark_color(self.theme.get('visual_bg', '#ffffff'))
@@ -2865,77 +3189,87 @@ class DocumentTab(ttk.Frame):
         font_size = self.theme.get('visual_font_size', 11)
         content_w = getattr(self.source_page, 'content_width', 600)
 
-        in_table = False
-        table_lines = []
-        table_start_line = 0
+        # Build candidate signature of blocks to render
+        candidate_blocks = []
+        in_tbl = False
+        cur_tbl = []
+        tbl_start = 0
 
         for lineno, line in enumerate(lines, start=1):
             stripped = line.strip()
             if stripped.startswith('|') and stripped.endswith('|'):
-                if not in_table:
-                    in_table = True
-                    table_lines = [stripped]
-                    table_start_line = lineno
+                if not in_tbl:
+                    in_tbl = True
+                    cur_tbl = [stripped]
+                    tbl_start = lineno
                 else:
-                    table_lines.append(stripped)
+                    cur_tbl.append(stripped)
             else:
-                if in_table:
-                    if any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl) for tl in table_lines):
-                        end_line = lineno - 1
-                        self.source_editor.tag_add("syn_block_elide", f"{table_start_line}.0", f"{end_line}.end")
-                        tbl_widget = VisualTableWidget(
-                            self.source_editor,
-                            on_change_callback=self._on_embedded_block_edit,
-                            table_lines=table_lines,
-                            is_dark=dark,
-                            visual_font=font_family,
-                            visual_font_size=font_size,
-                            content_width=content_w
-                        )
-                        self.source_editor.window_create(f"{table_start_line}.0", window=tbl_widget)
-                        self._embedded_windows.append(tbl_widget)
-                    in_table = False
-                    table_lines = []
+                if in_tbl:
+                    if any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl) for tl in cur_tbl):
+                        candidate_blocks.append(('table', tbl_start, lineno - 1, tuple(cur_tbl)))
+                    in_tbl = False
+                    cur_tbl = []
 
             m_img = re.match(r'^\s*(!\[([^\]]*)\]\(([^)]+)\))\s*$', line)
-            if m_img and not in_table:
-                raw_match = m_img.group(1)
-                alt_meta = m_img.group(2)
-                img_path = m_img.group(3)
-                img_info = self.visual_viewer.image_handler._parse_extended_alt(alt_meta)
-                img_info['path'] = img_path
-                img_info['type'] = 'file'
-                img_info['full_match'] = raw_match
+            if m_img and not in_tbl:
+                candidate_blocks.append(('image', lineno, m_img.group(1), m_img.group(2), m_img.group(3)))
 
-                self.source_editor.tag_add("syn_block_elide", f"{lineno}.0", f"{lineno}.end")
-                fig_widget = VisualFigureWidget(
-                    self.source_editor,
-                    on_change_callback=self._on_embedded_block_edit,
-                    raw_match=raw_match,
-                    img_info=img_info,
-                    image_handler=self.visual_viewer.image_handler,
-                    is_dark=dark,
-                    visual_font=font_family,
-                    visual_font_size=font_size,
-                    content_width=content_w
-                )
-                self.source_editor.window_create(f"{lineno}.0", window=fig_widget)
-                self._embedded_windows.append(fig_widget)
+        if in_tbl and any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl) for tl in cur_tbl):
+            candidate_blocks.append(('table', tbl_start, len(lines), tuple(cur_tbl)))
 
-        if in_table and any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl) for tl in table_lines):
-            end_line = len(lines)
-            self.source_editor.tag_add("syn_block_elide", f"{table_start_line}.0", f"{end_line}.end")
-            tbl_widget = VisualTableWidget(
-                self.source_editor,
-                on_change_callback=self._on_embedded_block_edit,
-                table_lines=table_lines,
-                is_dark=dark,
-                visual_font=font_family,
-                visual_font_size=font_size,
-                content_width=content_w
-            )
-            self.source_editor.window_create(f"{table_start_line}.0", window=tbl_widget)
-            self._embedded_windows.append(tbl_widget)
+        new_sig = (tuple(candidate_blocks), dark, font_family, font_size, content_w)
+        if getattr(self, '_last_embedded_sig', None) == new_sig:
+            return
+
+        self._updating_from_widget = True
+        was_modified = self.is_modified
+        prev_undo = self.source_editor.cget('undo')
+        self.source_editor.config(undo=False)
+        try:
+            self.clear_embedded_widgets()
+            for blk in candidate_blocks:
+                if blk[0] == 'table':
+                    _, s_line, e_line, t_lines = blk
+                    self.source_editor.tag_add("syn_block_elide", f"{s_line}.0", f"{e_line}.end")
+                    tbl_widget = VisualTableWidget(
+                        self.source_editor,
+                        on_change_callback=self._on_embedded_block_edit,
+                        table_lines=list(t_lines),
+                        is_dark=dark,
+                        visual_font=font_family,
+                        visual_font_size=font_size,
+                        content_width=content_w
+                    )
+                    self.source_editor.window_create(f"{s_line}.0", window=tbl_widget)
+                    self._embedded_windows.append(tbl_widget)
+                elif blk[0] == 'image':
+                    _, lineno, raw_match, alt_meta, img_path = blk
+                    img_info = self.visual_viewer.image_handler._parse_extended_alt(alt_meta)
+                    img_info['path'] = img_path
+                    img_info['type'] = 'file'
+                    img_info['full_match'] = raw_match
+
+                    self.source_editor.tag_add("syn_block_elide", f"{lineno}.0", f"{lineno}.end")
+                    fig_widget = VisualFigureWidget(
+                        self.source_editor,
+                        on_change_callback=self._on_embedded_block_edit,
+                        raw_match=raw_match,
+                        img_info=img_info,
+                        image_handler=self.visual_viewer.image_handler,
+                        is_dark=dark,
+                        visual_font=font_family,
+                        visual_font_size=font_size,
+                        content_width=content_w
+                    )
+                    self.source_editor.window_create(f"{lineno}.0", window=fig_widget)
+                    self._embedded_windows.append(fig_widget)
+            self._last_embedded_sig = new_sig
+        finally:
+            self.source_editor.config(undo=prev_undo)
+            self.is_modified = was_modified
+            self.source_editor.edit_modified(False)
+            self._updating_from_widget = False
 
     def _update_active_line_elision(self, event=None):
         """Reveal syntax delimiters on the active cursor line and elide them on other lines in visual mode."""
@@ -3104,8 +3438,8 @@ class DocumentTab(ttk.Frame):
             code_bg, code_fg = '#2d2f3a', '#f38ba8'
             hl_bg, hl_fg = '#713f12', '#fef9c3'
         else:
-            heads = ('#1a1a2e', '#16213e', '#1f4068', '#1b1b2f')
-            bold_fg, italic_fg, link_fg, quote_fg, hr_fg = '#d73a49', '#6f42c1', '#0066cc', '#6c757d', '#aaaaaa'
+            heads = ('#2e1065', '#3b0764', '#4c1d95', '#5b21b6')
+            bold_fg, italic_fg, link_fg, quote_fg, hr_fg = '#d73a49', '#6f42c1', '#6d28d9', '#6c757d', '#aaaaaa'
             code_bg, code_fg = '#f0f0f0', '#c7254e'
             hl_bg, hl_fg = '#fef08a', '#1a1a1a'
 
@@ -3354,8 +3688,6 @@ class DocumentTab(ttk.Frame):
 
     def center_cursor_vertically(self):
         """Keep the active cursor line near the vertical center (~45%) of the source editor viewport."""
-        if self.current_mode != "source":
-            return
         editor = self.source_editor
         try:
             bbox = editor.bbox(tk.INSERT)
@@ -3393,10 +3725,6 @@ class DocumentTab(ttk.Frame):
             except Exception:
                 pass
             self._ac_job = None
-
-        if self.current_mode != "source":
-            self._close_autocomplete()
-            return
 
         line_prefix = self.source_editor.get("insert linestart", tk.INSERT)
         m = re.search(r'\[@(?!(?:anchor|def):)([^\]\n]*)$', line_prefix)
@@ -3446,10 +3774,6 @@ class DocumentTab(ttk.Frame):
     def _show_anchor_autocomplete(self):
         """Display or refresh the floating cross-reference autocomplete popup."""
         self._ac_job = None
-        if self.current_mode != "source":
-            self._close_autocomplete()
-            return
-
         editor = self.source_editor
         line_prefix = editor.get("insert linestart", tk.INSERT)
         m = re.search(r'\[@(?!(?:anchor|def):)([^\]\n]*)$', line_prefix)
@@ -3834,10 +4158,19 @@ class OutlinePanel(ttk.Frame):
         header.pack(fill=tk.X, padx=4, pady=(6, 2))
         ttk.Label(header, text='Navigator', font=(SANS_FONT, 10, 'bold')).pack(side=tk.LEFT, padx=4)
 
-        # Category filter bar
+        # Category filter bar with uniform columns to prevent clipping
         cat_bar = ttk.Frame(self)
         cat_bar.pack(fill=tk.X, padx=4, pady=(0, 3))
-        for key, label in self.CATEGORIES:
+        for i in range(len(self.CATEGORIES)):
+            cat_bar.columnconfigure(i, weight=1, uniform='nav_cats')
+        cat_tips = {
+            'all': "Display all structural items in the document including headings, anchors, tables, media, and footnotes.",
+            'headings': "Filter navigator to only show Markdown headings (levels H1 through H6).",
+            'anchors': "Filter navigator to display explicit cross-reference anchors and reference links.",
+            'media': "Filter navigator to show tables, diagrams, and embedded image figures.",
+            'footnotes': "Filter navigator to list all footnote references and footnote definitions."
+        }
+        for i, (key, label) in enumerate(self.CATEGORIES):
             rb = ttk.Radiobutton(
                 cat_bar,
                 text=label,
@@ -3846,7 +4179,8 @@ class OutlinePanel(ttk.Frame):
                 style='Toolbar.Toolbutton',
                 command=self._refresh_from_cache,
             )
-            rb.pack(side=tk.LEFT, padx=1, expand=True, fill=tk.X)
+            rb.grid(row=0, column=i, sticky='ew', padx=1)
+            ToolTip(rb, cat_tips.get(key, ""))
 
         # Live filter search entry
         filter_row = ttk.Frame(self)
@@ -3859,6 +4193,7 @@ class OutlinePanel(ttk.Frame):
             command=lambda: (self.filter_var.set(''), self._refresh_from_cache())
         )
         clear_btn.pack(side=tk.RIGHT, padx=(2, 0))
+        ToolTip(clear_btn, "Clear search filter and display all items in active category.")
         self.filter_var.trace_add('write', lambda *_: self._refresh_from_cache())
 
         tree_frame = ttk.Frame(self)
@@ -4066,56 +4401,59 @@ class DockedFindReplaceBar(ttk.Frame):
         self._setup_ui()
 
     def _setup_ui(self):
-        # Row 1: Find controls
+        # Row 1: Find controls (close button packed right first to avoid occlusion)
         self.find_row = ttk.Frame(self)
         self.find_row.pack(fill=tk.X, pady=1)
 
-        ttk.Label(self.find_row, text="Find:", width=8).pack(side=tk.LEFT)
-        self.find_entry = ttk.Entry(self.find_row, textvariable=self.find_var, width=28)
+        close_btn = ttk.Button(self.find_row, text="✕", width=3, style="Toolbar.TButton", command=self.hide)
+        close_btn.pack(side=tk.RIGHT, padx=2)
+        ToolTip(close_btn, "Close Find & Replace bar (Escape).")
+
+        ttk.Label(self.find_row, text="Find:", width=6).pack(side=tk.LEFT)
+        self.find_entry = ttk.Entry(self.find_row, textvariable=self.find_var, width=22)
         self.find_entry.pack(side=tk.LEFT, padx=(0, 4))
 
         prev_btn = ttk.Button(self.find_row, text="▲", width=3, style="Toolbar.TButton", command=self.find_prev)
         prev_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(prev_btn, "Previous Match (Shift+Enter)")
+        ToolTip(prev_btn, "Navigate to previous search match in document (Shift+Enter).")
 
         next_btn = ttk.Button(self.find_row, text="▼", width=3, style="Toolbar.TButton", command=self.find_next)
         next_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(next_btn, "Next Match (Enter / F3)")
+        ToolTip(next_btn, "Navigate to next search match in document (Enter / F3).")
 
         case_cb = ttk.Checkbutton(self.find_row, text="Aa", variable=self.case_var,
                                   style="Toolbar.Toolbutton", command=self._on_query_change)
         case_cb.pack(side=tk.LEFT, padx=2)
-        ToolTip(case_cb, "Match Case")
+        ToolTip(case_cb, "Toggle case-sensitive search matching.")
 
         regex_cb = ttk.Checkbutton(self.find_row, text=".*", variable=self.regex_var,
                                    style="Toolbar.Toolbutton", command=self._on_query_change)
         regex_cb.pack(side=tk.LEFT, padx=2)
-        ToolTip(regex_cb, "Use Regular Expressions")
+        ToolTip(regex_cb, "Enable regular expression search pattern matching.")
 
         self.toggle_rep_btn = ttk.Button(
             self.find_row, text="⇄ Replace", width=9, style="Toolbar.TButton",
             command=self.toggle_replace_row
         )
         self.toggle_rep_btn.pack(side=tk.LEFT, padx=4)
+        ToolTip(self.toggle_rep_btn, "Expand or collapse the text replacement input row.")
 
         self.count_label = ttk.Label(self.find_row, text="", foreground="#64748b", font=(SANS_FONT, 9))
         self.count_label.pack(side=tk.LEFT, padx=8)
 
-        close_btn = ttk.Button(self.find_row, text="✕", width=3, style="Toolbar.TButton", command=self.hide)
-        close_btn.pack(side=tk.RIGHT, padx=2)
-        ToolTip(close_btn, "Close Find Bar (Esc)")
-
         # Row 2: Replace controls (packed when replace_visible is True)
         self.replace_row = ttk.Frame(self)
         ttk.Label(self.replace_row, text="Replace:", width=8).pack(side=tk.LEFT)
-        self.replace_entry = ttk.Entry(self.replace_row, textvariable=self.replace_var, width=28)
+        self.replace_entry = ttk.Entry(self.replace_row, textvariable=self.replace_var, width=22)
         self.replace_entry.pack(side=tk.LEFT, padx=(0, 4))
 
         rep_btn = ttk.Button(self.replace_row, text="Replace", width=9, style="Toolbar.TButton", command=self.replace_one)
         rep_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(rep_btn, "Replace the currently focused match with replacement text.")
 
         rep_all_btn = ttk.Button(self.replace_row, text="Replace All", width=10, style="Toolbar.TButton", command=self.replace_all)
         rep_all_btn.pack(side=tk.LEFT, padx=2)
+        ToolTip(rep_all_btn, "Replace all occurrences throughout the entire document.")
 
         # Bindings
         self.find_var.trace_add("write", lambda *_: self._on_query_change())
@@ -4312,7 +4650,7 @@ class MarkdownNotepad(tk.Tk):
     
     # Default theme settings. Font entries are resolved in __init__ once a Tk root exists.
     DEFAULT_THEME = {
-        'source_bg': '#fefefe',
+        'source_bg': '#ffffff',
         'source_fg': '#1a1a1a',
         'source_font': None,
         'source_font_size': 11,
@@ -4320,8 +4658,12 @@ class MarkdownNotepad(tk.Tk):
         'visual_fg': '#1a1a1a',
         'visual_font': None,
         'visual_font_size': 11,
-        # Page layout / zoom
-        'desk_bg': '#d9dce1',
+        # Page layout / zoom / Royal Purple Word 2010 theme
+        'desk_bg': '#dcd6e8',
+        'ribbon_bg': '#f3effa',
+        'status_bg': '#3b1d6e',
+        'status_fg': '#f5f3ff',
+        'accent_purple': '#5b21b6',
         'page_layout': True,
         'page_size': 'Letter',
         'page_margin': 'Normal',
@@ -4567,16 +4909,13 @@ class MarkdownNotepad(tk.Tk):
         self._update_zoom_widgets()
     
     def _setup_styles(self):
-        """Configure ttk look & feel (fonts, toolbar buttons, tabs, status bar)"""
+        """Configure ttk look & feel with MS Word 2010 Royal Purple styling."""
         style = ttk.Style()
-        if os.name == 'nt' and 'vista' in style.theme_names():
+        if 'clam' in style.theme_names():
             try:
-                style.theme_use('vista')
+                style.theme_use('clam')
             except Exception:
-                if 'clam' in style.theme_names():
-                    style.theme_use('clam')
-        elif style.theme_use() == 'default' and 'clam' in style.theme_names():
-            style.theme_use('clam')
+                pass
 
         for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont'):
             try:
@@ -4584,15 +4923,40 @@ class MarkdownNotepad(tk.Tk):
             except Exception:
                 pass
 
-        if style.theme_use() == 'clam':
-            style.configure('Vertical.TScrollbar', arrowsize=12)
+        ribbon_bg = self.theme.get('ribbon_bg', '#f3effa')
+        desk_bg = self.theme.get('desk_bg', '#dcd6e8')
+        status_bg = self.theme.get('status_bg', '#3b1d6e')
+        status_fg = self.theme.get('status_fg', '#f5f3ff')
+        accent_purple = self.theme.get('accent_purple', '#5b21b6')
 
-        style.configure("Toolbar.TButton", relief='flat', padding=(6, 3), width=0)
-        style.configure("Toolbar.Toolbutton", padding=(10, 4))
-        style.configure("TNotebook.Tab", padding=(14, 6))
-        style.configure("Status.TLabel", font=(SANS_FONT, 9))
-        style.configure("Zoom.TButton", padding=(4, 0), width=2)
-    
+        style.configure("Ribbon.TFrame", background=ribbon_bg)
+        style.configure("RibbonDeck.TFrame", background=ribbon_bg)
+        style.configure("Toolbar.TButton", background=ribbon_bg, relief='flat', padding=(6, 3), width=0)
+        style.map("Toolbar.TButton",
+            background=[('pressed', '#ddd6fe'), ('active', '#ede9fe')],
+            relief=[('pressed', 'groove'), ('!pressed', 'flat')]
+        )
+        style.configure("Toolbar.Toolbutton", background=ribbon_bg, padding=(8, 3))
+        style.map("Toolbar.Toolbutton",
+            background=[('selected', '#ddd6fe'), ('active', '#ede9fe')]
+        )
+        style.configure("TNotebook", background=desk_bg)
+        style.configure("TNotebook.Tab", background=ribbon_bg, padding=(14, 5))
+        style.map("TNotebook.Tab",
+            background=[('selected', '#ffffff'), ('active', '#ede9fe')]
+        )
+        style.configure("StatusBar.TFrame", background=status_bg)
+        style.configure("Status.TLabel", background=status_bg, foreground=status_fg, font=(SANS_FONT, 9))
+        style.configure("StatusPill.TButton", background='#4c1d95', foreground='#ffffff', relief='flat', padding=(6, 1))
+        style.map("StatusPill.TButton",
+            background=[('pressed', '#6d28d9'), ('active', '#5b21b6')]
+        )
+        style.configure("Zoom.TButton", background=status_bg, foreground=status_fg, padding=(4, 0), width=2)
+        style.map("Zoom.TButton",
+            background=[('pressed', '#6d28d9'), ('active', '#4c1d95')]
+        )
+        style.configure('Vertical.TScrollbar', arrowsize=12)
+
     def _create_menu(self):
         """Create the menu bar"""
         self.menubar = tk.Menu(self)
@@ -4775,70 +5139,104 @@ class MarkdownNotepad(tk.Tk):
         help_menu.add_command(label="MarkItDown Info", command=self.show_markitdown_info)
     
     def _create_toolbar(self):
-        """Create the main toolbar with grouped icons and shortcut tooltips"""
-        self.toolbar_frame = ttk.Frame(self)
+        """Create the MS Word 2010 style two-deck ribbon toolbar with grouped tools and 1-2 sentence tooltips."""
+        self.toolbar_frame = ttk.Frame(self, style="Ribbon.TFrame")
         self.toolbar_frame.pack(fill=tk.X, padx=5, pady=(4, 2))
-        toolbar = self.toolbar_frame
         
-        # 1. File & Document Workflow Group
-        new_btn = ttk.Button(toolbar, text="\U0001f5cb New", command=self.new_tab, style="Toolbar.TButton")
+        # Two distinct decks: Top Deck (Workflow & Workspace) and Bottom Deck (Typography & Formatting)
+        self.ribbon_top_deck = ttk.Frame(self.toolbar_frame, style="RibbonDeck.TFrame")
+        self.ribbon_top_deck.pack(fill=tk.X, padx=2, pady=(0, 2))
+        
+        self.ribbon_bottom_deck = ttk.Frame(self.toolbar_frame, style="RibbonDeck.TFrame")
+        self.ribbon_bottom_deck.pack(fill=tk.X, padx=2, pady=(0, 2))
+        self._ribbon_collapsed = False
+
+        # -------------------------------------------------------------
+        # DECK 1 (Top Deck): File, Workflow, View Mode, Panels
+        # -------------------------------------------------------------
+        top = self.ribbon_top_deck
+
+        new_btn = ttk.Button(top, text="\U0001f5cb New", command=self.new_tab, style="Toolbar.TButton")
         new_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(new_btn, "New Tab (Ctrl+N)")
-        
-        open_btn = ttk.Button(toolbar, text="\U0001f4c2 Open", command=self.open_file, style="Toolbar.TButton")
+        ToolTip(new_btn, "Create a new blank document tab (Ctrl+N). Each tab maintains independent zoom, view mode, and history.")
+
+        open_btn = ttk.Button(top, text="\U0001f4c2 Open", command=self.open_file, style="Toolbar.TButton")
         open_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(open_btn, "Open File (Ctrl+O)")
-        
-        convert_btn = ttk.Button(toolbar, text="\u26a1 Convert", command=self.open_with_markitdown, style="Toolbar.TButton")
+        ToolTip(open_btn, "Open an existing Markdown (.md, .txt) file from your local disk (Ctrl+O).")
+
+        convert_btn = ttk.Button(top, text="\u26a1 Convert", command=self.open_with_markitdown, style="Toolbar.TButton")
         convert_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(convert_btn, "Open with MarkItDown — Convert PDF, DOCX, PPTX, EPUB (Ctrl+Shift+O)")
-        
-        save_btn = ttk.Button(toolbar, text="\U0001f4be Save", command=self.save_file, style="Toolbar.TButton")
+        ToolTip(convert_btn, "Convert document formats (PDF, DOCX, PPTX, EPUB, XLSX) to clean Markdown using MarkItDown (Ctrl+Shift+O).")
+
+        save_btn = ttk.Button(top, text="\U0001f4be Save", command=self.save_file, style="Toolbar.TButton")
         save_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(save_btn, "Save File (Ctrl+S)")
+        ToolTip(save_btn, "Save the current document to disk (Ctrl+S). If untitled, prompts for a destination file path.")
 
-        snap_btn = ttk.Button(toolbar, text="\U0001f552 Snapshots", command=self.open_snapshots_dialog, style="Toolbar.TButton")
+        snap_btn = ttk.Button(top, text="\U0001f552 Snapshots", command=self.open_snapshots_dialog, style="Toolbar.TButton")
         snap_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(snap_btn, "Document Snapshots / Checkpoints — Save, compare & restore versions (Ctrl+Alt+S / Ctrl+Shift+P)")
+        ToolTip(snap_btn, "Open Document Snapshots / Checkpoints dialog (Ctrl+Alt+S / Ctrl+Shift+P) to compare, review diffs, or restore prior versions.")
 
-        reflow_btn = ttk.Button(toolbar, text="\u21bb Reflow", command=self.clean_current_document, style="Toolbar.TButton")
+        reflow_btn = ttk.Button(top, text="\u21bb Reflow", command=self.clean_current_document, style="Toolbar.TButton")
         reflow_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(reflow_btn, "Clean & Reflow Document — Fix soft wraps & broken lines (Ctrl+Shift+R)")
-        
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
-        
-        # 2. Unified View / Source View Checkbox
-        mode_frame = ttk.Frame(toolbar)
-        mode_frame.pack(side=tk.LEFT, padx=1)
-        
+        ToolTip(reflow_btn, "Clean and reflow lines, fixing artificial line breaks, hyphenated breaks, and soft wrapped prose (Ctrl+Shift+R).")
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
+
         self.source_view_cb = ttk.Checkbutton(
-            mode_frame, text="Source View", variable=self.source_view_var, style="Toolbar.Toolbutton",
+            top, text="Source View", variable=self.source_view_var, style="Toolbar.Toolbutton",
             command=self._on_source_view_toggle
         )
-        self.source_view_cb.pack(side=tk.LEFT)
-        ToolTip(self.source_view_cb, "Toggle raw Markdown syntax view (Ctrl+E)")
-        
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
-        
-        # 3. Inline Formatting Group (Source Mode)
+        self.source_view_cb.pack(side=tk.LEFT, padx=2)
+        ToolTip(self.source_view_cb, "Toggle raw Markdown syntax view (Ctrl+E). When unticked, displays a seamless Word-like visual canvas with embedded tables and figures.")
+
+        # Right-aligned controls in Deck 1
+        self.ai_sidebar_btn = ttk.Button(top, text="\U0001f4ac AI Chat", command=self._toggle_ai_sidebar, style="Toolbar.TButton")
+        self.ai_sidebar_btn.pack(side=tk.RIGHT, padx=1)
+        ToolTip(self.ai_sidebar_btn, "Toggle the AI assistant sidebar (Ctrl+Shift+A) for drafting, rewriting, grammar correction, and document Q&A.")
+
+        fullscreen_btn = ttk.Button(top, text="\u26f6 Full Screen", command=self._toggle_focus_mode, style="Toolbar.TButton")
+        fullscreen_btn.pack(side=tk.RIGHT, padx=1)
+        ToolTip(fullscreen_btn, "Toggle full-screen focus distraction-free writing mode (F11). Press Escape to exit.")
+
+        outline_btn = ttk.Button(top, text="\U0001f4d1 Navigator", command=self._toggle_outline_panel, style="Toolbar.TButton")
+        outline_btn.pack(side=tk.RIGHT, padx=1)
+        ToolTip(outline_btn, "Toggle the Document Navigator sidebar (Ctrl+Shift+L) to browse headings, anchors, tables, and citations.")
+
+        theme_btn = ttk.Button(top, text="\U0001f3a8 Theme", command=self.open_theme_dialog, style="Toolbar.TButton")
+        theme_btn.pack(side=tk.RIGHT, padx=1)
+        ToolTip(theme_btn, "Customize editor theme, fonts, margins, desk background color, and blockquote styling.")
+
+        find_btn = ttk.Button(top, text="\U0001f50d Find", command=self.find_text, style="Toolbar.TButton")
+        find_btn.pack(side=tk.RIGHT, padx=1)
+        ToolTip(find_btn, "Open the docked search and replace bar (Ctrl+F / Ctrl+H) for fast in-document navigation.")
+
+        self.ribbon_toggle_btn = ttk.Button(top, text="▲", width=3, command=self._toggle_ribbon_collapse, style="Toolbar.TButton")
+        self.ribbon_toggle_btn.pack(side=tk.RIGHT, padx=2)
+        self._ribbon_toggle_tip = ToolTip(self.ribbon_toggle_btn, "Collapse formatting ribbon deck (Ctrl+F1) to maximize writing area.")
+
+        # -------------------------------------------------------------
+        # DECK 2 (Bottom Deck): Typography, Structure, Insert Elements
+        # -------------------------------------------------------------
+        btm = self.ribbon_bottom_deck
         self._format_buttons = []
-        
+
         def add_format_button(text, command, width, tip):
-            btn = ttk.Button(toolbar, text=text, command=command, width=width, style="Toolbar.TButton")
+            btn = ttk.Button(btm, text=text, command=command, width=width, style="Toolbar.TButton")
             btn.pack(side=tk.LEFT, padx=1)
             ToolTip(btn, tip)
             self._format_buttons.append(btn)
             return btn
-        
-        add_format_button("\U0001d401", lambda: self._insert_format("**", "**"), 3, "Bold **text** (Ctrl+B)")
-        add_format_button("\U0001d43c", lambda: self._insert_format("*", "*"), 3, "Italic *text* (Ctrl+I)")
-        add_format_button("\U0001f58d HL", lambda: self._insert_format("==", "=="), 5, "Highlight ==text== (Ctrl+Shift+H)")
-        add_format_button("</>", lambda: self._insert_format("`", "`"), 4, "Inline Code `code` (Ctrl+`)")
-        
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
-        
-        # 4. Structural & Block Elements Group (Source Mode)
-        heading_mb = ttk.Menubutton(toolbar, text="H\u25be", width=4, style="Toolbar.TButton")
+
+        # Typography
+        add_format_button("\U0001d401", lambda: self._insert_format("**", "**"), 3, "Format selected text as bold (**text**) (Ctrl+B).")
+        add_format_button("\U0001d43c", lambda: self._insert_format("*", "*"), 3, "Format selected text as italic (*text*) (Ctrl+I).")
+        add_format_button("\U0001f58d HL", lambda: self._insert_format("==", "=="), 5, "Format selected text with a highlight marker (==text==) (Ctrl+Shift+H).")
+        add_format_button("</>", lambda: self._insert_format("`", "`"), 4, "Format selected text as inline code (`code`) (Ctrl+`).")
+
+        ttk.Separator(btm, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
+
+        # Headings & Blocks
+        heading_mb = ttk.Menubutton(btm, text="H\u25be", width=4, style="Toolbar.TButton")
         heading_menu = tk.Menu(heading_mb, tearoff=0)
         heading_menu.add_command(label="H1 — Heading 1 (#)", command=lambda: self._insert_line_prefix("# "))
         heading_menu.add_command(label="H2 — Heading 2 (##)", command=lambda: self._insert_line_prefix("## "))
@@ -4846,47 +5244,40 @@ class MarkdownNotepad(tk.Tk):
         heading_menu.add_command(label="H4 — Heading 4 (####)", command=lambda: self._insert_line_prefix("#### "))
         heading_mb.config(menu=heading_menu)
         heading_mb.pack(side=tk.LEFT, padx=1)
-        ToolTip(heading_mb, "Insert Section Heading (# to ####)")
+        ToolTip(heading_mb, "Insert a markdown section heading (levels H1 through H4) at the active cursor line.")
         self._format_buttons.append(heading_mb)
-        
-        quote_btn = add_format_button("\u275d Quote", lambda: self._insert_line_prefix("> "), 7, "Blockquote > (Ctrl+Shift+Q) — Right-click to customize style")
+
+        quote_btn = add_format_button("\u275d Quote", lambda: self._insert_line_prefix("> "), 7, "Insert a blockquote prefix (> text) on the active line (Ctrl+Shift+Q). Right-click to configure custom colors and styling.")
         quote_btn.bind("<Button-3>", lambda e: self.open_blockquote_style_dialog())
-        add_format_button("\u2022 List", lambda: self._insert_line_prefix("- "), 6, "Bullet List (- item)")
-        add_format_button("1. List", lambda: self._insert_line_prefix("1. "), 6, "Numbered List (1. item)")
-        add_format_button("\u229e Table", self.insert_table, 7, "Insert Table — Choose rows, columns & header (Alt+T)")
-        add_format_button("{ }", lambda: self._insert_text("\n```\n\n```\n"), 4, "Fenced Code Block ``` (Ctrl+Shift+K)")
-        add_format_button("\u2015 HR", lambda: self._insert_text("\n---\n"), 5, "Horizontal Divider Rule (---)")
-        
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
-        
-        # 5. Cross-References, Citations, Math & Media Group (Source Mode)
-        add_format_button("\u2693 Anchor", lambda: self._insert_format("[@anchor: ", "]"), 8, "Insert Anchor Target [@anchor: name] (Ctrl+Shift+M)")
-        add_format_button("\U0001f517 Link", lambda: self._insert_format("[", "](url)"), 6, "Insert Link [text](url) (Ctrl+K)")
-        add_format_button("[^] Note", self.insert_footnote, 7, "Insert Footnote Citation [^1] (Ctrl+Shift+F)")
-        add_format_button("\u2211 Math", self.open_math_symbol_picker, 6, "Insert Math & Unicode Symbols (Ctrl+Shift+Y)")
-        add_format_button("\U0001f5bc Image", self.insert_image, 7, "Insert Image (Ctrl+Shift+I)")
-        
-        # 6. Right-hand Utility & Workspace Controls
-        self.ai_sidebar_btn = ttk.Button(toolbar, text="\U0001f4ac AI Chat", command=self._toggle_ai_sidebar, style="Toolbar.TButton")
-        self.ai_sidebar_btn.pack(side=tk.RIGHT, padx=1)
-        ToolTip(self.ai_sidebar_btn, "Toggle AI Assistant Sidebar (Ctrl+Shift+A)")
-        
-        fullscreen_btn = ttk.Button(toolbar, text="\u26f6 Full Screen", command=self._toggle_focus_mode, style="Toolbar.TButton")
-        fullscreen_btn.pack(side=tk.RIGHT, padx=1)
-        ToolTip(fullscreen_btn, "Full Screen Focus Mode (F11)")
-        
-        outline_btn = ttk.Button(toolbar, text="\U0001f4d1 Navigator", command=self._toggle_outline_panel, style="Toolbar.TButton")
-        outline_btn.pack(side=tk.RIGHT, padx=1)
-        ToolTip(outline_btn, "Toggle Document Navigator & Outline (Ctrl+Shift+L)")
-        
-        theme_btn = ttk.Button(toolbar, text="\U0001f3a8 Theme", command=self.open_theme_dialog, style="Toolbar.TButton")
-        theme_btn.pack(side=tk.RIGHT, padx=1)
-        ToolTip(theme_btn, "Customize Theme, Fonts, Desk & Blockquote Styling")
-        
-        find_btn = ttk.Button(toolbar, text="\U0001f50d Find", command=self.find_text, style="Toolbar.TButton")
-        find_btn.pack(side=tk.RIGHT, padx=1)
-        ToolTip(find_btn, "Find & Replace in Document (Ctrl+F / Ctrl+H)")
-    
+
+        add_format_button("\u2022 List", lambda: self._insert_line_prefix("- "), 6, "Insert a bulleted list item (- item) at the current line.")
+        add_format_button("1. List", lambda: self._insert_line_prefix("1. "), 6, "Insert a numbered list item (1. item) at the current line.")
+        add_format_button("\u229e Table", self.insert_table, 7, "Insert a structured Markdown table (Alt+T). You can specify columns, rows, and header text.")
+        add_format_button("{ }", lambda: self._insert_text("\n```\n\n```\n"), 4, "Insert a fenced code block with optional syntax highlighting language tag (Ctrl+Shift+K).")
+        add_format_button("\u2015 HR", lambda: self._insert_text("\n---\n"), 5, "Insert a thematic horizontal divider rule (---) separating document sections.")
+
+        ttk.Separator(btm, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
+
+        # Cross-References & Media
+        add_format_button("\u2693 Anchor", lambda: self._insert_format("[@anchor: ", "]"), 8, "Insert a named cross-reference target [@anchor: name] (Ctrl+Shift+M) for internal document hyperlinking.")
+        add_format_button("\U0001f517 Link", lambda: self._insert_format("[", "](url)"), 6, "Insert a markdown hyperlink [text](url) (Ctrl+K) around the selected text or at cursor.")
+        add_format_button("[^] Note", self.insert_footnote, 7, "Insert a footnote reference marker [^1] and generate a footnote definition stub (Ctrl+Shift+F).")
+        add_format_button("\u2211 Math", self.open_math_symbol_picker, 6, "Open the mathematical symbol and Greek alphabet picker (Ctrl+Shift+Y) to insert Unicode math notation.")
+        add_format_button("\U0001f5bc Image", self.insert_image, 7, "Insert an image tag with optional extended caption and alignment metadata (Ctrl+Shift+I).")
+
+    def _toggle_ribbon_collapse(self):
+        """Toggle bottom ribbon deck collapse/expand state (Ctrl+F1)."""
+        if getattr(self, '_ribbon_collapsed', False):
+            self.ribbon_bottom_deck.pack(fill=tk.X, padx=2, pady=(0, 2))
+            self._ribbon_collapsed = False
+            self.ribbon_toggle_btn.config(text="▲")
+            self._ribbon_toggle_tip.set_text("Collapse formatting ribbon deck (Ctrl+F1) to maximize writing area.")
+        else:
+            self.ribbon_bottom_deck.pack_forget()
+            self._ribbon_collapsed = True
+            self.ribbon_toggle_btn.config(text="▼")
+            self._ribbon_toggle_tip.set_text("Expand formatting ribbon deck (Ctrl+F1) to show typography and insert tools.")
+
     def _set_format_buttons_enabled(self, enabled=True):
         """Formatting buttons remain active across both Source View and Visual View."""
         for btn in getattr(self, '_format_buttons', []):
@@ -4896,8 +5287,8 @@ class MarkdownNotepad(tk.Tk):
                 pass
     
     def _create_status_bar(self):
-        """Create the status bar"""
-        self.status_bar = ttk.Frame(self)
+        """Create the MS Word 2010 Royal Purple status bar with interactive pills and tooltips."""
+        self.status_bar = ttk.Frame(self, style="StatusBar.TFrame")
         self.status_bar.pack(fill=tk.X, side=tk.BOTTOM, before=self.outer_paned)
         
         self.status_label = ttk.Label(self.status_bar, text="Ready", style="Status.TLabel")
@@ -4912,41 +5303,64 @@ class MarkdownNotepad(tk.Tk):
         zoom_menu.add_separator()
         zoom_menu.add_command(label="Fit Width", command=self.zoom_fit_width)
         self.zoom_label.config(menu=zoom_menu)
-        ToolTip(self.zoom_label, "Zoom level (click for presets, Ctrl+0 to reset)")
+        ToolTip(self.zoom_label, "Current canvas zoom level. Click to select a preset zoom percentage or fit width (Ctrl+0 to reset).")
         
         zoom_in_btn = ttk.Button(self.status_bar, text="+", style="Zoom.TButton", command=self.zoom_in)
         zoom_in_btn.pack(side=tk.RIGHT, pady=1)
-        ToolTip(zoom_in_btn, "Zoom In (Ctrl++)")
+        ToolTip(zoom_in_btn, "Zoom in the document canvas by 10% (Ctrl++).")
+
         self.zoom_scale = ttk.Scale(self.status_bar, from_=25, to=300, orient=tk.HORIZONTAL, length=110,
                                     command=self._on_zoom_scale)
         self.zoom_scale.pack(side=tk.RIGHT, padx=4)
-        ToolTip(self.zoom_scale, "Zoom: 25% – 400% (Ctrl+MouseWheel)")
-        zoom_out_btn = ttk.Button(self.status_bar, text="\u2212", style="Zoom.TButton", command=self.zoom_out)
+        ToolTip(self.zoom_scale, "Drag to adjust zoom between 25% and 400% of standard letter width. You can also hold Ctrl and scroll your mouse wheel.")
+
+        zoom_out_btn = ttk.Button(self.status_bar, text="−", style="Zoom.TButton", command=self.zoom_out)
         zoom_out_btn.pack(side=tk.RIGHT, pady=1)
-        ToolTip(zoom_out_btn, "Zoom Out (Ctrl+-)")
+        ToolTip(zoom_out_btn, "Zoom out the document canvas by 10% (Ctrl+-).")
         
         ttk.Separator(self.status_bar, orient=tk.VERTICAL).pack(side=tk.RIGHT, fill=tk.Y, padx=8, pady=3)
         
-        self.mode_label = ttk.Label(self.status_bar, text="Source Mode", style="Status.TLabel")
+        self.mode_label = ttk.Label(self.status_bar, text="Visual View", style="Status.TLabel", cursor="hand2")
         self.mode_label.pack(side=tk.RIGHT, padx=8)
+        self.mode_label.bind("<Button-1>", lambda e: self._on_status_mode_click())
+        ToolTip(self.mode_label, "Current document editing mode. Click to toggle between Visual View and raw Markdown Source View (Ctrl+E).")
         
-        self.wrap_label = ttk.Label(self.status_bar, text="Wrap: On", style="Status.TLabel")
+        self.wrap_label = ttk.Label(self.status_bar, text="Wrap: On", style="Status.TLabel", cursor="hand2")
         self.wrap_label.pack(side=tk.RIGHT, padx=8)
+        self.wrap_label.bind("<Button-1>", lambda e: self.toggle_word_wrap())
+        ToolTip(self.wrap_label, "Soft word wrap status. Click to toggle between visual line wrapping and unwrapped continuous lines.")
         
         # Word and character count
-        self.word_count_label = ttk.Label(self.status_bar, text="Words: 0 | Chars: 0", style="Status.TLabel")
+        self.word_count_label = ttk.Label(self.status_bar, text="Words: 0 | Chars: 0", style="Status.TLabel", cursor="hand2")
         self.word_count_label.pack(side=tk.RIGHT, padx=8)
+        self.word_count_label.bind("<Button-1>", lambda e: self.open_statistics_dialog())
+        ToolTip(self.word_count_label, "Document word and character counts. Click to open comprehensive Document Statistics with reading time and structure analysis.")
         
-        self.position_label = ttk.Label(self.status_bar, text="Line 1, Col 1", style="Status.TLabel")
+        self.position_label = ttk.Label(self.status_bar, text="Line 1, Col 1", style="Status.TLabel", cursor="hand2")
         self.position_label.pack(side=tk.RIGHT, padx=8)
+        self.position_label.bind("<Button-1>", lambda e: self.goto_line())
+        ToolTip(self.position_label, "Current cursor line and column position. Click to jump to a specific line number (Ctrl+G).")
         
         # MarkItDown status
         md_status = "MarkItDown: ✓" if MARKITDOWN_AVAILABLE else "MarkItDown: ✗"
-        self.md_status_label = ttk.Label(self.status_bar, text=md_status, style="Status.TLabel")
+        self.md_status_label = ttk.Label(self.status_bar, text=md_status, style="Status.TLabel", cursor="hand2")
         self.md_status_label.pack(side=tk.RIGHT, padx=8)
-    
+        self.md_status_label.bind("<Button-1>", lambda e: self.show_markitdown_info())
+        ToolTip(self.md_status_label, "MarkItDown document conversion engine availability. Click for supported format information and installation instructions.")
+
+    def open_statistics_dialog(self):
+        """Open comprehensive document statistics dialog."""
+        if self.current_tab:
+            DocumentStatisticsDialog(self, self.current_tab)
+
+    def _on_status_mode_click(self):
+        """Toggle source view from status bar click."""
+        self.source_view_var.set(not self.source_view_var.get())
+        self._on_source_view_toggle()
+
     def _setup_bindings(self):
         """Setup keyboard bindings"""
+        self.bind("<Control-F1>", lambda e: self._toggle_ribbon_collapse())
         # Neutralize conflicting default Text class bindings (e.g. Ctrl+I inserting tab)
         try:
             self.unbind_class("Text", "<Control-Key-i>")
@@ -5068,6 +5482,10 @@ class MarkdownNotepad(tk.Tk):
             self.outline_visible = False
         else:
             self.outer_paned.insert(0, self.outline_panel, weight=0)
+            try:
+                self.outer_paned.paneconfig(self.outline_panel, minsize=240, width=255)
+            except Exception:
+                pass
             self.outline_visible = True
             self._schedule_outline_update()
 
@@ -5981,11 +6399,7 @@ class MarkdownNotepad(tk.Tk):
                 word_count = len(words)
                 
                 # Check if there is a highlighted selection in the active view
-                active_widget = (
-                    self.current_tab.source_editor
-                    if self.current_tab.current_mode == "source"
-                    else self.current_tab.visual_viewer.text_widget
-                )
+                active_widget = self.current_tab.source_editor
                 sel_text = ""
                 try:
                     if active_widget.tag_ranges(tk.SEL):
@@ -6132,7 +6546,7 @@ class MarkdownNotepad(tk.Tk):
         if not self.current_tab:
             return
         tab = self.current_tab
-        page = tab.source_page if tab.current_mode == "source" else tab.visual_viewer.page_view
+        page = tab.source_page
         self._set_zoom(int(page.fit_zoom() * 100))
     
     def _update_zoom_widgets(self):
@@ -6327,7 +6741,7 @@ class MarkdownNotepad(tk.Tk):
         self.attributes('-fullscreen', False)
 
         # Restore chrome in pack order: toolbar (top), status bar (bottom), then the paned area
-        self.configure(bg="#f5f5f5")
+        self.configure(bg=self.theme.get('desk_bg', '#dcd6e8'))
         self.config(menu=self.menubar)
         self.toolbar_frame.pack(fill=tk.X, padx=5, pady=2, before=self.outer_paned)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, before=self.outer_paned)
@@ -7230,6 +7644,7 @@ class MarkdownNotepad(tk.Tk):
                 self.outline_panel.apply_theme(self.theme)
             except Exception:
                 pass
+        self._setup_styles()
         
         self._set_status("Theme applied")
 
@@ -7239,6 +7654,20 @@ class ThemeDialog(tk.Toplevel):
     
     # Preset themes
     PRESETS = {
+        'Royal Purple (Word)': {
+            'source_bg': '#ffffff', 'source_fg': '#1a1a1a',
+            'visual_bg': '#ffffff', 'visual_fg': '#1a1a1a',
+            'desk_bg': '#dcd6e8', 'ribbon_bg': '#f3effa',
+            'status_bg': '#3b1d6e', 'status_fg': '#f5f3ff',
+            'accent_purple': '#5b21b6',
+        },
+        'Royal Nocturne': {
+            'source_bg': '#191124', 'source_fg': '#e9d5ff',
+            'visual_bg': '#221533', 'visual_fg': '#f3e8ff',
+            'desk_bg': '#120b1a', 'ribbon_bg': '#2a1a40',
+            'status_bg': '#3b1d6e', 'status_fg': '#f5f3ff',
+            'accent_purple': '#9333ea',
+        },
         'Light': {
             'source_bg': '#fefefe', 'source_fg': '#1a1a1a',
             'visual_bg': '#ffffff', 'visual_fg': '#1a1a1a',
@@ -7278,9 +7707,9 @@ class ThemeDialog(tk.Toplevel):
         self.on_apply = on_apply
         
         self.title("Theme Settings")
-        self.geometry("520x720")
+        self.geometry("540x740")
         self.resizable(True, True)
-        self.minsize(470, 680)  # Set minimum size to prevent UI elements from overlapping
+        self.minsize(500, 700)  # Set minimum size to prevent UI elements from overlapping
         self.transient(parent)
         
         self._setup_ui()

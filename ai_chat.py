@@ -112,18 +112,25 @@ MONO_FONT = select_best_font(MONOSPACE_FONTS, "TkFixedFont")
 
 
 class ToolTip:
-    """Simple tooltip widget for tkinter"""
+    """Rich, screen-edge-clamped tooltip widget with multi-line wrap and dynamic text updates."""
     
-    def __init__(self, widget, text, delay=500):
+    def __init__(self, widget, text, delay=400):
         self.widget = widget
         self.text = text
         self.delay = delay
         self.tooltip_window = None
         self.scheduled_id = None
+        self.label = None
         
-        widget.bind('<Enter>', self._on_enter)
-        widget.bind('<Leave>', self._on_leave)
-        widget.bind('<Button>', self._on_leave)
+        widget.bind('<Enter>', self._on_enter, add=True)
+        widget.bind('<Leave>', self._on_leave, add=True)
+        widget.bind('<Button>', self._on_leave, add=True)
+    
+    def set_text(self, text):
+        """Dynamically update tooltip text while widget is alive."""
+        self.text = text
+        if self.label and self.tooltip_window and self.tooltip_window.winfo_exists():
+            self.label.config(text=text)
     
     def _on_enter(self, event=None):
         self._cancel_scheduled()
@@ -135,32 +142,66 @@ class ToolTip:
     
     def _cancel_scheduled(self):
         if self.scheduled_id:
-            self.widget.after_cancel(self.scheduled_id)
+            try:
+                self.widget.after_cancel(self.scheduled_id)
+            except Exception:
+                pass
             self.scheduled_id = None
     
     def _show_tooltip(self):
-        if self.tooltip_window:
+        if self.tooltip_window or not self.widget.winfo_exists():
             return
         
-        x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
-        
+        try:
+            wx = self.widget.winfo_rootx()
+            wy = self.widget.winfo_rooty()
+            ww = self.widget.winfo_width()
+            wh = self.widget.winfo_height()
+        except Exception:
+            return
+
         self.tooltip_window = tw = tk.Toplevel(self.widget)
         tw.wm_overrideredirect(True)
-        tw.wm_geometry(f"+{x}+{y}")
         
-        label = tk.Label(
+        self.label = tk.Label(
             tw, text=self.text, justify=tk.LEFT,
-            background="#ffffcc", foreground="#000000",
+            background="#2e1065", foreground="#faf5ff",
             relief=tk.SOLID, borderwidth=1,
-            font=(SANS_FONT, 9), padx=6, pady=3
+            font=(SANS_FONT, 9), padx=8, pady=5,
+            wraplength=340
         )
-        label.pack()
+        self.label.pack()
+        tw.update_idletasks()
+        
+        tip_w = tw.winfo_reqwidth()
+        tip_h = tw.winfo_reqheight()
+        
+        x = wx + (ww - tip_w) // 2
+        y = wy + wh + 6
+        
+        screen_w = tw.winfo_screenwidth()
+        screen_h = tw.winfo_screenheight()
+        
+        if x + tip_w > screen_w - 12:
+            x = screen_w - tip_w - 12
+        if x < 12:
+            x = 12
+        
+        if y + tip_h > screen_h - 12:
+            y = wy - tip_h - 6
+            if y < 12:
+                y = 12
+        
+        tw.wm_geometry(f"+{x}+{y}")
     
     def _hide_tooltip(self):
         if self.tooltip_window:
-            self.tooltip_window.destroy()
+            try:
+                self.tooltip_window.destroy()
+            except Exception:
+                pass
             self.tooltip_window = None
+            self.label = None
 
 # =============================================================================
 # Data Classes
@@ -2822,9 +2863,9 @@ class AISettingsDialog(tk.Toplevel):
         self.result = None
         
         self.title("AI Settings")
-        self.geometry("560x560")
+        self.geometry("580x640")
         self.resizable(True, True)
-        self.minsize(520, 500)
+        self.minsize(540, 580)
         self.transient(parent)
         self.grab_set()
         
@@ -3642,26 +3683,26 @@ def make_chat_palette(theme: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     dark = _hex_luminance(bg) < 0.5
     if dark:
         pal = dict(
-            dark=True, panel='#181a1f', display_bg=bg, text=theme.get('visual_fg') or '#e6e8ee',
-            muted='#8b93a3', border='#2c303a', input_bg='#20232b', input_fg='#e6e8ee',
-            hdr_user_bg='#22314a', hdr_ai_bg='#1e302a', hdr_sys_bg='#2a2c33',
-            acc_user='#7db4ff', acc_ai='#5fd3a5', acc_sys='#9aa3b2', err='#ff7b72',
-            btn_bg='#2a2e38', btn_fg='#e6e8ee', btn_hover='#363b48',
-            accent='#2563eb', accent_fg='#ffffff', accent_hover='#1d4ed8',
-            code_bg='#0f1115', code_fg='#d6deeb', icode_bg='#2d2f3a', icode_fg='#f38ba8',
-            hl_bg='#713f12', hl_fg='#fef9c3', quote_fg='#a0a8b8', quote_bg='#1d2027',
-            link='#79b8ff', table_bg='#1d2027')
+            dark=True, panel='#1e1136', display_bg=bg, text=theme.get('visual_fg') or '#e6e8ee',
+            muted='#94a3b8', border='#3b1d6e', input_bg='#2a1a40', input_fg='#f5f3ff',
+            hdr_user_bg='#3b1d6e', hdr_ai_bg='#231a38', hdr_sys_bg='#2a1a40',
+            acc_user='#c084fc', acc_ai='#a78bfa', acc_sys='#c4b5fd', err='#f87171',
+            btn_bg='#3b1d6e', btn_fg='#f5f3ff', btn_hover='#4c1d95',
+            accent='#9333ea', accent_fg='#ffffff', accent_hover='#a855f7',
+            code_bg='#120b1a', code_fg='#e9d5ff', icode_bg='#2e1065', icode_fg='#f472b6',
+            hl_bg='#713f12', hl_fg='#fef9c3', quote_fg='#c4b5fd', quote_bg='#231a38',
+            link='#c084fc', table_bg='#231a38')
     else:
         pal = dict(
-            dark=False, panel='#eef0f3', display_bg=bg, text=theme.get('visual_fg') or '#1a1a1a',
-            muted='#6b7280', border='#d4d8de', input_bg='#ffffff', input_fg='#1a1a1a',
-            hdr_user_bg='#e1ecfb', hdr_ai_bg='#e4f3ea', hdr_sys_bg='#efefef',
-            acc_user='#1d4ed8', acc_ai='#0f7a4a', acc_sys='#525b6a', err='#cc0000',
-            btn_bg='#ffffff', btn_fg='#1a1a1a', btn_hover='#e3e6ea',
-            accent='#2563eb', accent_fg='#ffffff', accent_hover='#1d4ed8',
-            code_bg='#282c34', code_fg='#abb2bf', icode_bg='#eceff3', icode_fg='#c7254e',
-            hl_bg='#fef08a', hl_fg='#1a1a1a', quote_fg='#5b6472', quote_bg='#f3f5f8',
-            link='#0b63ce', table_bg='#f3f5f8')
+            dark=False, panel='#f3effa', display_bg=bg, text=theme.get('visual_fg') or '#1a1a1a',
+            muted='#6b7280', border='#dcd6e8', input_bg='#ffffff', input_fg='#1a1a1a',
+            hdr_user_bg='#ede9fe', hdr_ai_bg='#f5f3ff', hdr_sys_bg='#f3effa',
+            acc_user='#5b21b6', acc_ai='#4c1d95', acc_sys='#6b21a8', err='#dc2626',
+            btn_bg='#ffffff', btn_fg='#2e1065', btn_hover='#ede9fe',
+            accent='#5b21b6', accent_fg='#ffffff', accent_hover='#4c1d95',
+            code_bg='#2e1065', code_fg='#faf5ff', icode_bg='#ede9fe', icode_fg='#9333ea',
+            hl_bg='#fef08a', hl_fg='#1a1a1a', quote_fg='#4c1d95', quote_bg='#f8f6fc',
+            link='#6d28d9', table_bg='#f8f6fc')
     return pal
 
 
@@ -3845,21 +3886,21 @@ class ChatSidebar(tk.Frame):
         self._reg(self.edit_btn, bg='btn_bg', fg='btn_fg', activebackground='btn_hover',
                   activeforeground='btn_fg', selectcolor='accent')
         self.edit_btn.pack(side=tk.LEFT)
-        ToolTip(self.edit_btn, "Toggle raw-markdown editing of this chat's history")
+        ToolTip(self.edit_btn, "Toggle raw markdown editing mode to directly inspect, edit, or clean up conversation turns.")
 
         self.font_minus_btn = self._flat_button(bar, "A\u2212", lambda: self._bump_font(-1), width=3)
         self.font_minus_btn.pack(side=tk.LEFT, padx=(8, 1))
-        ToolTip(self.font_minus_btn, "Decrease chat text size (Ctrl+Mouse Wheel)")
+        ToolTip(self.font_minus_btn, "Decrease chat typography text size. You can also hold Ctrl and scroll your mouse wheel down.")
         self.font_plus_btn = self._flat_button(bar, "A+", lambda: self._bump_font(1), width=3)
         self.font_plus_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(self.font_plus_btn, "Increase chat text size (Ctrl+Mouse Wheel)")
+        ToolTip(self.font_plus_btn, "Increase chat typography text size. You can also hold Ctrl and scroll your mouse wheel up.")
 
         settings_btn = self._flat_button(bar, "Config", self._open_settings)
         settings_btn.pack(side=tk.RIGHT)
-        ToolTip(settings_btn, "Configure AI provider, API keys, and model settings")
+        ToolTip(settings_btn, "Open AI Settings to configure providers (AGY, Gemini, Anthropic, DeepSeek, Ollama), API keys, and model parameters.")
         self.clear_btn = self._flat_button(bar, "Clear", self._clear_history)
         self.clear_btn.pack(side=tk.RIGHT, padx=(0, 4))
-        ToolTip(self.clear_btn, "Clear chat history for this document")
+        ToolTip(self.clear_btn, "Clear conversation history for this document tab to begin a fresh conversation.")
 
         # --- Display container: chat view <-> raw edit view -------------------
         self.display_container = self._reg(tk.Frame(self), bg='panel')
@@ -3905,11 +3946,11 @@ class ChatSidebar(tk.Frame):
 
         self.include_doc_var = tk.BooleanVar(value=False)
         self.include_doc_cb = check("Include Document", self.include_doc_var,
-                                    "Send current document content with your message")
+                                    "Include current document content with your message as contextual grounding for the AI assistant.")
         self.include_doc_cb.pack(side=tk.LEFT, padx=(0, 8))
         self.include_history_var = tk.BooleanVar(value=True)
         self.include_history_cb = check("Include Chat History", self.include_history_var,
-                                        "Include previous messages for context")
+                                        "Include prior messages from this chat session so the AI maintains multi-turn conversation context.")
         self.include_history_cb.pack(side=tk.LEFT)
 
         limit_row = self._reg(tk.Frame(self), bg='panel')
@@ -3924,7 +3965,7 @@ class ChatSidebar(tk.Frame):
         self.history_limit_cb.bind('<<ComboboxSelected>>', self._on_history_limit_change)
         self._reg(tk.Label(limit_row, text="messages", font=(SANS_FONT, 8)),
                   bg='panel', fg='muted').pack(side=tk.LEFT, padx=4)
-        ToolTip(self.history_limit_cb, "How many of the most recent messages are sent as context")
+        ToolTip(self.history_limit_cb, "Select how many recent conversational turns are included in the prompt context sent to the AI.")
 
         # --- Attachments ------------------------------------------------------
         self.attachments_frame = self._reg(tk.Frame(self), bg='panel')
@@ -3954,10 +3995,10 @@ class ChatSidebar(tk.Frame):
 
         self.attach_btn = self._flat_button(btn_frame, "Attach", self._attach_file, width=6)
         self.attach_btn.pack(side=tk.TOP, padx=(6, 0), pady=(0, 3))
-        ToolTip(self.attach_btn, "Attach image or text file")
+        ToolTip(self.attach_btn, "Attach an image or text file from your computer for multimodal vision analysis or document comprehension.")
         self.send_btn = self._flat_button(btn_frame, "Send", self._send_message, width=6, accent=True)
         self.send_btn.pack(side=tk.TOP, padx=(6, 0))
-        ToolTip(self.send_btn, "Send message (Shift+Enter)")
+        self.send_btn_tip = ToolTip(self.send_btn, "Submit your prompt message to the AI assistant (Shift+Enter or Ctrl+Enter). Click while generating to stop.")
 
         # --- Selection indicator (shown when text is transferred from editor) --
         self.selection_indicator_frame = tk.Frame(self, bg='#e8f0fe')
@@ -4610,7 +4651,7 @@ class ChatSidebar(tk.Frame):
             self.progress.start(12)
             self.edit_btn.configure(state=tk.DISABLED)
             self.clear_btn.configure(state=tk.DISABLED)
-            ToolTip(self.send_btn, "Stop generating")
+            if hasattr(self, 'send_btn_tip') and self.send_btn_tip: self.send_btn_tip.set_text("Stop generating AI response and return to ready state.")
             self._tick()
         else:
             self.send_btn.configure(text="Send", command=self._send_message, state=tk.NORMAL)

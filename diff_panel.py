@@ -31,6 +31,82 @@ SANS_FONTS = ["Segoe UI", "SF Pro Display", "Ubuntu", "DejaVu Sans", "Arial", "H
 MONO_FONTS = ["Consolas", "SF Mono", "Monaco", "Ubuntu Mono", "DejaVu Sans Mono", "Courier New"]
 
 
+class ToolTip:
+    """Rich, screen-edge-clamped tooltip widget for diff panel."""
+    def __init__(self, widget, text, delay=400):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.tooltip_window = None
+        self.scheduled_id = None
+        self.label = None
+        widget.bind('<Enter>', self._on_enter, add=True)
+        widget.bind('<Leave>', self._on_leave, add=True)
+        widget.bind('<Button>', self._on_leave, add=True)
+
+    def _on_enter(self, event=None):
+        self._cancel_scheduled()
+        self.scheduled_id = self.widget.after(self.delay, self._show_tooltip)
+
+    def _on_leave(self, event=None):
+        self._cancel_scheduled()
+        self._hide_tooltip()
+
+    def _cancel_scheduled(self):
+        if self.scheduled_id:
+            try:
+                self.widget.after_cancel(self.scheduled_id)
+            except Exception:
+                pass
+            self.scheduled_id = None
+
+    def _show_tooltip(self):
+        if self.tooltip_window or not self.widget.winfo_exists():
+            return
+        try:
+            wx = self.widget.winfo_rootx()
+            wy = self.widget.winfo_rooty()
+            ww = self.widget.winfo_width()
+            wh = self.widget.winfo_height()
+        except Exception:
+            return
+        self.tooltip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        self.label = tk.Label(
+            tw, text=self.text, justify=tk.LEFT,
+            background="#2e1065", foreground="#faf5ff",
+            relief=tk.SOLID, borderwidth=1,
+            font=(SANS_FONTS[0], 9), padx=8, pady=5,
+            wraplength=320
+        )
+        self.label.pack()
+        tw.update_idletasks()
+        tip_w = tw.winfo_reqwidth()
+        tip_h = tw.winfo_reqheight()
+        x = wx + (ww - tip_w) // 2
+        y = wy + wh + 6
+        screen_w = tw.winfo_screenwidth()
+        screen_h = tw.winfo_screenheight()
+        if x + tip_w > screen_w - 12:
+            x = screen_w - tip_w - 12
+        if x < 12:
+            x = 12
+        if y + tip_h > screen_h - 12:
+            y = wy - tip_h - 6
+            if y < 12:
+                y = 12
+        tw.wm_geometry(f"+{x}+{y}")
+
+    def _hide_tooltip(self):
+        if self.tooltip_window:
+            try:
+                self.tooltip_window.destroy()
+            except Exception:
+                pass
+            self.tooltip_window = None
+            self.label = None
+
+
 class DiffPanel(tk.Toplevel):
     """
     Side-by-side diff panel for reviewing AI-suggested edits or snapshot comparisons.
@@ -170,15 +246,19 @@ class DiffPanel(tk.Toplevel):
         self.status_label.pack(side=tk.RIGHT, padx=5)
 
         self.sync_scroll_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        sync_cb = ttk.Checkbutton(
             header, text="Sync Scroll", variable=self.sync_scroll_var
-        ).pack(side=tk.RIGHT, padx=8)
+        )
+        sync_cb.pack(side=tk.RIGHT, padx=8)
+        ToolTip(sync_cb, "Lock vertical scrolling so both the original document and suggested changes scroll simultaneously.")
 
         self.word_diff_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        word_cb = ttk.Checkbutton(
             header, text="Highlight Word Diffs", variable=self.word_diff_var,
             command=self._refresh_word_diff_tags
-        ).pack(side=tk.RIGHT, padx=4)
+        )
+        word_cb.pack(side=tk.RIGHT, padx=4)
+        ToolTip(word_cb, "Highlight granular word-by-word deletions in red strikethrough and additions in green.")
 
         # Paned window for side-by-side
         paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
@@ -239,14 +319,19 @@ class DiffPanel(tk.Toplevel):
             text="Toggle individual changed blocks to include or exclude them from the final result:",
             font=(self._sans_font, 8), foreground=P['muted']
         ).pack(side=tk.LEFT)
-        ttk.Button(
+        sel_all_btn = ttk.Button(
             self.hunks_header, text="Select All", width=9,
             command=lambda: self._set_all_hunks(True)
-        ).pack(side=tk.RIGHT, padx=(2, 0))
-        ttk.Button(
+        )
+        sel_all_btn.pack(side=tk.RIGHT, padx=(2, 0))
+        ToolTip(sel_all_btn, "Accept and include all changed paragraphs and hunks in the final applied document.")
+
+        desel_all_btn = ttk.Button(
             self.hunks_header, text="Deselect All", width=10,
             command=lambda: self._set_all_hunks(False)
-        ).pack(side=tk.RIGHT, padx=2)
+        )
+        desel_all_btn.pack(side=tk.RIGHT, padx=2)
+        ToolTip(desel_all_btn, "Exclude all changed blocks, keeping the original document text across all hunks.")
 
         self.hunks_flow = ttk.Frame(self.hunks_outer)
         self.hunks_flow.pack(fill=tk.X)
@@ -257,13 +342,16 @@ class DiffPanel(tk.Toplevel):
 
         self.reject_btn = ttk.Button(btn_frame, text="Reject", command=self._on_reject)
         self.reject_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        ToolTip(self.reject_btn, "Discard all suggested changes and close this diff review panel without modifying your document.")
 
         self.edit_btn = ttk.Button(btn_frame, text="Edit", command=self._toggle_edit)
         self.edit_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        ToolTip(self.edit_btn, "Toggle manual editing mode on the suggested text pane to fine-tune revisions before applying.")
 
         self.accept_btn = ttk.Button(btn_frame, text="✔ Accept & Apply", command=self._on_accept,
                                      state=tk.DISABLED)
         self.accept_btn.pack(side=tk.RIGHT)
+        ToolTip(self.accept_btn, "Apply the accepted changes directly to your document using the selected apply mode.")
 
         # Apply mode selector
         ttk.Label(btn_frame, text="Apply mode:", font=(self._sans_font, 9)).pack(side=tk.LEFT, padx=(0, 4))
@@ -275,6 +363,7 @@ class DiffPanel(tk.Toplevel):
             values=mode_labels, state="readonly", width=21
         )
         self.apply_mode_combo.pack(side=tk.LEFT, padx=(0, 12))
+        ToolTip(self.apply_mode_combo, "Select how applied text is inserted: replace target range, insert at cursor, append to end, or replace whole document.")
 
         # Info label
         ttk.Label(btn_frame, text="Target: Lines " + self._format_range(),
