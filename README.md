@@ -5,12 +5,14 @@ A feature-rich markdown notepad application built with Python and Tkinter, power
 ## Features
 
 ### Core Features
+- **Dual Tab Architecture**: Work seamlessly across **Document Tabs** and **Spreadsheet Tabs** in a unified tabbed workspace
 - **Source Mode**: Edit raw markdown with syntax-aware formatting
 - **Visual Mode**: Rendered markdown preview with styled text display (editable)
+- **Integrated Spreadsheet Processor**: Excel-style 2D virtualized grid with formula engine, cell coordinates, and clipboard compatibility
 - **MarkItDown Integration**: Open virtually any file type and convert to markdown
-- **Tabbed Interface**: Work with multiple documents simultaneously
-- **Session Persistence**: Optionally restore your tabs and documents on restart
-- **Professional Export**: Export to PDF, HTML, and DOCX with theme-aware styling
+- **Tabbed Interface**: Work with multiple documents and sheets simultaneously
+- **Session Persistence**: Restore open document and spreadsheet tabs, scroll positions, and window geometries on restart
+- **Professional Export**: Export documents to PDF, HTML, and DOCX with theme-aware styling, or export spreadsheets to CSV, TSV, XLSX, and MDSHEET
 
 ### AI Assistant with Context Menu Integration
 - **Collapsible AI Sidebar**: Integrated chat with AI models
@@ -32,11 +34,12 @@ A feature-rich markdown notepad application built with Python and Tkinter, power
 - **Advanced Parameters**: Temperature, Top-p, Top-k configuration with tooltips
 - **Image Support**: Include document images in AI context
 
-### Supported File Types (via MarkItDown)
+### Supported File Types (via MarkItDown & Spreadsheet Engine)
 - 📄 **PDF** files
 - 📝 **Word** documents (.docx)
 - 📊 **PowerPoint** presentations (.pptx)
-- 📈 **Excel** spreadsheets (.xlsx, .xls)
+- 📈 **Excel** spreadsheets (.xlsx, .xls) — open as Markdown notes or interactive Spreadsheets
+- 📊 **Spreadsheet formats** (.csv, .tsv, .xlsx, .mdsheet)
 - 🌐 **HTML** files
 - 🖼️ **Images** (EXIF metadata and OCR)
 - 🎵 **Audio** files (metadata and transcription)
@@ -45,6 +48,23 @@ A feature-rich markdown notepad application built with Python and Tkinter, power
 - 🎬 **YouTube** URLs
 - 📚 **EPub** books
 - 📚 **Outlook** messages (.msg)
+
+### Integrated Spreadsheet Processor
+- **Excel-Style 2D Grid**: Smooth, virtualized canvas grid rendering columns (A, B, C...) and rows (1, 2, 3...) with Royal Purple selection styling
+- **Formula Engine**:
+  - Math: `=SUM(range)`, `=AVERAGE(range)`, `=ROUND(val, digits)`, `=ROUNDUP()`, `=ROUNDDOWN()`, `=MIN()`, `=MAX()`, `=ABS()`, `=SQRT()`, `=POWER()`, `=MOD()`, `=INT()`, `=PRODUCT()`
+  - Statistics: `=MEDIAN()`, `=STDEV()`, `=VAR()`
+  - Logic & Counting: `=IF(cond, true_val, false_val)`, `=IFERROR(val, fallback)`, `=COUNT(range)`, `=COUNTA(range)`, `=SUMIF(range, criteria, sum_range)`, `=COUNTIF(range, criteria)`, `=AND()`, `=OR()`, `=NOT()`
+  - Text: `=CONCAT()`, `=LEN()`, `=UPPER()`, `=LOWER()`, `=TRIM()`, `=LEFT()`, `=RIGHT()`
+  - Error detection: Circular reference protection (`#CIRC!`), division by zero (`#DIV/0!`), invalid names (`#NAME?`), and reference errors (`#REF!`)
+- **Formula Bar & Quick Actions**: Dedicated formula bar (`fx`) with active coordinate display, point-and-click cell referencing during formula entry, quick formula buttons (`∑ Sum`, `x̄ Avg`, `Round`), row/col insertion, and instant **Export to Markdown Table** (`📋 MD Table`)
+- **Clipboard Interoperability**: Seamless copy/paste with Microsoft Excel, Google Sheets, LibreOffice Calc, and raw TSV/CSV data
+- **Bidirectional AI Chat Integration**:
+  - Right-click selected cells to **Transfer Selection to AI Chat** or **Ask AI About Selection**
+  - Toggle **Include Document** to furnish the AI with full structural grid geometry and populated data
+  - AI can propose direct cell updates and formulas using fenced `spreadsheet` blocks
+  - Interactive **Spreadsheet Diff Dialog** previews proposed changes with coordinate-level checkboxes before application
+- **Native File Formats**: Direct loading and saving of `.csv`, `.tsv`, `.xlsx` (via `openpyxl`), and state-preserving `.mdsheet` files
 
 ### Editor Features
 - **Multi-Tab Editing**: Open multiple documents with Ctrl+Tab navigation
@@ -92,8 +112,10 @@ python markdown_notepad.py
 
 | Action | Shortcut |
 |--------|----------|
-| New Tab | Ctrl+N |
+| New Document Tab | Ctrl+N |
+| New Spreadsheet Tab | Ctrl+Shift+N |
 | Open File | Ctrl+O |
+| Open as Spreadsheet | Ctrl+Alt+O |
 | Open with MarkItDown | Ctrl+Shift+O |
 | Save | Ctrl+S |
 | Save As | Ctrl+Shift+S |
@@ -176,31 +198,72 @@ This workflow is perfect for iterative refinement—you can have a conversation 
 
 All actions support any AI provider you've configured (Claude, Gemini, Ollama, DeepSeek).
 
-## AI Assistant Setup
+## AI Assistant Setup & Provider Generalizability
+
+The application provides a universal multi-provider AI backend supporting both remote cloud models and zero-cost local agents. Settings are persisted in `~/.markitdown_ai_config.json`, making configurations portable across different machines.
 
 1. Click the **AI Chat** button in the toolbar or press **Ctrl+Shift+A**
 2. Click the **Config** button in the sidebar header
 3. Configure your preferred provider:
-   
-   **For Anthropic Claude:**
-   - Get an API key from [console.anthropic.com](https://console.anthropic.com)
-   - Paste it into the "Anthropic" field
-   - Click "Test" to verify
-   
-   **For Google Gemini:**
-   - Get an API key from [aistudio.google.com](https://aistudio.google.com)
-   - Paste it into the "Gemini" field
-   - Select "gemini" as your provider
-   
-   **For Ollama (local, free):**
-   - Install Ollama from [ollama.ai](https://ollama.ai)
-   - Pull a model: `ollama pull llama3.2`
-   - Keep default URL: `http://localhost:11434`
-   - Click "Test" to detect available models
-   
-   **For DeepSeek:**
-   - Get an API key from [deepseek.com](https://www.deepseek.com)
-   - Paste into the "DeepSeek" field
+
+### Google Antigravity CLI (`agy`)
+Google Antigravity CLI enables authenticated agent workflows directly on your workstation without requiring third-party API keys.
+
+- **How it works**: The notepad launches the `agy` command-line interface in headless streaming mode using your local authenticated Google credentials.
+- **Locating your `agy` executable path**:
+  - **Windows (npm global)**:
+    ```
+    %APPDATA%\npm\agy.cmd
+    ```
+    *(e.g., `C:\Users\<username>\AppData\Roaming\npm\agy.cmd`)*
+  - **Windows (standard binary install)**:
+    ```
+    %LOCALAPPDATA%\Programs\antigravity\bin\agy.exe
+    ```
+    or `%LOCALAPPDATA%\agy\bin\agy.exe`
+  - **macOS / Linux**:
+    ```bash
+    /usr/local/bin/agy
+    # or
+    ~/.local/bin/agy
+    # or
+    ~/.npm-global/bin/agy
+    ```
+- **Configuration Steps**:
+  1. In the AI Settings Dialog, choose **Antigravity CLI (agy)** from the Provider dropdown.
+  2. Paste your executable path into the **CLI Path** field (or click **Browse** to select the file).
+  3. Click **Test** to verify connection.
+  4. If your Google credentials have expired or need initial authorization, click **Interactive Sign-in Console**; a console window will launch allowing you to complete authentication directly.
+
+### Ollama (Local & Offline)
+Run high-performance open-weight models locally with zero cloud dependencies or costs.
+
+- **Installation**: Download and install Ollama from [ollama.ai](https://ollama.ai).
+- **Start the Service**:
+  ```bash
+  ollama serve
+  ```
+- **Pull Recommended Models**:
+  ```bash
+  ollama pull llama3.2
+  ollama pull qwen2.5:7b
+  ollama pull deepseek-r1:8b
+  ```
+- **Configuration Steps**:
+  1. Set Provider to **Ollama**.
+  2. Enter the server endpoint URL (default is `http://localhost:11434`).
+  3. Click **Test** to automatically query Ollama and populate all installed local models into the model selection dropdown.
+
+### Cloud API Providers
+- **Google Gemini API**:
+  - Obtain an API key from [aistudio.google.com](https://aistudio.google.com).
+  - Enter the key into the Gemini field, select provider **gemini**, and pick from `gemini-2.5-flash`, `gemini-2.5-pro`, or `gemini-1.5-pro`.
+- **Anthropic Claude**:
+  - Obtain an API key from [console.anthropic.com](https://console.anthropic.com).
+  - Enter the key into the Anthropic field, select provider **anthropic**, and pick from Claude 3.5 Sonnet or Claude 3.5 Haiku.
+- **DeepSeek**:
+  - Obtain an API key from [deepseek.com](https://www.deepseek.com).
+  - Enter the key into the DeepSeek field and select provider **deepseek**.
 
 4. Select your preferred model from the dropdown
 5. Optionally customize:
@@ -268,20 +331,28 @@ pip install weasyprint python-docx markdown
 
 ```
 note-processor/
-├── markdown_notepad.py      # Main application (~4200 lines)
+├── markdown_notepad.py      # Main application (~9500 lines)
 │   ├── ImageExtractor       # Extract images from Office documents
 │   ├── ImageHandler         # Manage image embedding and display
 │   ├── PageView             # Word-style page (sheet) on a desk; owns zoom/page width/margins
 │   ├── MarkdownVisualWidget # Visual markdown rendering
-│   ├── DocumentTab          # Individual tab management
-│   ├── MarkdownNotepad      # Main application window
-│   ├── ThemeDialog          # Theme customization
+│   ├── DocumentTab          # Individual markdown document tab
+│   ├── MarkdownNotepad      # Main application window with Deck 1 & Deck 2 ribbons
+│   ├── ThemeDialog          # Theme customization (auto-fitting & resizable)
 │   ├── InsertImageDialog    # Image insertion wizard
 │   ├── ImageManagerDialog   # Image management interface
 │   ├── FindReplaceDialog    # Search and replace with regex
 │   └── GoToLineDialog       # Jump to line number
 │
-├── ai_chat.py               # AI chat module (~2900 lines)
+├── spreadsheet_tab.py       # Integrated Spreadsheet Processor (~2100 lines)
+│   ├── FormulaEngine        # AST formula parser, recursive evaluator, circular ref detection
+│   ├── SpreadsheetGrid      # Virtualized Tkinter Canvas grid with floating headers and Royal Purple styling
+│   ├── SpreadsheetTab       # Formula bar (fx), coordinate tracker, markdown table exporter, undo/redo
+│   ├── SpreadsheetPatchParser # Regex extractor for AI-generated cell updates
+│   ├── SpreadsheetDiffDialog # Coordinate-by-coordinate diff inspector with checkboxes
+│   └── open/save_spreadsheet_file # CSV, TSV, XLSX (openpyxl), and MDSHEET I/O
+│
+├── ai_chat.py               # AI chat module (~3600 lines)
 │   ├── AISettings           # Configuration persistence
 │   ├── ChatHistoryManager   # Per-document chat history
 │   ├── ChatMessage          # Message data structure
@@ -291,7 +362,8 @@ note-processor/
 │   ├── GeminiClient         # Google Gemini integration
 │   ├── OllamaClient         # Ollama local LLM integration
 │   ├── DeepSeekClient       # DeepSeek API integration
-│   ├── AISettingsDialog     # Settings UI with context menu config
+│   ├── AntigravityClient    # Google Antigravity CLI (agy) integration
+│   ├── AISettingsDialog     # Settings UI with dynamic button widths and CLI path config
 │   └── ChatSidebar          # Chat interface widget
 │
 ├── diff_panel.py            # Diff review panel (~300 lines)
@@ -303,8 +375,8 @@ note-processor/
 │   ├── export_to_docx()     # Markdown → Word document
 │   └── Helper functions     # CSS generation, image handling, formatting
 │
-├── session_manager.py       # Session persistence (~290 lines)
-│   ├── TabState             # Individual tab state
+├── session_manager.py       # Session persistence (~300 lines)
+│   ├── TabState             # Document and spreadsheet tab state (tab_type aware)
 │   ├── SessionState         # Full session state
 │   └── SessionManager       # Save/restore functionality
 │
@@ -348,6 +420,9 @@ The application stores configuration in your home directory:
 - **google-genai** - Google Gemini AI (multimodal)
 - **ollama** - Local LLM support (free, runs on your machine)
 - **openai** - OpenAI-compatible APIs (used for DeepSeek)
+
+### Optional - Spreadsheet Features
+- **openpyxl** - Microsoft Excel (.xlsx) direct spreadsheet import and export
 
 ### Optional - Export Features
 - **weasyprint** - PDF export with professional typography

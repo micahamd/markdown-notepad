@@ -24,7 +24,8 @@ class TabState:
         scroll_position: float = 0.0,
         current_mode: str = "source",
         is_modified: bool = False,
-        snapshots: Optional[List[Dict[str, Any]]] = None
+        snapshots: Optional[List[Dict[str, Any]]] = None,
+        tab_type: str = "document"
     ):
         self.file_path = file_path
         self.content = content
@@ -33,6 +34,7 @@ class TabState:
         self.current_mode = current_mode
         self.is_modified = is_modified
         self.snapshots: List[Dict[str, Any]] = snapshots if snapshots is not None else []
+        self.tab_type = tab_type
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -43,7 +45,8 @@ class TabState:
             'scroll_position': self.scroll_position,
             'current_mode': self.current_mode,
             'is_modified': self.is_modified,
-            'snapshots': self.snapshots
+            'snapshots': self.snapshots,
+            'tab_type': self.tab_type
         }
     
     @classmethod
@@ -56,7 +59,8 @@ class TabState:
             scroll_position=data.get('scroll_position', 0.0),
             current_mode=data.get('current_mode', 'source'),
             is_modified=data.get('is_modified', False),
-            snapshots=data.get('snapshots', [])
+            snapshots=data.get('snapshots', []),
+            tab_type=data.get('tab_type', 'document')
         )
     
     def get_document_hash(self) -> str:
@@ -129,7 +133,7 @@ class SessionManager:
         Returns the loaded state, or a default state if file doesn't exist.
         """
         try:
-            if self.SESSION_FILE.exists():
+            if Path(self.SESSION_FILE).exists():
                 with open(self.SESSION_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     self.state = SessionState.from_dict(data)
@@ -189,8 +193,8 @@ class SessionManager:
         Called when caching is disabled or when user explicitly clears.
         """
         try:
-            if self.SESSION_FILE.exists():
-                self.SESSION_FILE.unlink()
+            if Path(self.SESSION_FILE).exists():
+                Path(self.SESSION_FILE).unlink()
             self.state = SessionState()
             return True
         except Exception as e:
@@ -205,7 +209,8 @@ class SessionManager:
         cursor_position: Optional[str] = None,
         scroll_position: Optional[float] = None,
         current_mode: Optional[str] = None,
-        is_modified: Optional[bool] = None
+        is_modified: Optional[bool] = None,
+        tab_type: Optional[str] = None
     ):
         """Update the state of a specific tab"""
         # Ensure we have enough tabs
@@ -226,6 +231,8 @@ class SessionManager:
             tab.current_mode = current_mode
         if is_modified is not None:
             tab.is_modified = is_modified
+        if tab_type is not None:
+            tab.tab_type = tab_type
     
     def add_tab(self, tab_state: Optional[TabState] = None) -> int:
         """Add a new tab and return its index"""
@@ -272,7 +279,7 @@ class SessionManager:
     
     def has_saved_session(self) -> bool:
         """Check if a saved session exists"""
-        return self.SESSION_FILE.exists()
+        return Path(self.SESSION_FILE).exists()
     
     def get_document_hash(self, tab_index: int) -> Optional[str]:
         """Get the document hash for a specific tab (used for chat history)"""

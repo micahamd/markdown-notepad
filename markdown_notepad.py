@@ -125,6 +125,32 @@ except ImportError:
     EXPORT_MARKDOWN_AVAILABLE = False
     print("Warning: export_manager module not found. Export disabled.")
 
+# Import spreadsheet module
+try:
+    from spreadsheet_tab import (
+        SpreadsheetTab, SpreadsheetDiffDialog, open_spreadsheet_file,
+        save_spreadsheet_file, SpreadsheetPatchParser, parse_cell_ref
+    )
+    SPREADSHEET_AVAILABLE = True
+except ImportError as e:
+    SPREADSHEET_AVAILABLE = False
+    print(f"Warning: spreadsheet_tab module not found ({e}). Spreadsheet tabs disabled.")
+
+
+def _fit_and_center_dialog(dialog: tk.Toplevel, parent: tk.Misc, min_w: int = 400, min_h: int = 300):
+    """Ensure dialog is resizable in both X and Y, auto-fits without clipping, and is centered."""
+    dialog.resizable(True, True)
+    dialog.update_idletasks()
+    req_w = max(min_w, dialog.winfo_reqwidth() + 24)
+    req_h = max(min_h, dialog.winfo_reqheight() + 24)
+    dialog.minsize(req_w, req_h)
+    try:
+        px = parent.winfo_rootx() + max(0, (parent.winfo_width() - req_w) // 2)
+        py = parent.winfo_rooty() + max(0, (parent.winfo_height() - req_h) // 2)
+        dialog.geometry(f"{req_w}x{req_h}+{max(10, px)}+{max(10, py)}")
+    except Exception:
+        dialog.geometry(f"{req_w}x{req_h}")
+
 
 # =============================================================================
 # Font Detection Utilities
@@ -424,23 +450,12 @@ class DocumentStatisticsDialog(tk.Toplevel):
         self.tab = tab
         
         self.title("Document Statistics")
-        self.geometry("460x540")
-        self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
-        
         self.configure(bg="#f8f7fc")
         
-        # Center dialog
-        self.update_idletasks()
-        try:
-            x = parent.winfo_rootx() + (parent.winfo_width() - 460) // 2
-            y = parent.winfo_rooty() + (parent.winfo_height() - 540) // 2
-            self.geometry(f"+{max(10, x)}+{max(10, y)}")
-        except Exception:
-            pass
-        
         self._build_ui()
+        _fit_and_center_dialog(self, parent, 480, 560)
         self.bind("<Escape>", lambda e: self.destroy())
 
     def _build_ui(self):
@@ -3014,6 +3029,7 @@ class DocumentTab(ttk.Frame):
         self.on_content_change_callback = on_content_change
         
         # Document state
+        self.tab_type = "document"
         self.file_path = None
         self.is_modified = False
         self.current_mode = "visual"
@@ -4432,7 +4448,7 @@ class DockedFindReplaceBar(ttk.Frame):
         ToolTip(regex_cb, "Enable regular expression search pattern matching.")
 
         self.toggle_rep_btn = ttk.Button(
-            self.find_row, text="⇄ Replace", width=9, style="Toolbar.TButton",
+            self.find_row, text="⇄ Replace", style="Toolbar.TButton",
             command=self.toggle_replace_row
         )
         self.toggle_rep_btn.pack(side=tk.LEFT, padx=4)
@@ -4447,11 +4463,11 @@ class DockedFindReplaceBar(ttk.Frame):
         self.replace_entry = ttk.Entry(self.replace_row, textvariable=self.replace_var, width=22)
         self.replace_entry.pack(side=tk.LEFT, padx=(0, 4))
 
-        rep_btn = ttk.Button(self.replace_row, text="Replace", width=9, style="Toolbar.TButton", command=self.replace_one)
+        rep_btn = ttk.Button(self.replace_row, text="Replace", style="Toolbar.TButton", command=self.replace_one)
         rep_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(rep_btn, "Replace the currently focused match with replacement text.")
 
-        rep_all_btn = ttk.Button(self.replace_row, text="Replace All", width=10, style="Toolbar.TButton", command=self.replace_all)
+        rep_all_btn = ttk.Button(self.replace_row, text="Replace All", style="Toolbar.TButton", command=self.replace_all)
         rep_all_btn.pack(side=tk.LEFT, padx=2)
         ToolTip(rep_all_btn, "Replace all occurrences throughout the entire document.")
 
@@ -4966,8 +4982,10 @@ class MarkdownNotepad(tk.Tk):
         # File menu
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="New Tab", command=self.new_tab, accelerator="Ctrl+N")
+        file_menu.add_command(label="New Document Tab", command=self.new_document_tab, accelerator="Ctrl+N")
+        file_menu.add_command(label="New Spreadsheet Tab", command=self.new_spreadsheet_tab, accelerator="Ctrl+Shift+N")
         file_menu.add_command(label="Open...", command=self.open_file, accelerator="Ctrl+O")
+        file_menu.add_command(label="Open as Spreadsheet...", command=self.open_as_spreadsheet, accelerator="Ctrl+Alt+O")
         file_menu.add_command(label="Open with MarkItDown...", command=self.open_with_markitdown, accelerator="Ctrl+Shift+O")
         
         # Recent files submenu
@@ -5156,13 +5174,21 @@ class MarkdownNotepad(tk.Tk):
         # -------------------------------------------------------------
         top = self.ribbon_top_deck
 
-        new_btn = ttk.Button(top, text="\U0001f5cb New", command=self.new_tab, style="Toolbar.TButton")
-        new_btn.pack(side=tk.LEFT, padx=1)
-        ToolTip(new_btn, "Create a new blank document tab (Ctrl+N). Each tab maintains independent zoom, view mode, and history.")
+        new_doc_btn = ttk.Button(top, text="\U0001f5cb New Doc", command=self.new_document_tab, style="Toolbar.TButton")
+        new_doc_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(new_doc_btn, "Create a new blank Markdown document tab (Ctrl+N).")
+
+        new_sheet_btn = ttk.Button(top, text="\u229e New Sheet", command=self.new_spreadsheet_tab, style="Toolbar.TButton")
+        new_sheet_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(new_sheet_btn, "Create a new Excel-style spreadsheet tab (Ctrl+Shift+N) with formula evaluation and AI integration.")
 
         open_btn = ttk.Button(top, text="\U0001f4c2 Open", command=self.open_file, style="Toolbar.TButton")
         open_btn.pack(side=tk.LEFT, padx=1)
         ToolTip(open_btn, "Open an existing Markdown (.md, .txt) file from your local disk (Ctrl+O).")
+
+        open_sheet_btn = ttk.Button(top, text="\U0001f4ca Open Sheet", command=self.open_as_spreadsheet, style="Toolbar.TButton")
+        open_sheet_btn.pack(side=tk.LEFT, padx=1)
+        ToolTip(open_sheet_btn, "Open a CSV, TSV, XLSX, or Markdown table file directly as an interactive spreadsheet (Ctrl+Alt+O).")
 
         convert_btn = ttk.Button(top, text="\u26a1 Convert", command=self.open_with_markitdown, style="Toolbar.TButton")
         convert_btn.pack(side=tk.LEFT, padx=1)
@@ -5220,23 +5246,26 @@ class MarkdownNotepad(tk.Tk):
         btm = self.ribbon_bottom_deck
         self._format_buttons = []
 
-        def add_format_button(text, command, width, tip):
-            btn = ttk.Button(btm, text=text, command=command, width=width, style="Toolbar.TButton")
+        def add_format_button(text, command, tip, width=None):
+            kwargs = {'text': text, 'command': command, 'style': "Toolbar.TButton"}
+            if width is not None and width > 0:
+                kwargs['width'] = width
+            btn = ttk.Button(btm, **kwargs)
             btn.pack(side=tk.LEFT, padx=1)
             ToolTip(btn, tip)
             self._format_buttons.append(btn)
             return btn
 
         # Typography
-        add_format_button("\U0001d401", lambda: self._insert_format("**", "**"), 3, "Format selected text as bold (**text**) (Ctrl+B).")
-        add_format_button("\U0001d43c", lambda: self._insert_format("*", "*"), 3, "Format selected text as italic (*text*) (Ctrl+I).")
-        add_format_button("\U0001f58d HL", lambda: self._insert_format("==", "=="), 5, "Format selected text with a highlight marker (==text==) (Ctrl+Shift+H).")
-        add_format_button("</>", lambda: self._insert_format("`", "`"), 4, "Format selected text as inline code (`code`) (Ctrl+`).")
+        add_format_button("\U0001d401", lambda: self._insert_format("**", "**"), "Format selected text as bold (**text**) (Ctrl+B).", width=3)
+        add_format_button("\U0001d43c", lambda: self._insert_format("*", "*"), "Format selected text as italic (*text*) (Ctrl+I).", width=3)
+        add_format_button("\U0001f58d HL", lambda: self._insert_format("==", "=="), "Format selected text with a highlight marker (==text==) (Ctrl+Shift+H).")
+        add_format_button("</>", lambda: self._insert_format("`", "`"), "Format selected text as inline code (`code`) (Ctrl+`).")
 
         ttk.Separator(btm, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
 
         # Headings & Blocks
-        heading_mb = ttk.Menubutton(btm, text="H\u25be", width=4, style="Toolbar.TButton")
+        heading_mb = ttk.Menubutton(btm, text="H\u25be", style="Toolbar.TButton")
         heading_menu = tk.Menu(heading_mb, tearoff=0)
         heading_menu.add_command(label="H1 — Heading 1 (#)", command=lambda: self._insert_line_prefix("# "))
         heading_menu.add_command(label="H2 — Heading 2 (##)", command=lambda: self._insert_line_prefix("## "))
@@ -5247,23 +5276,23 @@ class MarkdownNotepad(tk.Tk):
         ToolTip(heading_mb, "Insert a markdown section heading (levels H1 through H4) at the active cursor line.")
         self._format_buttons.append(heading_mb)
 
-        quote_btn = add_format_button("\u275d Quote", lambda: self._insert_line_prefix("> "), 7, "Insert a blockquote prefix (> text) on the active line (Ctrl+Shift+Q). Right-click to configure custom colors and styling.")
+        quote_btn = add_format_button("\u275d Quote", lambda: self._insert_line_prefix("> "), "Insert a blockquote prefix (> text) on the active line (Ctrl+Shift+Q). Right-click to configure custom colors and styling.")
         quote_btn.bind("<Button-3>", lambda e: self.open_blockquote_style_dialog())
 
-        add_format_button("\u2022 List", lambda: self._insert_line_prefix("- "), 6, "Insert a bulleted list item (- item) at the current line.")
-        add_format_button("1. List", lambda: self._insert_line_prefix("1. "), 6, "Insert a numbered list item (1. item) at the current line.")
-        add_format_button("\u229e Table", self.insert_table, 7, "Insert a structured Markdown table (Alt+T). You can specify columns, rows, and header text.")
-        add_format_button("{ }", lambda: self._insert_text("\n```\n\n```\n"), 4, "Insert a fenced code block with optional syntax highlighting language tag (Ctrl+Shift+K).")
-        add_format_button("\u2015 HR", lambda: self._insert_text("\n---\n"), 5, "Insert a thematic horizontal divider rule (---) separating document sections.")
+        add_format_button("\u2022 List", lambda: self._insert_line_prefix("- "), "Insert a bulleted list item (- item) at the current line.")
+        add_format_button("1. List", lambda: self._insert_line_prefix("1. "), "Insert a numbered list item (1. item) at the current line.")
+        add_format_button("\u229e Table", self.insert_table, "Insert a structured Markdown table (Alt+T). You can specify columns, rows, and header text.")
+        add_format_button("{ }", lambda: self._insert_text("\n```\n\n```\n"), "Insert a fenced code block with optional syntax highlighting language tag (Ctrl+Shift+K).")
+        add_format_button("\u2015 HR", lambda: self._insert_text("\n---\n"), "Insert a thematic horizontal divider rule (---) separating document sections.")
 
         ttk.Separator(btm, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
 
         # Cross-References & Media
-        add_format_button("\u2693 Anchor", lambda: self._insert_format("[@anchor: ", "]"), 8, "Insert a named cross-reference target [@anchor: name] (Ctrl+Shift+M) for internal document hyperlinking.")
-        add_format_button("\U0001f517 Link", lambda: self._insert_format("[", "](url)"), 6, "Insert a markdown hyperlink [text](url) (Ctrl+K) around the selected text or at cursor.")
-        add_format_button("[^] Note", self.insert_footnote, 7, "Insert a footnote reference marker [^1] and generate a footnote definition stub (Ctrl+Shift+F).")
-        add_format_button("\u2211 Math", self.open_math_symbol_picker, 6, "Open the mathematical symbol and Greek alphabet picker (Ctrl+Shift+Y) to insert Unicode math notation.")
-        add_format_button("\U0001f5bc Image", self.insert_image, 7, "Insert an image tag with optional extended caption and alignment metadata (Ctrl+Shift+I).")
+        add_format_button("\u2693 Anchor", lambda: self._insert_format("[@anchor: ", "]"), "Insert a named cross-reference target [@anchor: name] (Ctrl+Shift+M) for internal document hyperlinking.")
+        add_format_button("\U0001f517 Link", lambda: self._insert_format("[", "](url)"), "Insert a markdown hyperlink [text](url) (Ctrl+K) around the selected text or at cursor.")
+        add_format_button("[^] Note", self.insert_footnote, "Insert a footnote reference marker [^1] and generate a footnote definition stub (Ctrl+Shift+F).")
+        add_format_button("\u2211 Math", self.open_math_symbol_picker, "Open the mathematical symbol and Greek alphabet picker (Ctrl+Shift+Y) to insert Unicode math notation.")
+        add_format_button("\U0001f5bc Image", self.insert_image, "Insert an image tag with optional extended caption and alignment metadata (Ctrl+Shift+I).")
 
     def _toggle_ribbon_collapse(self):
         """Toggle bottom ribbon deck collapse/expand state (Ctrl+F1)."""
@@ -5368,8 +5397,13 @@ class MarkdownNotepad(tk.Tk):
         except Exception:
             pass
 
-        self.bind("<Control-n>", lambda e: self.new_tab())
+        self.bind("<Control-n>", lambda e: self.new_document_tab())
+        self.bind("<Control-N>", lambda e: self.new_spreadsheet_tab())
+        self.bind("<Control-Shift-N>", lambda e: self.new_spreadsheet_tab())
+        self.bind("<Control-Shift-Key-N>", lambda e: self.new_spreadsheet_tab())
         self.bind("<Control-o>", lambda e: self.open_file())
+        self.bind("<Control-Alt-o>", lambda e: self.open_as_spreadsheet())
+        self.bind("<Control-Alt-O>", lambda e: self.open_as_spreadsheet())
         self.bind("<Control-O>", lambda e: self.open_with_markitdown())  # Ctrl+Shift+O
         self.bind("<Control-s>", lambda e: self.save_file())
         self.bind("<Control-S>", lambda e: self.save_file_as())  # Ctrl+Shift+S
@@ -5512,6 +5546,24 @@ class MarkdownNotepad(tk.Tk):
                 
                 # Restore all tabs
                 for tab_state in state.tabs:
+                    t_type = getattr(tab_state, 'tab_type', 'document')
+                    if t_type == 'spreadsheet' and SPREADSHEET_AVAILABLE:
+                        tab = SpreadsheetTab(
+                            self.notebook,
+                            theme=self.theme,
+                            on_modified_callback=lambda: self._on_tab_modified()
+                        )
+                        tab.file_path = tab_state.file_path
+                        tab.set_content(tab_state.content)
+                        tab.is_modified = tab_state.is_modified
+                        tab.snapshots = list(getattr(tab_state, 'snapshots', []) or [])
+                        tab_name = tab.get_display_name()
+                        if tab.is_modified:
+                            tab_name = f"*{tab_name}"
+                        self.notebook.add(tab, text=tab_name)
+                        self.tabs.append(tab)
+                        continue
+
                     tab = DocumentTab(
                         self.notebook,
                         theme=self.theme,
@@ -5589,15 +5641,29 @@ class MarkdownNotepad(tk.Tk):
         
         # Save each tab's state
         for i, tab in enumerate(self.tabs):
-            tab_state = TabState(
-                file_path=tab.file_path,
-                content=tab.get_content(),
-                cursor_position=tab.source_editor.index(tk.INSERT),
-                scroll_position=tab.source_editor.yview()[0],
-                current_mode=tab.current_mode,
-                is_modified=tab.is_modified,
-                snapshots=getattr(tab, 'snapshots', [])
-            )
+            t_type = getattr(tab, 'tab_type', 'document')
+            if t_type == 'spreadsheet':
+                tab_state = TabState(
+                    file_path=tab.file_path,
+                    content=tab.get_content(),
+                    cursor_position="A1",
+                    scroll_position=0.0,
+                    current_mode="spreadsheet",
+                    is_modified=tab.is_modified,
+                    snapshots=getattr(tab, 'snapshots', []),
+                    tab_type="spreadsheet"
+                )
+            else:
+                tab_state = TabState(
+                    file_path=tab.file_path,
+                    content=tab.get_content(),
+                    cursor_position=tab.source_editor.index(tk.INSERT),
+                    scroll_position=tab.source_editor.yview()[0],
+                    current_mode=tab.current_mode,
+                    is_modified=tab.is_modified,
+                    snapshots=getattr(tab, 'snapshots', []),
+                    tab_type="document"
+                )
             self.session_manager.state.tabs.append(tab_state)
         
         # Save active tab index
@@ -5731,6 +5797,8 @@ class MarkdownNotepad(tk.Tk):
         """Get current document content for AI context"""
         if not self.current_tab:
             return ""
+        if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+            return self.current_tab.get_ai_context()
         return self.current_tab.get_content()
     
     def _get_current_document_images(self):
@@ -5986,10 +6054,40 @@ class MarkdownNotepad(tk.Tk):
         self._set_status(action_desc)
 
     def _on_apply_edit_from_chat(self, original_text, replacement_text, start_index, end_index):
-        """Callback from ChatSidebar 'Apply to Document' or 'Review & Apply' — opens the diff panel."""
+        """Callback from ChatSidebar 'Apply to Document' or 'Review & Apply' — opens diff panel or spreadsheet dialog."""
         if not self.current_tab:
             return
-        
+
+        if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+            patches = SpreadsheetPatchParser.parse_patches(replacement_text)
+            if patches:
+                def _do_apply_patches(selected):
+                    old_cells = {}
+                    new_cells = {}
+                    for coord_str, val in selected.items():
+                        pos = parse_cell_ref(coord_str)
+                        if pos:
+                            r, c = pos
+                            old_cells[(r, c)] = self.current_tab.engine.get_raw(r, c)
+                            new_cells[(r, c)] = val
+                            self.current_tab.engine.set_cell(r, c, val)
+                    self.current_tab.grid_widget._save_undo_state({"type": "batch_cells", "old_cells": old_cells, "new_cells": new_cells})
+                    self.current_tab.engine.recalculate_all()
+                    self.current_tab.grid_widget.recompute_bounds()
+                    self.current_tab.grid_widget.redraw()
+                    self.current_tab.is_modified = True
+                    self._update_tab_title(self.current_tab)
+                    self._set_status(f"Applied {len(selected)} spreadsheet cell changes from AI")
+
+                SpreadsheetDiffDialog(self, self.current_tab, patches, on_apply=_do_apply_patches)
+                return
+            else:
+                self.current_tab.clipboard_clear()
+                self.current_tab.clipboard_append(replacement_text)
+                self.current_tab.grid_widget.paste_clipboard()
+                self._set_status("Pasted AI response into spreadsheet cells")
+                return
+
         default_mode = "replace"
         if original_text is None or start_index is None:
             # Check if the user currently has text selected in the active editor
@@ -6152,7 +6250,92 @@ class MarkdownNotepad(tk.Tk):
             self._set_status("Export failed")
 
     # === Tab Management Methods ===
-    
+
+    def new_document_tab(self, file_path=None, content=""):
+        """Create a new Markdown document tab (Ctrl+N)."""
+        return self.new_tab(file_path=file_path, content=content)
+
+    def new_spreadsheet_tab(self, file_path=None, content=""):
+        """Create a new Excel-style spreadsheet tab (Ctrl+Shift+N)."""
+        if not SPREADSHEET_AVAILABLE:
+            messagebox.showwarning("Unavailable", "Spreadsheet module could not be loaded.", parent=self)
+            return None
+
+        tab = SpreadsheetTab(
+            self.notebook,
+            theme=self.theme,
+            on_modified_callback=lambda: self._on_tab_modified()
+        )
+        if file_path:
+            tab.file_path = file_path
+        if content:
+            tab.set_content(content)
+
+        tab_name = tab.get_display_name() if not file_path else os.path.basename(file_path)
+        self.notebook.add(tab, text=tab_name)
+        self.tabs.append(tab)
+        self.notebook.select(tab)
+        self.current_tab = tab
+        self._update_title()
+        self._set_status("Created new spreadsheet tab")
+        return tab
+
+    def open_as_spreadsheet(self, filepath=None):
+        """Open a CSV, TSV, XLSX, or Markdown table file in an interactive Spreadsheet tab."""
+        if not SPREADSHEET_AVAILABLE:
+            messagebox.showwarning("Unavailable", "Spreadsheet module could not be loaded.", parent=self)
+            return
+
+        if not filepath:
+            filetypes = [
+                ("Spreadsheet files", "*.csv *.tsv *.xlsx *.xls *.mdsheet"),
+                ("CSV files", "*.csv"),
+                ("Excel files", "*.xlsx *.xls"),
+                ("Tab-separated files", "*.tsv"),
+                ("MarkItDown Spreadsheet", "*.mdsheet"),
+                ("Markdown files (extract table)", "*.md *.markdown *.txt"),
+                ("All files", "*.*")
+            ]
+            filepath = filedialog.askopenfilename(title="Open as Spreadsheet", filetypes=filetypes)
+            if not filepath:
+                return
+
+        filepath = os.path.normpath(filepath)
+
+        # Check if already open
+        for tab in self.tabs:
+            if tab.file_path and os.path.normpath(tab.file_path) == filepath:
+                self.notebook.select(tab)
+                self._set_status(f"Spreadsheet already open: {os.path.basename(filepath)}")
+                return
+
+        tab = self.new_spreadsheet_tab(file_path=filepath)
+        if not tab:
+            return
+
+        ok = open_spreadsheet_file(filepath, tab)
+        if ok:
+            self._update_tab_title(tab)
+            self._set_status(f"Opened spreadsheet: {filepath}")
+            self._add_to_recent_files(filepath)
+        else:
+            # Check if file has Markdown pipe table
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                if "|" in content:
+                    tab.set_content(content)
+                    tab.file_path = filepath
+                    self._update_tab_title(tab)
+                    self._set_status(f"Opened Markdown table as spreadsheet: {filepath}")
+                    self._add_to_recent_files(filepath)
+                else:
+                    self.close_tab(tab)
+                    messagebox.showerror("Error", f"Could not parse '{os.path.basename(filepath)}' as a spreadsheet.", parent=self)
+            except Exception as e:
+                self.close_tab(tab)
+                messagebox.showerror("Error", f"Could not open spreadsheet:\n{e}", parent=self)
+
     def new_tab(self, file_path=None, content=""):
         """Create a new tab"""
         tab = DocumentTab(
@@ -6278,14 +6461,22 @@ class MarkdownNotepad(tk.Tk):
                 for tab in self.tabs:
                     if str(tab) == current:
                         self.current_tab = tab
+                        is_sheet = getattr(tab, 'tab_type', 'document') == 'spreadsheet'
+                        if is_sheet:
+                            if not getattr(self, '_ribbon_collapsed', False):
+                                self.ribbon_bottom_deck.pack_forget()
+                        else:
+                            if not getattr(self, '_ribbon_collapsed', False):
+                                self.ribbon_bottom_deck.pack(fill=tk.X, padx=2, pady=(0, 2))
                         self._update_title()
                         self._update_mode_display()
                         self._update_position()
                         self._update_word_count()
                         # Update AI sidebar context for new tab
                         self._update_ai_sidebar_context()
-                        self._do_syntax_highlight()
-                        self._schedule_outline_update()
+                        if not is_sheet:
+                            self._do_syntax_highlight()
+                            self._schedule_outline_update()
                         if getattr(self, 'find_bar', None) and self.find_bar.is_visible:
                             self.find_bar._on_query_change()
                         break
@@ -6373,19 +6564,23 @@ class MarkdownNotepad(tk.Tk):
     
     def _on_modified(self, event=None):
         """Handle text modification - called by tab's source editor"""
-        if self.current_tab and self.current_tab.source_editor.edit_modified():
-            self.current_tab.is_modified = True
-            self._update_tab_title(self.current_tab)
-            self._update_title()
-            self.current_tab.source_editor.edit_modified(False)
+        if self.current_tab and hasattr(self.current_tab, 'source_editor'):
+            if self.current_tab.source_editor.edit_modified():
+                self.current_tab.is_modified = True
+                self._update_tab_title(self.current_tab)
+                self._update_title()
+                self.current_tab.source_editor.edit_modified(False)
     
     def _update_position(self, event=None):
         """Update cursor position in status bar"""
         try:
             if self.current_tab:
-                pos = self.current_tab.source_editor.index(tk.INSERT)
-                line, col = pos.split('.')
-                self.position_label.config(text=f"Line {line}, Col {int(col)+1}")
+                if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+                    self.position_label.config(text=f"Cell {self.current_tab.coord_var.get()}")
+                else:
+                    pos = self.current_tab.source_editor.index(tk.INSERT)
+                    line, col = pos.split('.')
+                    self.position_label.config(text=f"Line {line}, Col {int(col)+1}")
         except:
             pass
     
@@ -6393,28 +6588,48 @@ class MarkdownNotepad(tk.Tk):
         """Update word and character count in status bar, including highlighted selection counts"""
         try:
             if self.current_tab:
-                content = self.current_tab.get_content()
-                char_count = len(content)
-                words = content.split()
-                word_count = len(words)
-                
-                # Check if there is a highlighted selection in the active view
-                active_widget = self.current_tab.source_editor
-                sel_text = ""
-                try:
-                    if active_widget.tag_ranges(tk.SEL):
-                        sel_text = active_widget.get(tk.SEL_FIRST, tk.SEL_LAST)
-                except tk.TclError:
-                    sel_text = ""
-                
-                if sel_text:
-                    sel_words = len(sel_text.split())
-                    sel_chars = len(sel_text)
-                    self.word_count_label.config(
-                        text=f"Words: {sel_words} / {word_count} | Chars: {sel_chars} / {char_count}"
-                    )
+                if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+                    cell_count = len(self.current_tab.engine.raw_cells)
+                    (min_r, min_c), (max_r, max_c) = self.current_tab.grid_widget.get_selected_range()
+                    sel_cells = (max_r - min_r + 1) * (max_c - min_c + 1)
+                    if sel_cells > 1:
+                        s_nums = []
+                        for r in range(min_r, max_r + 1):
+                            for c in range(min_c, max_c + 1):
+                                v = self.current_tab.engine.get_value(r, c)
+                                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                                    s_nums.append(float(v))
+                        if s_nums:
+                            s_sum = sum(s_nums)
+                            s_avg = s_sum / len(s_nums)
+                            self.word_count_label.config(text=f"Sel: {sel_cells} | Sum: {s_sum:,.2f} | Avg: {s_avg:,.2f}")
+                        else:
+                            self.word_count_label.config(text=f"Selected: {sel_cells} cells | Populated: {cell_count}")
+                    else:
+                        self.word_count_label.config(text=f"Cells: {cell_count} populated")
                 else:
-                    self.word_count_label.config(text=f"Words: {word_count} | Chars: {char_count}")
+                    content = self.current_tab.get_content()
+                    char_count = len(content)
+                    words = content.split()
+                    word_count = len(words)
+                    
+                    # Check if there is a highlighted selection in the active view
+                    active_widget = self.current_tab.source_editor
+                    sel_text = ""
+                    try:
+                        if active_widget.tag_ranges(tk.SEL):
+                            sel_text = active_widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+                    except tk.TclError:
+                        sel_text = ""
+                    
+                    if sel_text:
+                        sel_words = len(sel_text.split())
+                        sel_chars = len(sel_text)
+                        self.word_count_label.config(
+                            text=f"Words: {sel_words} / {word_count} | Chars: {sel_chars} / {char_count}"
+                        )
+                    else:
+                        self.word_count_label.config(text=f"Words: {word_count} | Chars: {char_count}")
             else:
                 self.word_count_label.config(text="Words: 0 | Chars: 0")
         except Exception:
@@ -6435,11 +6650,20 @@ class MarkdownNotepad(tk.Tk):
     def _update_mode_display(self):
         """Update mode display in status bar for current tab"""
         if self.current_tab:
-            mode = self.current_tab.current_mode
-            self.mode_var.set(mode)
-            self.source_view_var.set(mode == "source")
-            self.mode_label.config(text="Source View" if mode == "source" else "Visual View")
-            self._set_format_buttons_enabled(True)
+            if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+                self.mode_var.set("spreadsheet")
+                self.source_view_var.set(False)
+                self.mode_label.config(text="Spreadsheet View")
+                if hasattr(self, 'source_view_cb'):
+                    self.source_view_cb.config(state="disabled")
+            else:
+                if hasattr(self, 'source_view_cb'):
+                    self.source_view_cb.config(state="normal")
+                mode = self.current_tab.current_mode
+                self.mode_var.set(mode)
+                self.source_view_var.set(mode == "source")
+                self.mode_label.config(text="Source View" if mode == "source" else "Visual View")
+                self._set_format_buttons_enabled(True)
     
     def _set_status(self, message):
         """Set status bar message"""
@@ -6476,7 +6700,7 @@ class MarkdownNotepad(tk.Tk):
         """Toggle large file mode for better performance with big files"""
         is_large = self.large_file_var.get()
         
-        if self.current_tab:
+        if self.current_tab and hasattr(self.current_tab, 'source_editor'):
             if is_large:
                 # Disable expensive operations
                 self.current_tab.source_editor.config(undo=False)
@@ -6489,7 +6713,8 @@ class MarkdownNotepad(tk.Tk):
     def _toggle_live_render(self):
         enabled = self.live_render_var.get()
         for tab in self.tabs:
-            tab.visual_viewer.live_render_enabled = enabled
+            if hasattr(tab, 'visual_viewer'):
+                tab.visual_viewer.live_render_enabled = enabled
         self.theme['live_render_enabled'] = enabled
         self._save_theme()
     
@@ -6610,7 +6835,7 @@ class MarkdownNotepad(tk.Tk):
 
     def _on_source_view_toggle(self):
         """Toggle callback for the Source View checkbox"""
-        if not self.current_tab:
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
             return
         if self.source_view_var.get():
             self._show_source_mode()
@@ -6661,7 +6886,10 @@ class MarkdownNotepad(tk.Tk):
     def _focus_active_editor(self):
         if not self.current_tab:
             return
-        self.current_tab.source_editor.focus_set()
+        if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+            self.current_tab.grid_widget.focus_set()
+        elif hasattr(self.current_tab, 'source_editor'):
+            self.current_tab.source_editor.focus_set()
 
     def _enter_focus_mode(self):
         """Enter distraction-free full screen: hide all chrome and show the same page widgets on a dark desk."""
@@ -6801,6 +7029,11 @@ class MarkdownNotepad(tk.Tk):
                 return
 
         ext = Path(filepath).suffix.lower()
+
+        # If it's a spreadsheet format, route directly to open_as_spreadsheet
+        if ext in ('.csv', '.tsv', '.xlsx', '.xls', '.mdsheet') and SPREADSHEET_AVAILABLE:
+            self.open_as_spreadsheet(filepath)
+            return
 
         # If it's a binary/document format supported by MarkItDown, route directly to MarkItDown
         if MARKITDOWN_AVAILABLE and ext in MARKITDOWN_DOCUMENT_EXTENSIONS:
@@ -6968,6 +7201,18 @@ class MarkdownNotepad(tk.Tk):
         """Save the current tab's file"""
         if not self.current_tab:
             return False
+
+        if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+            if self.current_tab.file_path:
+                ok = save_spreadsheet_file(self.current_tab, self.current_tab.file_path)
+                if ok:
+                    self.current_tab.is_modified = False
+                    self._update_tab_title(self.current_tab)
+                    self._update_title()
+                    self._set_status(f"Saved spreadsheet: {self.current_tab.file_path}")
+                return ok
+            else:
+                return self.save_file_as()
             
         if self.current_tab.file_path:
             try:
@@ -6988,6 +7233,30 @@ class MarkdownNotepad(tk.Tk):
     def save_file_as(self):
         """Save the current tab's file with a new name"""
         if not self.current_tab:
+            return False
+
+        if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+            filetypes = [
+                ("CSV files", "*.csv"),
+                ("Excel files", "*.xlsx"),
+                ("Tab-separated files", "*.tsv"),
+                ("MarkItDown Spreadsheet", "*.mdsheet"),
+                ("All files", "*.*")
+            ]
+            filepath = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=filetypes
+            )
+            if filepath:
+                ok = save_spreadsheet_file(self.current_tab, filepath)
+                if ok:
+                    self.current_tab.file_path = filepath
+                    self.current_tab.is_modified = False
+                    self._update_tab_title(self.current_tab)
+                    self._update_title()
+                    self._set_status(f"Saved spreadsheet: {filepath}")
+                    self._add_to_recent_files(filepath)
+                return ok
             return False
             
         filetypes = [
@@ -7043,32 +7312,48 @@ class MarkdownNotepad(tk.Tk):
     def undo(self):
         """Undo last action"""
         if self.current_tab:
-            try:
-                self.current_tab.source_editor.edit_undo()
-            except tk.TclError:
-                pass
+            if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+                self.current_tab.grid_widget.undo()
+            elif hasattr(self.current_tab, 'source_editor'):
+                try:
+                    self.current_tab.source_editor.edit_undo()
+                except tk.TclError:
+                    pass
     
     def redo(self):
         """Redo last undone action"""
         if self.current_tab:
-            try:
-                self.current_tab.source_editor.edit_redo()
-            except tk.TclError:
-                pass
+            if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+                self.current_tab.grid_widget.redo()
+            elif hasattr(self.current_tab, 'source_editor'):
+                try:
+                    self.current_tab.source_editor.edit_redo()
+                except tk.TclError:
+                    pass
     
     def cut(self):
         """Cut selected text"""
         if self.current_tab:
-            self.current_tab.source_editor.event_generate("<<Cut>>")
+            if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+                self.current_tab.grid_widget.copy_selection()
+                self.current_tab.grid_widget.delete_selection()
+            elif hasattr(self.current_tab, 'source_editor'):
+                self.current_tab.source_editor.event_generate("<<Cut>>")
     
     def copy(self):
         """Copy selected text"""
         if self.current_tab:
-            self.current_tab.source_editor.event_generate("<<Copy>>")
+            if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+                self.current_tab.grid_widget.copy_selection()
+            elif hasattr(self.current_tab, 'source_editor'):
+                self.current_tab.source_editor.event_generate("<<Copy>>")
     
     def paste(self):
         """Paste from clipboard with smart detection of tables and images"""
         if self.current_tab:
+            if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+                self.current_tab.grid_widget.paste_clipboard()
+                return "break"
             return self._handle_smart_paste()
         return "break"
 
@@ -7179,9 +7464,14 @@ class MarkdownNotepad(tk.Tk):
         return "break"
     
     def select_all(self):
-        """Select all text"""
+        """Select all text or all populated spreadsheet cells"""
         if self.current_tab:
-            self.current_tab.source_editor.tag_add(tk.SEL, "1.0", tk.END)
+            if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+                min_r, min_c, max_r, max_c = self.current_tab.engine.get_bounding_box()
+                self.current_tab.grid_widget.selected_cells = ((min_r, min_c), (max_r, max_c))
+                self.current_tab.grid_widget.redraw()
+            elif hasattr(self.current_tab, 'source_editor'):
+                self.current_tab.source_editor.tag_add(tk.SEL, "1.0", tk.END)
         return "break"
 
     def clean_current_document(self):
@@ -7382,7 +7672,7 @@ class MarkdownNotepad(tk.Tk):
 
     def insert_table(self):
         """Open dialog to insert a formatted Markdown table with configurable rows, columns, and header."""
-        if not self.current_tab:
+        if not self.current_tab or not hasattr(self.current_tab, 'source_editor'):
             return "break"
         InsertTableDialog(self, self.current_tab.source_editor, self._on_table_inserted)
         return "break"
@@ -7398,7 +7688,7 @@ class MarkdownNotepad(tk.Tk):
 
     def insert_footnote(self):
         """Insert a numbered footnote citation [^n] at cursor and append [^n]: definition at bottom."""
-        if not self.current_tab:
+        if not self.current_tab or not hasattr(self.current_tab, 'source_editor'):
             return "break"
         editor = self.current_tab.source_editor
         content = editor.get("1.0", tk.END)
@@ -7459,7 +7749,7 @@ class MarkdownNotepad(tk.Tk):
     
     def insert_image(self):
         """Insert an image into the document with proper asset management"""
-        if not self.current_tab:
+        if not self.current_tab or not hasattr(self.current_tab, 'source_editor'):
             return
         
         # Open image insert dialog
@@ -7467,7 +7757,7 @@ class MarkdownNotepad(tk.Tk):
     
     def manage_images(self):
         """Open image manager dialog"""
-        if not self.current_tab or not self.current_tab.file_path:
+        if not self.current_tab or not self.current_tab.file_path or not hasattr(self.current_tab, 'source_editor'):
             messagebox.showinfo(
                 "Save Required",
                 "Please save your document first to manage images.\n\n"
@@ -7527,7 +7817,7 @@ class MarkdownNotepad(tk.Tk):
     
     def goto_line(self):
         """Open go to line dialog"""
-        if self.current_tab:
+        if self.current_tab and hasattr(self.current_tab, 'source_editor'):
             GoToLineDialog(self, self.current_tab.source_editor)
     
     def _find_next_f3(self):
@@ -7707,12 +7997,10 @@ class ThemeDialog(tk.Toplevel):
         self.on_apply = on_apply
         
         self.title("Theme Settings")
-        self.geometry("540x740")
-        self.resizable(True, True)
-        self.minsize(500, 700)  # Set minimum size to prevent UI elements from overlapping
         self.transient(parent)
         
         self._setup_ui()
+        _fit_and_center_dialog(self, parent, 560, 740)
         
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Escape>", lambda e: self.destroy())
@@ -7729,10 +8017,12 @@ class ThemeDialog(tk.Toplevel):
         preset_btn_frame = ttk.Frame(preset_frame)
         preset_btn_frame.pack(fill=tk.X)
         
+        for col in range(3):
+            preset_btn_frame.columnconfigure(col, weight=1, uniform="preset_btn")
         for i, (name, _) in enumerate(self.PRESETS.items()):
-            btn = ttk.Button(preset_btn_frame, text=name, width=12,
+            btn = ttk.Button(preset_btn_frame, text=name,
                            command=lambda n=name: self._apply_preset(n))
-            btn.grid(row=i//3, column=i%3, padx=2, pady=2)
+            btn.grid(row=i//3, column=i%3, padx=3, pady=3, sticky="ew")
         
         # Source Editor section
         source_frame = ttk.LabelFrame(main_frame, text="Source Editor", padding=10)
@@ -7971,12 +8261,11 @@ class BlockquoteStyleDialog(tk.Toplevel):
         self.on_apply = on_apply
 
         self.title("Customize Blockquote Style (>)")
-        self.geometry("480x500")
-        self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
 
         self._setup_ui()
+        _fit_and_center_dialog(self, parent, 500, 520)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Escape>", lambda e: self.destroy())
 
@@ -8115,11 +8404,10 @@ class InsertImageDialog(tk.Toplevel):
         self.original_size = (0, 0)
         
         self.title("Insert Image")
-        self.geometry("500x400")
-        self.resizable(True, False)
         self.transient(parent)
         
         self._setup_ui()
+        _fit_and_center_dialog(self, parent, 540, 440)
         
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Escape>", lambda e: self.destroy())
@@ -8553,8 +8841,6 @@ class FindReplaceDialog(tk.Toplevel):
         self.text_widget = text_widget
         self.parent = parent
         self.title("Find & Replace")
-        self.geometry("500x220")
-        self.resizable(True, False)
         self.transient(parent)
         
         # Track state
@@ -8564,6 +8850,7 @@ class FindReplaceDialog(tk.Toplevel):
         
         self._setup_ui()
         self._setup_bindings()
+        _fit_and_center_dialog(self, parent, 520, 260)
         
         # Clear highlights when dialog closes
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -8796,8 +9083,6 @@ class GoToLineDialog(tk.Toplevel):
         super().__init__(parent)
         self.text_widget = text_widget
         self.title("Go to Line")
-        self.geometry("250x100")
-        self.resizable(False, False)
         self.transient(parent)
         
         # Get current line count
@@ -8820,6 +9105,7 @@ class GoToLineDialog(tk.Toplevel):
         
         self.line_entry.bind("<Return>", lambda e: self.goto())
         self.bind("<Escape>", lambda e: self.destroy())
+        _fit_and_center_dialog(self, parent, 300, 140)
     
     def goto(self):
         """Go to the specified line"""
@@ -8884,8 +9170,6 @@ class FindDialog(tk.Toplevel):
         super().__init__(parent)
         self.text_widget = text_widget
         self.title("Find")
-        self.geometry("350x100")
-        self.resizable(False, False)
         
         # Search field
         frame = ttk.Frame(self, padding=10)
@@ -8907,6 +9191,7 @@ class FindDialog(tk.Toplevel):
         # Bind Enter and Escape keys
         self.search_entry.bind("<Return>", lambda e: self.find_next())
         self.bind("<Escape>", lambda e: self._on_close())
+        _fit_and_center_dialog(self, parent, 380, 140)
         
         # Clear highlights when dialog closes
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -8959,17 +9244,11 @@ class InsertTableDialog(tk.Toplevel):
         self.on_inserted = on_inserted
 
         self.title("Insert Markdown Table")
-        self.geometry("360x260")
-        self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
 
         self._setup_ui()
-
-        self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
-        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        _fit_and_center_dialog(self, parent, 400, 300)
 
         self.bind("<Return>", lambda e: self._insert())
         self.bind("<Escape>", lambda e: self.destroy())
@@ -9126,11 +9405,10 @@ class MathSymbolDialog(tk.Toplevel):
         super().__init__(notepad)
         self.notepad = notepad
         self.title("Math & Symbol Palette")
-        self.geometry("430x310")
-        self.resizable(False, False)
         self.transient(notepad)
 
         self._setup_ui()
+        _fit_and_center_dialog(self, notepad, 480, 360)
         self.bind("<Escape>", lambda e: self.destroy())
 
     def _setup_ui(self):

@@ -2942,9 +2942,9 @@ class AISettingsDialog(tk.Toplevel):
         
         btn_frame = ttk.Frame(f_agy)
         btn_frame.grid(row=0, column=2, padx=(4, 0), pady=2)
-        ttk.Button(btn_frame, text="Auto", width=5, command=self._auto_detect_agy_path).pack(side=tk.LEFT, padx=1)
-        ttk.Button(btn_frame, text="Browse", width=6, command=self._browse_agy_path).pack(side=tk.LEFT, padx=1)
-        ttk.Button(btn_frame, text="Test", width=5, command=lambda: self._test_connection('agy')).pack(side=tk.LEFT, padx=1)
+        ttk.Button(btn_frame, text="Auto", command=self._auto_detect_agy_path).pack(side=tk.LEFT, padx=1)
+        ttk.Button(btn_frame, text="Browse", command=self._browse_agy_path).pack(side=tk.LEFT, padx=1)
+        ttk.Button(btn_frame, text="Test", command=lambda: self._test_connection('agy')).pack(side=tk.LEFT, padx=1)
         
         row2 = ttk.Frame(f_agy)
         row2.grid(row=1, column=0, columnspan=3, sticky=tk.EW, pady=(4, 0))
@@ -3138,7 +3138,7 @@ class AISettingsDialog(tk.Toplevel):
         ctx_top.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(ctx_top, text="Right-click actions for selected text. Use {selection} as placeholder.",
                   font=('Segoe UI', 8), foreground='#666666').pack(side=tk.LEFT)
-        ttk.Button(ctx_top, text="+ Add", width=6,
+        ttk.Button(ctx_top, text="+ Add",
                    command=self._add_context_action).pack(side=tk.RIGHT)
 
         self.ctx_list_frame = ttk.Frame(ctx_frame)
