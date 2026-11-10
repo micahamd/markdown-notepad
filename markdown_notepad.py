@@ -129,7 +129,7 @@ except ImportError:
 try:
     from spreadsheet_tab import (
         SpreadsheetTab, SpreadsheetDiffDialog, open_spreadsheet_file,
-        save_spreadsheet_file, SpreadsheetPatchParser, parse_cell_ref
+        save_spreadsheet_file, SpreadsheetPatchParser, parse_cell_ref, cell_to_ref
     )
     SPREADSHEET_AVAILABLE = True
 except ImportError as e:
@@ -459,6 +459,80 @@ class DocumentStatisticsDialog(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
 
     def _build_ui(self):
+        if getattr(self.tab, 'tab_type', 'document') == 'spreadsheet':
+            # Header banner
+            header = tk.Frame(self, bg="#3b1d6e", padx=16, pady=14)
+            header.pack(fill=tk.X)
+            tk.Label(
+                header, text="Spreadsheet Statistics", font=(SANS_FONT, 13, "bold"),
+                bg="#3b1d6e", fg="#ffffff"
+            ).pack(anchor=tk.W)
+            doc_name = self.tab.get_display_name() if self.tab else "Current Spreadsheet"
+            tk.Label(
+                header, text=f"Grid overview and aggregates for {doc_name}", font=(SANS_FONT, 9),
+                bg="#3b1d6e", fg="#ddd6fe"
+            ).pack(anchor=tk.W, pady=(2, 0))
+
+            body = ttk.Frame(self, padding=16)
+            body.pack(fill=tk.BOTH, expand=True)
+
+            engine = self.tab.engine
+            populated_cells = len(engine.raw_cells)
+            numeric_cells = 0
+            text_cells = 0
+            formula_cells = 0
+            for (r, c), raw in engine.raw_cells.items():
+                if raw.startswith("="):
+                    formula_cells += 1
+                v = engine.get_value(r, c)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    numeric_cells += 1
+                elif raw and not raw.startswith("="):
+                    text_cells += 1
+
+            (min_r, min_c), (max_r, max_c) = self.tab.grid_widget.get_selected_range()
+            sel_count = (max_r - min_r + 1) * (max_c - min_c + 1)
+            sel_nums = []
+            for r in range(min_r, max_r + 1):
+                for c in range(min_c, max_c + 1):
+                    v = engine.get_value(r, c)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        sel_nums.append(float(v))
+
+            sel_sum = f"{sum(sel_nums):,.2f}" if sel_nums else "N/A"
+            sel_avg = f"{sum(sel_nums)/len(sel_nums):,.2f}" if sel_nums else "N/A"
+            sel_min = f"{min(sel_nums):,.2f}" if sel_nums else "N/A"
+            sel_max = f"{max(sel_nums):,.2f}" if sel_nums else "N/A"
+
+            cell_frame = ttk.LabelFrame(body, text="Cell Composition", padding=10)
+            cell_frame.pack(fill=tk.X, pady=(0, 10))
+
+            rows = [
+                ("Total Populated Cells:", f"{populated_cells:,}"),
+                ("Formula Cells:", f"{formula_cells:,}"),
+                ("Numeric Cells:", f"{numeric_cells:,}"),
+                ("Text / Label Cells:", f"{text_cells:,}"),
+                ("Grid Extents:", f"{self.tab.grid_widget.total_rows} Rows × {self.tab.grid_widget.total_cols} Columns"),
+            ]
+            for idx, (lbl, val) in enumerate(rows):
+                ttk.Label(cell_frame, text=lbl).grid(row=idx, column=0, sticky=tk.W, pady=2)
+                ttk.Label(cell_frame, text=val, font=(SANS_FONT, 9, "bold")).grid(row=idx, column=1, sticky=tk.E, padx=20, pady=2)
+
+            agg_frame = ttk.LabelFrame(body, text="Active Selection Aggregates", padding=10)
+            agg_frame.pack(fill=tk.X, pady=(0, 10))
+
+            agg_rows = [
+                ("Selected Cells Range:", f"{cell_to_ref(min_r, min_c)}:{cell_to_ref(max_r, max_c)} ({sel_count} cells)"),
+                ("Sum (numeric cells):", sel_sum),
+                ("Average:", sel_avg),
+                ("Min Value:", sel_min),
+                ("Max Value:", sel_max),
+            ]
+            for idx, (lbl, val) in enumerate(agg_rows):
+                ttk.Label(agg_frame, text=lbl).grid(row=idx, column=0, sticky=tk.W, pady=2)
+                ttk.Label(agg_frame, text=val, font=(SANS_FONT, 9, "bold")).grid(row=idx, column=1, sticky=tk.E, padx=20, pady=2)
+            return
+
         content = self.tab.get_content() if self.tab else ""
         sel_text = ""
         try:
@@ -4481,9 +4555,9 @@ class DockedFindReplaceBar(ttk.Frame):
 
     def _active_text_widget(self):
         tab = self.notepad.current_tab
-        if not tab:
+        if not tab or getattr(tab, 'tab_type', 'document') == 'spreadsheet':
             return None
-        return tab.source_editor
+        return getattr(tab, 'source_editor', None)
 
     def _ensure_highlight_tags(self, widget):
         if not widget:
@@ -4500,14 +4574,15 @@ class DockedFindReplaceBar(ttk.Frame):
 
     def clear_highlights(self):
         tab = self.notepad.current_tab
-        if not tab:
+        if not tab or getattr(tab, 'tab_type', 'document') == 'spreadsheet':
             return
-        for w in (tab.source_editor, tab.visual_viewer.text_widget):
-            try:
-                w.tag_remove("find_match", "1.0", tk.END)
-                w.tag_remove("find_active", "1.0", tk.END)
-            except Exception:
-                pass
+        for w in (getattr(tab, 'source_editor', None), getattr(getattr(tab, 'visual_viewer', None), 'text_widget', None)):
+            if w:
+                try:
+                    w.tag_remove("find_match", "1.0", tk.END)
+                    w.tag_remove("find_active", "1.0", tk.END)
+                except Exception:
+                    pass
 
     def show(self, replace_mode=False):
         if not self.is_visible:
@@ -4558,21 +4633,43 @@ class DockedFindReplaceBar(ttk.Frame):
         self._active_idx = -1
 
         query = self.find_var.get()
-        w = self._active_text_widget()
-        if not query or not w:
+        tab = self.notepad.current_tab
+        if not query or not tab:
             self.count_label.config(text="")
             return
 
-        self._ensure_highlight_tags(w)
-        content = w.get("1.0", "end-1c")
         flags = 0 if self.case_var.get() else re.IGNORECASE
-
         try:
             pattern = query if self.regex_var.get() else re.escape(query)
             compiled = re.compile(pattern, flags)
         except re.error:
             self.count_label.config(text="Invalid regex")
             return
+
+        # Spreadsheet Tab Search
+        if getattr(tab, 'tab_type', 'document') == 'spreadsheet':
+            for (r, c) in sorted(tab.engine.raw_cells.keys()):
+                raw_val = tab.engine.get_raw(r, c)
+                comp_val = str(tab.engine.get_value(r, c))
+                if (raw_val and compiled.search(raw_val)) or (comp_val and compiled.search(comp_val)):
+                    self._matches.append((r, c))
+
+            if not self._matches:
+                self.count_label.config(text="No matches")
+                return
+
+            self._active_idx = 0
+            self._highlight_active_match()
+            return
+
+        # Document Tab Search
+        w = self._active_text_widget()
+        if not w:
+            self.count_label.config(text="")
+            return
+
+        self._ensure_highlight_tags(w)
+        content = w.get("1.0", "end-1c")
 
         for m in compiled.finditer(content):
             if m.start() == m.end():
@@ -4590,8 +4687,24 @@ class DockedFindReplaceBar(ttk.Frame):
         self._highlight_active_match()
 
     def _highlight_active_match(self):
+        tab = self.notepad.current_tab
+        if not tab or not self._matches or self._active_idx < 0:
+            return
+
+        if getattr(tab, 'tab_type', 'document') == 'spreadsheet':
+            r, c = self._matches[self._active_idx]
+            tab.grid_widget.active_cell = (r, c)
+            tab.grid_widget.sel_start = (r, c)
+            tab.grid_widget.sel_end = (r, c)
+            tab.grid_widget._ensure_cell_visible(r, c)
+            tab.grid_widget._notify_select()
+            tab.grid_widget.redraw()
+            ref = cell_to_ref(r, c) if SPREADSHEET_AVAILABLE else f"R{r+1}C{c+1}"
+            self.count_label.config(text=f"{self._active_idx + 1} of {len(self._matches)} (Cell {ref})")
+            return
+
         w = self._active_text_widget()
-        if not w or not self._matches or self._active_idx < 0:
+        if not w:
             return
         w.tag_remove("find_active", "1.0", tk.END)
         s_idx, e_idx = self._matches[self._active_idx]
@@ -4625,9 +4738,33 @@ class DockedFindReplaceBar(ttk.Frame):
             self._on_query_change()
             return "break"
 
-        editor = tab.source_editor
-        s_idx, e_idx = self._matches[self._active_idx]
+        query = self.find_var.get()
         rep_text = self.replace_var.get()
+        flags = 0 if self.case_var.get() else re.IGNORECASE
+        try:
+            pattern = query if self.regex_var.get() else re.escape(query)
+            compiled = re.compile(pattern, flags)
+        except re.error:
+            return "break"
+
+        if getattr(tab, 'tab_type', 'document') == 'spreadsheet':
+            r, c = self._matches[self._active_idx]
+            raw = tab.engine.get_raw(r, c)
+            new_raw = compiled.sub(rep_text, raw, count=1)
+            if new_raw != raw:
+                tab.grid_widget._save_undo_state({"type": "set_cell", "r": r, "c": c, "old": raw, "new": new_raw})
+                tab.engine.set_cell(r, c, new_raw)
+                tab.engine.recalculate_all()
+                tab.grid_widget.redraw()
+                tab.is_modified = True
+                self.notepad._update_tab_title(tab)
+            self._on_query_change()
+            return "break"
+
+        editor = getattr(tab, 'source_editor', None)
+        if not editor:
+            return "break"
+        s_idx, e_idx = self._matches[self._active_idx]
         editor.delete(s_idx, e_idx)
         editor.insert(s_idx, rep_text)
         tab.is_modified = True
@@ -4647,6 +4784,28 @@ class DockedFindReplaceBar(ttk.Frame):
             pattern = query if self.regex_var.get() else re.escape(query)
             compiled = re.compile(pattern, flags)
         except re.error:
+            return "break"
+
+        if getattr(tab, 'tab_type', 'document') == 'spreadsheet':
+            old_cells = {}
+            new_cells = {}
+            count = 0
+            for (r, c) in list(tab.engine.raw_cells.keys()):
+                raw = tab.engine.get_raw(r, c)
+                new_raw, n = compiled.subn(rep_text, raw)
+                if n > 0:
+                    old_cells[(r, c)] = raw
+                    new_cells[(r, c)] = new_raw
+                    tab.engine.set_cell(r, c, new_raw)
+                    count += n
+            if count > 0:
+                tab.grid_widget._save_undo_state({"type": "batch_cells", "old_cells": old_cells, "new_cells": new_cells})
+                tab.engine.recalculate_all()
+                tab.grid_widget.redraw()
+                tab.is_modified = True
+                self.notepad._update_tab_title(tab)
+                self.notepad._set_status(f"Replaced {count} occurrence(s) in spreadsheet")
+            self._on_query_change()
             return "break"
 
         content = tab.get_content()
@@ -6181,7 +6340,7 @@ class MarkdownNotepad(tk.Tk):
         self.update_idletasks()
         
         try:
-            content = self.current_tab.get_content()
+            content = self.current_tab.to_markdown_document() if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet' else self.current_tab.get_content()
             base_path = os.path.dirname(self.current_tab.file_path) if self.current_tab.file_path else os.getcwd()
             export_to_pdf(content, filepath, theme=self.theme, base_path=base_path)
             self._set_status(f"Exported to: {filepath}")
@@ -6211,7 +6370,7 @@ class MarkdownNotepad(tk.Tk):
             return
         
         try:
-            content = self.current_tab.get_content()
+            content = self.current_tab.to_markdown_document() if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet' else self.current_tab.get_content()
             base_path = os.path.dirname(self.current_tab.file_path) if self.current_tab.file_path else os.getcwd()
             export_to_html(content, filepath, theme=self.theme, base_path=base_path)
             self._set_status(f"Exported to: {filepath}")
@@ -6241,7 +6400,7 @@ class MarkdownNotepad(tk.Tk):
             return
         
         try:
-            content = self.current_tab.get_content()
+            content = self.current_tab.to_markdown_document() if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet' else self.current_tab.get_content()
             base_path = os.path.dirname(self.current_tab.file_path) if self.current_tab.file_path else os.getcwd()
             export_to_docx(content, filepath, theme=self.theme, base_path=base_path)
             self._set_status(f"Exported to: {filepath}")
@@ -6264,7 +6423,8 @@ class MarkdownNotepad(tk.Tk):
         tab = SpreadsheetTab(
             self.notebook,
             theme=self.theme,
-            on_modified_callback=lambda: self._on_tab_modified()
+            on_modified_callback=lambda: self._on_tab_modified(),
+            on_selection_change=self._schedule_position_update
         )
         if file_path:
             tab.file_path = file_path
@@ -6527,7 +6687,8 @@ class MarkdownNotepad(tk.Tk):
                 menu.add_command(label="Close Tab", command=lambda: self.close_tab(clicked_tab))
                 menu.add_command(label="Close Other Tabs", command=lambda: self._close_other_tabs(clicked_tab))
                 menu.add_separator()
-                menu.add_command(label="New Tab", command=self.new_tab)
+                menu.add_command(label="🗋 New Document Tab", command=self.new_document_tab)
+                menu.add_command(label="⊞ New Spreadsheet Tab", command=self.new_spreadsheet_tab)
                 menu.tk_popup(event.x_root, event.y_root)
         except:
             pass
@@ -6771,6 +6932,9 @@ class MarkdownNotepad(tk.Tk):
         if not self.current_tab:
             return
         tab = self.current_tab
+        if getattr(tab, 'tab_type', 'document') == 'spreadsheet':
+            self._set_zoom(100)
+            return
         page = tab.source_page
         self._set_zoom(int(page.fit_zoom() * 100))
     
@@ -7335,8 +7499,7 @@ class MarkdownNotepad(tk.Tk):
         """Cut selected text"""
         if self.current_tab:
             if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
-                self.current_tab.grid_widget.copy_selection()
-                self.current_tab.grid_widget.delete_selection()
+                self.current_tab.cut()
             elif hasattr(self.current_tab, 'source_editor'):
                 self.current_tab.source_editor.event_generate("<<Cut>>")
     
@@ -7467,9 +7630,7 @@ class MarkdownNotepad(tk.Tk):
         """Select all text or all populated spreadsheet cells"""
         if self.current_tab:
             if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
-                min_r, min_c, max_r, max_c = self.current_tab.engine.get_bounding_box()
-                self.current_tab.grid_widget.selected_cells = ((min_r, min_c), (max_r, max_c))
-                self.current_tab.grid_widget.redraw()
+                self.current_tab.select_all()
             elif hasattr(self.current_tab, 'source_editor'):
                 self.current_tab.source_editor.tag_add(tk.SEL, "1.0", tk.END)
         return "break"
@@ -7478,6 +7639,27 @@ class MarkdownNotepad(tk.Tk):
         """Clean and reflow the current tab's markdown text using algorithmic normalization."""
         if not self.current_tab:
             return
+        if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+            old_cells = {}
+            new_cells = {}
+            for (r, c), val in list(self.current_tab.engine.raw_cells.items()):
+                if isinstance(val, str) and not val.startswith("="):
+                    trimmed = val.strip()
+                    if trimmed != val:
+                        old_cells[(r, c)] = val
+                        new_cells[(r, c)] = trimmed
+                        self.current_tab.engine.set_cell(r, c, trimmed)
+            if old_cells:
+                self.current_tab.grid_widget._save_undo_state({"type": "batch_cells", "old_cells": old_cells, "new_cells": new_cells})
+                self.current_tab.engine.recalculate_all()
+                self.current_tab.grid_widget.redraw()
+                self.current_tab.is_modified = True
+                self._update_tab_title(self.current_tab)
+                self._set_status(f"Trimmed whitespace in {len(old_cells)} spreadsheet cell(s)")
+            else:
+                self._set_status("Spreadsheet cells are already clean")
+            return
+
         if not TEXT_CLEANER_AVAILABLE:
             messagebox.showwarning("Feature Unavailable", "Text cleaner module is not available.")
             return
@@ -7499,15 +7681,38 @@ class MarkdownNotepad(tk.Tk):
         """Clean and reflow only the currently selected text in the active tab."""
         if not self.current_tab:
             return
+        if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+            (min_r, min_c), (max_r, max_c) = self.current_tab.grid_widget.get_selected_range()
+            old_cells = {}
+            new_cells = {}
+            for r in range(min_r, max_r + 1):
+                for c in range(min_c, max_c + 1):
+                    val = self.current_tab.engine.get_raw(r, c)
+                    if isinstance(val, str) and not val.startswith("="):
+                        trimmed = val.strip()
+                        if trimmed != val:
+                            old_cells[(r, c)] = val
+                            new_cells[(r, c)] = trimmed
+                            self.current_tab.engine.set_cell(r, c, trimmed)
+            if old_cells:
+                self.current_tab.grid_widget._save_undo_state({"type": "batch_cells", "old_cells": old_cells, "new_cells": new_cells})
+                self.current_tab.engine.recalculate_all()
+                self.current_tab.grid_widget.redraw()
+                self.current_tab.is_modified = True
+                self._update_tab_title(self.current_tab)
+                self._set_status(f"Trimmed whitespace in {len(old_cells)} selected cell(s)")
+            else:
+                self._set_status("Selected cells are already clean")
+            return
+
         if not TEXT_CLEANER_AVAILABLE:
             messagebox.showwarning("Feature Unavailable", "Text cleaner module is not available.")
             return
 
-        if not self.current_tab:
-            return
-
         # Canonical editor widget
-        text_widget = self.current_tab.source_editor
+        text_widget = getattr(self.current_tab, 'source_editor', None)
+        if not text_widget:
+            return
 
         try:
             sel_start = text_widget.index(tk.SEL_FIRST)
@@ -7539,6 +7744,11 @@ class MarkdownNotepad(tk.Tk):
     def _insert_format(self, prefix, suffix):
         """Insert formatting around selected text, or toggle formatting if already applied."""
         if not self.current_tab:
+            return "break"
+
+        if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+            if prefix == "**":
+                self.current_tab.toggle_bold_selection()
             return "break"
         
         tab = self.current_tab
@@ -9646,9 +9856,24 @@ class SnapshotDialog(tk.Toplevel):
         snap = self.tab.snapshots[idx]
         self.preview_text.config(state=tk.NORMAL)
         self.preview_text.delete('1.0', tk.END)
-        self.preview_text.insert('1.0', snap.get('content', ''))
+        content_to_show = snap.get('content', '')
+        if getattr(self.tab, 'tab_type', 'document') == 'spreadsheet' and content_to_show.strip().startswith('{'):
+            try:
+                data = json.loads(content_to_show)
+                cells = data.get("cells", {})
+                preview_lines = [f"Spreadsheet Snapshot: {len(cells)} cells populated\n"]
+                for k, v in list(cells.items())[:35]:
+                    r, c = map(int, k.split(','))
+                    ref = cell_to_ref(r, c) if SPREADSHEET_AVAILABLE else f"R{r+1}C{c+1}"
+                    preview_lines.append(f"{ref}: {v}")
+                if len(cells) > 35:
+                    preview_lines.append(f"... ({len(cells) - 35} more cells)")
+                content_to_show = "\n".join(preview_lines)
+            except Exception:
+                pass
+        self.preview_text.insert('1.0', content_to_show)
         self.preview_text.config(state=tk.DISABLED)
-        self.compare_btn.config(state=tk.NORMAL)
+        self.compare_btn.config(state=tk.NORMAL if getattr(self.tab, 'tab_type', 'document') != 'spreadsheet' else tk.DISABLED)
         self.restore_btn.config(state=tk.NORMAL)
         self.delete_btn.config(state=tk.NORMAL)
 
@@ -9703,7 +9928,12 @@ class SnapshotDialog(tk.Toplevel):
             return
 
         self.notepad.create_quick_snapshot(f"Auto-backup before restoring '{snap_name}'")
-        self.notepad._apply_diff(snap_text, "1.0", tk.END, current_text, apply_mode="full")
+        if getattr(self.tab, 'tab_type', 'document') == 'spreadsheet':
+            self.tab.set_content(snap_text)
+            self.tab.is_modified = True
+            self.notepad._update_tab_title(self.tab)
+        else:
+            self.notepad._apply_diff(snap_text, "1.0", tk.END, current_text, apply_mode="full")
         self._refresh_list()
         self.notepad._set_status(f"Restored snapshot: '{snap_name}'")
 

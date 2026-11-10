@@ -5048,15 +5048,26 @@ class ChatSidebar(tk.Frame):
             'start_index': start_index,
             'end_index': end_index,
         }
-        try:
-            start_line = start_index.split('.')[0]
-            end_line = end_index.split('.')[0]
-            if start_line == end_line:
-                loc = f"line {start_line}"
+        # Determine location display (Spreadsheet cell/range vs Document lines)
+        if text.startswith("[Spreadsheet Range:"):
+            m = re.search(r"\[Spreadsheet Range:\s*([^\]]+)\]", text)
+            rng_name = m.group(1) if m else "Range"
+            loc = f"Range {rng_name}"
+        elif re.match(r"^[A-Za-z]+[0-9]+$", str(start_index)) and re.match(r"^[A-Za-z]+[0-9]+$", str(end_index)):
+            if start_index == end_index:
+                loc = f"Cell {start_index}"
             else:
-                loc = f"lines {start_line}\u2013{end_line}"
-        except Exception:
-            loc = "selection"
+                loc = f"Range {start_index}:{end_index}"
+        else:
+            try:
+                start_line = start_index.split('.')[0]
+                end_line = end_index.split('.')[0]
+                if start_line == end_line:
+                    loc = f"line {start_line}"
+                else:
+                    loc = f"lines {start_line}\u2013{end_line}"
+            except Exception:
+                loc = "selection"
         preview = text[:60].replace('\n', ' ')
         if len(text) > 60:
             preview += '\u2026'
@@ -5087,7 +5098,7 @@ class ChatSidebar(tk.Frame):
 
     def _show_apply_button(self):
         """Show an 'Apply to Document' button below the last AI message in the chat"""
-        if not self.pending_selection or not self.apply_edit_callback:
+        if not self.apply_edit_callback:
             return
         last = next((m for m in reversed(self._messages) if m.role == 'assistant'), None)
         if last is None or not last.content.strip():
@@ -5095,11 +5106,28 @@ class ChatSidebar(tk.Frame):
         response_text = last.content.strip()
         sel = self.pending_selection
 
+        notepad = self.winfo_toplevel()
+        cur_tab = getattr(notepad, 'current_tab', None)
+        is_sheet = bool(cur_tab and getattr(cur_tab, 'tab_type', 'document') == 'spreadsheet')
+
+        has_sheet_patches = False
+        if is_sheet:
+            has_sheet_patches = bool(
+                re.search(r"```(?:spreadsheet-edits|spreadsheet|excel|csv|tsv)", response_text, re.IGNORECASE) or
+                re.search(r"\b[A-Za-z]+[0-9]+\s*[:=]\s*", response_text) or
+                ("|" in response_text and "\n|" in response_text)
+            )
+
+        if not sel and not has_sheet_patches:
+            return
+
+        btn_text = "\u2714 Review & Apply to Spreadsheet" if is_sheet else "\u2714 Review & Apply to Document"
+
         w = self.chat_display
         with self._writable():
             w.insert(tk.END, '\n', ('body',))
             apply_btn = ttk.Button(
-                w, text="\u2714 Review & Apply to Document",
+                w, text=btn_text,
                 command=lambda: self._apply_response_to_document(response_text, sel))
             w.window_create(tk.END, window=apply_btn, padx=12)
             w.insert(tk.END, '  ', ('body',))
