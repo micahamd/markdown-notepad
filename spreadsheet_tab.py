@@ -2459,10 +2459,12 @@ class SpreadsheetTab(ttk.Frame):
                 raw = self.engine.get_raw(r, c)
                 val = self.engine.get_value(r, c)
                 coord = cell_to_ref(r, c)
-                if raw.startswith("="):
-                    row_parts.append(f"{coord}: {raw} => {val}")
-                elif raw:
-                    row_parts.append(f"{coord}: {raw}")
+                clean_raw = str(raw).replace("\r\n", " ").replace("\n", " ").strip()
+                clean_val = str(val).replace("\r\n", " ").replace("\n", " ").strip()
+                if clean_raw.startswith("="):
+                    row_parts.append(f"{coord}: {clean_raw} => {clean_val}")
+                elif clean_raw:
+                    row_parts.append(f"{coord}: {clean_raw}")
                 else:
                     row_parts.append(f"{coord}: [empty]")
             lines.append(" | ".join(row_parts))
@@ -2491,17 +2493,27 @@ class SpreadsheetTab(ttk.Frame):
         name = self.get_display_name()
         lines.append(f"# Spreadsheet: {name}")
 
-        (min_r, min_c), (max_r, max_c) = self.grid_widget.get_selected_range()
-        sel_coord = f"{cell_to_ref(min_r, min_c)}:{cell_to_ref(max_r, max_c)}"
+        (sel_min_r, sel_min_c), (sel_max_r, sel_max_c) = self.grid_widget.get_selected_range()
+        sel_coord = f"{cell_to_ref(sel_min_r, sel_min_c)}:{cell_to_ref(sel_max_r, sel_max_c)}"
         lines.append(f"Active Selection: {sel_coord}")
 
-        if not populated:
+        if not populated and (sel_min_r, sel_min_c) == (0, 0) and (sel_max_r, sel_max_c) == (0, 0):
             lines.append("[Spreadsheet is currently empty]")
         else:
-            min_r = min(r for r, c in populated)
-            max_r = max(r for r, c in populated)
-            min_c = min(c for r, c in populated)
-            max_c = max(c for r, c in populated)
+            if populated:
+                pop_min_r = min(r for r, c in populated)
+                pop_max_r = max(r for r, c in populated)
+                pop_min_c = min(c for r, c in populated)
+                pop_max_c = max(c for r, c in populated)
+                if sel_max_r > sel_min_r or sel_max_c > sel_min_c:
+                    min_r = min(pop_min_r, sel_min_r)
+                    max_r = max(pop_max_r, sel_max_r)
+                    min_c = min(pop_min_c, sel_min_c)
+                    max_c = max(pop_max_c, sel_max_c)
+                else:
+                    min_r, max_r, min_c, max_c = pop_min_r, pop_max_r, pop_min_c, pop_max_c
+            else:
+                min_r, max_r, min_c, max_c = sel_min_r, sel_max_r, sel_min_c, sel_max_c
 
             lines.append(f"Dimensions: Rows {min_r + 1} to {max_r + 1}, Columns {col_index_to_letter(min_c)} to {col_index_to_letter(max_c)}")
             lines.append("")
@@ -2516,9 +2528,19 @@ class SpreadsheetTab(ttk.Frame):
                 for c in range(min_c, max_c + 1):
                     raw = self.engine.get_raw(r, c)
                     val = self.engine.get_value(r, c)
-                    if raw.startswith("="):
-                        formula_map.append(f"- {cell_to_ref(r, c)}: `{raw}` => {val}")
-                    val_str = str(val).replace("|", "\\|") if val != "" and val is not None else ""
+                    if str(raw).startswith("="):
+                        clean_raw = str(raw).replace("\r\n", " ").replace("\n", " ").strip()
+                        clean_val = str(val).replace("\r\n", " ").replace("\n", " ").strip()
+                        formula_map.append(f"- {cell_to_ref(r, c)}: `{clean_raw}` => {clean_val}")
+                    val_str = (
+                        str(val)
+                        .replace("\r\n", " ")
+                        .replace("\n", " ")
+                        .replace("|", "\\|")
+                        .strip()
+                        if val != "" and val is not None
+                        else ""
+                    )
                     row_items.append(val_str)
                 lines.append("| " + " | ".join(row_items) + " |")
 
@@ -2528,18 +2550,22 @@ class SpreadsheetTab(ttk.Frame):
                 lines.extend(formula_map)
 
         lines.append("")
-        lines.append("### Instructions for Editing the Spreadsheet:")
-        lines.append("To insert, update, or calculate cells or formulas, provide a fenced `spreadsheet-edits` block:")
+        lines.append("### Instructions for Editing or Populating the Spreadsheet:")
+        lines.append("To insert, update, evaluate, or calculate cells, provide a fenced `spreadsheet-edits` block.")
+        lines.append("Formatting rules:")
+        lines.append("1. Write each cell update on its own line: `CELL: VALUE_OR_FORMULA`")
+        lines.append("2. For row-by-row grading, evaluation, or data filling:")
+        lines.append("   - Use sample grades and feedback already present in previous rows to guide your scoring criteria, scale, and feedback cadence.")
+        lines.append("   - Emit updates ONLY for the cells that need to be populated or updated (e.g., target score and feedback columns like C3 and D3).")
+        lines.append("   - Do NOT re-emit or overwrite existing question, response, or sample evaluation cells unless explicitly asked.")
+        lines.append("   - Keep each cell value on a single line.")
+        lines.append("3. Examples:")
         lines.append("```spreadsheet-edits")
-        lines.append("CELL: VALUE_OR_FORMULA")
-        lines.append("e.g.")
-        lines.append("A1: Item Name")
-        lines.append("B1: Price")
-        lines.append("C1: Quantity")
-        lines.append("D1: Total")
-        lines.append("D2: =ROUND(B2*C2, 2)")
-        lines.append("D2:D10: =ROUND(B2*C2, 2)")
-        lines.append("D11: =SUM(D2:D10)")
+        lines.append("C3: 0.8")
+        lines.append("D3: Accurate response addressing all key criteria.")
+        lines.append("C4: 0.5")
+        lines.append("D4: Missing the secondary explanation required by the rubric.")
+        lines.append("D11: =AVERAGE(C2:C10)")
         lines.append("```")
         return "\n".join(lines)
 
@@ -2659,54 +2685,47 @@ class SpreadsheetTab(ttk.Frame):
 class SpreadsheetPatchParser:
     """Extract cell modifications and formulas from AI messages."""
 
-    _BLOCK_RE = re.compile(r"```(?:spreadsheet-edits|spreadsheet|excel|csv|tsv)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
-    _RANGE_LINE_RE = re.compile(r"^\s*(?:[-*•]\s+)?(?:SET\s+)?([A-Za-z]+[0-9]+)\s*:\s*([A-Za-z]+[0-9]+)\s*[:=]\s*(.+)$", re.IGNORECASE)
+    _SPECIFIC_BLOCK_RE = re.compile(r"```(?:spreadsheet-edits|spreadsheet|excel)\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+    _GENERIC_BLOCK_RE = re.compile(r"```(?:csv|tsv|markdown|table)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+    _RANGE_LINE_RE = re.compile(r"^\s*(?:[-*•]\s+)?(?:SET\s+)?([A-Za-z]+[0-9]+):([A-Za-z]+[0-9]+)\s*[:=]\s*(.+)$", re.IGNORECASE)
     _LINE_RE = re.compile(r"^\s*(?:[-*•]\s+)?(?:SET\s+)?([A-Za-z]+[0-9]+)\s*[:=]\s*(.+)$", re.IGNORECASE)
+
+    @staticmethod
+    def _extract_col_letter(header: str) -> Optional[str]:
+        h = header.strip()
+        if not h:
+            return None
+        # Exact column letter e.g. "C" or "AA"
+        if re.match(r"^[A-Za-z]{1,2}$", h):
+            return h.upper()
+        # Look for (C) or [C]
+        m = re.search(r"[\(\[]\s*([A-Za-z]{1,2})\s*[\)\]]", h)
+        if m:
+            return m.group(1).upper()
+        # Look for "Col C", "Column C", "Col. C"
+        m = re.search(r"\bcol(?:umn)?\.?\s*([A-Za-z]{1,2})\b", h, re.IGNORECASE)
+        if m:
+            return m.group(1).upper()
+        return None
 
     @classmethod
     def parse_patches(cls, ai_text: str) -> Dict[str, str]:
         """Extract mapping of 'A1' -> 'new_value_or_formula' from AI text."""
         patches = {}
-        blocks = cls._BLOCK_RE.findall(ai_text)
-        sources = blocks if blocks else [ai_text]
+        specific_blocks = cls._SPECIFIC_BLOCK_RE.findall(ai_text)
+        if specific_blocks:
+            sources = specific_blocks
+            is_specific = True
+        else:
+            generic_blocks = cls._GENERIC_BLOCK_RE.findall(ai_text)
+            sources = generic_blocks if generic_blocks else [ai_text]
+            is_specific = False
 
         for block in sources:
             lines = [l.strip() for l in block.splitlines() if l.strip() and not l.strip().startswith("#")]
-            table_lines = [l for l in lines if l.startswith("|") and l.endswith("|")]
-            if len(table_lines) >= 2:
-                hdr_parts = [p.strip() for p in table_lines[0].split("|")[1:-1]]
-                data_rows = []
-                for tl in table_lines[1:]:
-                    parts = [p.strip() for p in tl.split("|")[1:-1]]
-                    if parts and not all(re.match(r"^:?-+:?$", p) for p in parts):
-                        data_rows.append(parts)
 
-                if len(hdr_parts) == 2 and hdr_parts[0].lower() in ("cell", "coord", "coordinate", "ref"):
-                    for row in data_rows:
-                        if len(row) >= 2 and parse_cell_ref(row[0].upper()):
-                            patches[row[0].upper()] = row[1]
-                elif len(hdr_parts) > 1 and hdr_parts[0].lower() in ("row", "r", "#"):
-                    col_letters = [h.upper() for h in hdr_parts[1:]]
-                    for row in data_rows:
-                        if not row:
-                            continue
-                        try:
-                            r_num = int(row[0])
-                        except ValueError:
-                            continue
-                        for col_idx, c_letter in enumerate(col_letters):
-                            if col_idx + 1 < len(row):
-                                val = row[col_idx + 1]
-                                patches[f"{c_letter}{r_num}"] = val
-                elif data_rows:
-                    for c_offset, h_val in enumerate(hdr_parts):
-                        c_letter = col_index_to_letter(c_offset)
-                        patches[f"{c_letter}1"] = h_val
-                    for r_offset, row in enumerate(data_rows):
-                        for c_offset, val in enumerate(row):
-                            c_letter = col_index_to_letter(c_offset)
-                            patches[f"{c_letter}{r_offset + 2}"] = val
-
+            # 1. Parse individual cell lines (CELL: VALUE or RANGE: VALUE)
+            block_line_patches = {}
             for line in lines:
                 m_range = cls._RANGE_LINE_RE.match(line)
                 if m_range:
@@ -2725,14 +2744,59 @@ class SpreadsheetPatchParser:
                                 dr = r - p1[0]
                                 dc = c - p1[1]
                                 shifted = shift_formula_references(val, dr, dc) if val.startswith("=") else val
-                                patches[cell_to_ref(r, c)] = shifted
+                                block_line_patches[cell_to_ref(r, c)] = shifted
                     continue
 
                 m = cls._LINE_RE.match(line)
                 if m:
                     coord = m.group(1).upper()
                     val = m.group(2).strip()
-                    patches[coord] = val
+                    if parse_cell_ref(coord):
+                        block_line_patches[coord] = val
+
+            # If explicit cell lines were found, prioritize them and avoid table fallbacks
+            if block_line_patches:
+                patches.update(block_line_patches)
+                continue
+
+            # 2. Table parsing (only if no explicit cell lines found in this block)
+            table_lines = [l for l in lines if l.startswith("|") and l.endswith("|")]
+            if len(table_lines) >= 2:
+                hdr_parts = [p.strip() for p in table_lines[0].split("|")[1:-1]]
+                data_rows = []
+                for tl in table_lines[1:]:
+                    parts = [p.strip() for p in tl.split("|")[1:-1]]
+                    if parts and not all(re.match(r"^:?-+:?$", p) for p in parts):
+                        data_rows.append(parts)
+
+                # Format A: | Cell | Value |
+                if len(hdr_parts) == 2 and hdr_parts[0].lower() in ("cell", "coord", "coordinate", "ref"):
+                    for row in data_rows:
+                        if len(row) >= 2 and parse_cell_ref(row[0].upper()):
+                            patches[row[0].upper()] = row[1]
+                # Format B: | Row | C | D | or | Row | Score (C) | Feedback (D) |
+                elif len(hdr_parts) > 1 and hdr_parts[0].lower() in ("row", "r", "#"):
+                    col_letters = [cls._extract_col_letter(h) for h in hdr_parts[1:]]
+                    for row in data_rows:
+                        if not row:
+                            continue
+                        try:
+                            r_num = int(row[0])
+                        except ValueError:
+                            continue
+                        for col_idx, c_letter in enumerate(col_letters):
+                            if c_letter and col_idx + 1 < len(row):
+                                val = row[col_idx + 1]
+                                patches[f"{c_letter}{r_num}"] = val
+                # Format C: Full grid replacement only if inside a specific spreadsheet block
+                elif data_rows and is_specific:
+                    for c_offset, h_val in enumerate(hdr_parts):
+                        c_letter = col_index_to_letter(c_offset)
+                        patches[f"{c_letter}1"] = h_val
+                    for r_offset, row in enumerate(data_rows):
+                        for c_offset, val in enumerate(row):
+                            c_letter = col_index_to_letter(c_offset)
+                            patches[f"{c_letter}{r_offset + 2}"] = val
 
         return patches
 

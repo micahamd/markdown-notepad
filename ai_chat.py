@@ -4788,7 +4788,7 @@ class ChatSidebar(tk.Frame):
             self._render_all()
         elif was_visible:
             self.chat_display.see(tk.END)
-            if self.pending_selection and status == "Ready":
+            if status == "Ready":
                 self._show_apply_button()
         self._gen_visible = False
 
@@ -5131,7 +5131,16 @@ class ChatSidebar(tk.Frame):
                 command=lambda: self._apply_response_to_document(response_text, sel))
             w.window_create(tk.END, window=apply_btn, padx=12)
             w.insert(tk.END, '  ', ('body',))
-            discard_btn = ttk.Button(w, text="\u2718 Discard", command=self._clear_pending_selection)
+
+            def _on_discard():
+                self._clear_pending_selection()
+                try:
+                    apply_btn.destroy()
+                    discard_btn.destroy()
+                except Exception:
+                    pass
+
+            discard_btn = ttk.Button(w, text="\u2718 Discard", command=_on_discard)
             w.window_create(tk.END, window=discard_btn)
             w.insert(tk.END, '\n', ('body',))
         w.see(tk.END)
