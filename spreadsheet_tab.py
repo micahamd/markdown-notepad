@@ -595,17 +595,23 @@ class FormulaEngine:
     def evaluate_cell(self, row: int, col: int) -> Any:
         """Recursively evaluate cell, detecting circular references."""
         raw = self.raw_cells.get((row, col), "")
-        if not raw or not raw.startswith("="):
+        raw_str = str(raw) if raw is not None else ""
+        if raw_str.startswith("'"):
+            # Excel-style explicit text escape, e.g. '= literal text
+            val = raw_str[1:]
+            self.computed_values[(row, col)] = val
+            return val
+        if not raw_str or not raw_str.startswith("="):
             # Literal constant
-            if raw == "":
+            if raw_str == "":
                 self.computed_values[(row, col)] = ""
                 return ""
             try:
                 # If numeric string, store as float/int
-                if "." in raw:
-                    val = float(raw)
+                if "." in raw_str:
+                    val = float(raw_str)
                 else:
-                    val = int(raw)
+                    val = int(raw_str)
             except ValueError:
                 val = raw
             self.computed_values[(row, col)] = val
@@ -617,7 +623,7 @@ class FormulaEngine:
 
         self._eval_stack.add((row, col))
         try:
-            computed = self._eval_formula(raw[1:], row, col)
+            computed = self._eval_formula(raw_str[1:], row, col)
         except Exception as e:
             computed = self.ERROR_GENERIC
         finally:
@@ -2439,6 +2445,24 @@ class SpreadsheetTab(ttk.Frame):
         finally:
             menu.grab_release()
 
+    @staticmethod
+    def _sanitize_cell_for_markdown(val: Any) -> str:
+        """Sanitize cell value for robust Markdown table rendering and AI context serialization."""
+        if val is None or val == "":
+            return ""
+        s = str(val)
+        # Strip null bytes and non-printable control characters (\x00-\x08, \x0b, \x0c, \x0e-\x1f)
+        s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", s)
+        # Normalize newlines, carriage returns, and tabs to single spaces
+        s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        # Neutralize triple backticks so embedded code doesn't terminate markdown blocks prematurely
+        s = s.replace("```", "` ` `")
+        # Escape literal pipes
+        s = s.replace("|", "\\|")
+        # Collapse multiple consecutive whitespace spaces while preserving text
+        s = re.sub(r" {2,}", " ", s)
+        return s.strip()
+
     def _transfer_selection_to_chat(self):
         """Transfer selected cell coordinates, values, and formulas to AI Sidebar."""
         (min_r, min_c), (max_r, max_c) = self.grid_widget.get_selected_range()
@@ -2459,9 +2483,9 @@ class SpreadsheetTab(ttk.Frame):
                 raw = self.engine.get_raw(r, c)
                 val = self.engine.get_value(r, c)
                 coord = cell_to_ref(r, c)
-                clean_raw = str(raw).replace("\r\n", " ").replace("\n", " ").strip()
-                clean_val = str(val).replace("\r\n", " ").replace("\n", " ").strip()
-                if clean_raw.startswith("="):
+                clean_raw = self._sanitize_cell_for_markdown(raw)
+                clean_val = self._sanitize_cell_for_markdown(val)
+                if str(raw).startswith("="):
                     row_parts.append(f"{coord}: {clean_raw} => {clean_val}")
                 elif clean_raw:
                     row_parts.append(f"{coord}: {clean_raw}")
@@ -2529,18 +2553,10 @@ class SpreadsheetTab(ttk.Frame):
                     raw = self.engine.get_raw(r, c)
                     val = self.engine.get_value(r, c)
                     if str(raw).startswith("="):
-                        clean_raw = str(raw).replace("\r\n", " ").replace("\n", " ").strip()
-                        clean_val = str(val).replace("\r\n", " ").replace("\n", " ").strip()
+                        clean_raw = self._sanitize_cell_for_markdown(raw)
+                        clean_val = self._sanitize_cell_for_markdown(val)
                         formula_map.append(f"- {cell_to_ref(r, c)}: `{clean_raw}` => {clean_val}")
-                    val_str = (
-                        str(val)
-                        .replace("\r\n", " ")
-                        .replace("\n", " ")
-                        .replace("|", "\\|")
-                        .strip()
-                        if val != "" and val is not None
-                        else ""
-                    )
+                    val_str = self._sanitize_cell_for_markdown(val)
                     row_items.append(val_str)
                 lines.append("| " + " | ".join(row_items) + " |")
 
@@ -2685,10 +2701,32 @@ class SpreadsheetTab(ttk.Frame):
 class SpreadsheetPatchParser:
     """Extract cell modifications and formulas from AI messages."""
 
-    _SPECIFIC_BLOCK_RE = re.compile(r"```(?:spreadsheet-edits|spreadsheet|excel)\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
-    _GENERIC_BLOCK_RE = re.compile(r"```(?:csv|tsv|markdown|table)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+    _SPECIFIC_BLOCK_RE = re.compile(
+        r"```(?:spreadsheet-edits|spreadsheet|excel)[^\n]*\r?\n(.*?)(?:\r?\n[ \t]*```|```$)",
+        re.DOTALL | re.IGNORECASE
+    )
+    _GENERIC_BLOCK_RE = re.compile(
+        r"```(?:csv|tsv|markdown|table)?[^\n]*\r?\n(.*?)(?:\r?\n[ \t]*```|```$)",
+        re.DOTALL | re.IGNORECASE
+    )
     _RANGE_LINE_RE = re.compile(r"^\s*(?:[-*•]\s+)?(?:SET\s+)?([A-Za-z]+[0-9]+):([A-Za-z]+[0-9]+)\s*[:=]\s*(.+)$", re.IGNORECASE)
     _LINE_RE = re.compile(r"^\s*(?:[-*•]\s+)?(?:SET\s+)?([A-Za-z]+[0-9]+)\s*[:=]\s*(.+)$", re.IGNORECASE)
+
+    @classmethod
+    def _find_specific_blocks(cls, text: str) -> List[str]:
+        blocks = cls._SPECIFIC_BLOCK_RE.findall(text)
+        if not blocks:
+            fallback_re = re.compile(r"```(?:spreadsheet-edits|spreadsheet|excel)\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+            blocks = fallback_re.findall(text)
+        return blocks
+
+    @classmethod
+    def _find_generic_blocks(cls, text: str) -> List[str]:
+        blocks = cls._GENERIC_BLOCK_RE.findall(text)
+        if not blocks:
+            fallback_re = re.compile(r"```(?:csv|tsv|markdown|table)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+            blocks = fallback_re.findall(text)
+        return blocks
 
     @staticmethod
     def _extract_col_letter(header: str) -> Optional[str]:
@@ -2708,30 +2746,76 @@ class SpreadsheetPatchParser:
             return m.group(1).upper()
         return None
 
+    @staticmethod
+    def _clean_patch_value(val: str) -> str:
+        """Strip wrapper quotes, spurious leading equals from prose, and normalize whitespace."""
+        v = val.strip()
+        if not v:
+            return ""
+        # Strip outer matching quotes if not an Excel formula
+        if not v.startswith("="):
+            if len(v) >= 2 and v.startswith('"') and v.endswith('"'):
+                v = v[1:-1].strip().replace('\\"', '"')
+            elif len(v) >= 2 and v.startswith("'") and v.endswith("'") and not v.startswith("'="):
+                v = v[1:-1].strip().replace("\\'", "'")
+        else:
+            # Starts with "="
+            # Check if this is an accidental prose line with leading = (e.g. "= 0.5 points because...")
+            # or a genuine formula (e.g. "=SUM(C1:C10)" or "=C3*100")
+            is_formula = False
+            try:
+                expr = v[1:].strip()
+                if expr:
+                    prep = preprocess_excel_formula(expr)
+                    ast.parse(prep, mode="eval")
+                    is_formula = True
+            except Exception:
+                is_formula = False
+
+            if not is_formula:
+                # If it has leading '= ' or '==' or looks like prose, strip spurious leading '='
+                stripped = re.sub(r"^=+\s*", "", v)
+                if stripped:
+                    v = stripped
+        return v
+
     @classmethod
     def parse_patches(cls, ai_text: str) -> Dict[str, str]:
         """Extract mapping of 'A1' -> 'new_value_or_formula' from AI text."""
         patches = {}
-        specific_blocks = cls._SPECIFIC_BLOCK_RE.findall(ai_text)
+        specific_blocks = cls._find_specific_blocks(ai_text)
         if specific_blocks:
             sources = specific_blocks
             is_specific = True
         else:
-            generic_blocks = cls._GENERIC_BLOCK_RE.findall(ai_text)
+            generic_blocks = cls._find_generic_blocks(ai_text)
             sources = generic_blocks if generic_blocks else [ai_text]
             is_specific = False
 
         for block in sources:
-            lines = [l.strip() for l in block.splitlines() if l.strip() and not l.strip().startswith("#")]
+            lines = [l.strip() for l in block.splitlines()]
 
             # 1. Parse individual cell lines (CELL: VALUE or RANGE: VALUE)
             block_line_patches = {}
+            last_single_coord = None
             for line in lines:
+                if not line:
+                    continue
+                # If line is a markdown table row, reset continuation
+                if line.startswith("|") and line.endswith("|"):
+                    last_single_coord = None
+                    continue
+                # If line is a markdown heading/comment (# Comment or // Comment), reset continuation
+                if re.match(r"^#{1,6}\s+", line) or line.startswith("//"):
+                    last_single_coord = None
+                    continue
+
                 m_range = cls._RANGE_LINE_RE.match(line)
                 if m_range:
+                    last_single_coord = None
                     c1_str = m_range.group(1).upper()
                     c2_str = m_range.group(2).upper()
-                    val = m_range.group(3).strip()
+                    val = cls._clean_patch_value(m_range.group(3))
                     p1 = parse_cell_ref(c1_str)
                     p2 = parse_cell_ref(c2_str)
                     if p1 and p2:
@@ -2750,24 +2834,37 @@ class SpreadsheetPatchParser:
                 m = cls._LINE_RE.match(line)
                 if m:
                     coord = m.group(1).upper()
-                    val = m.group(2).strip()
+                    raw_val = m.group(2).strip()
                     if parse_cell_ref(coord):
-                        block_line_patches[coord] = val
+                        block_line_patches[coord] = raw_val
+                        last_single_coord = coord
+                    else:
+                        last_single_coord = None
+                    continue
+
+                # Continuation line for the preceding single cell
+                if last_single_coord is not None and last_single_coord in block_line_patches:
+                    clean_cont = line.strip()
+                    if clean_cont:
+                        block_line_patches[last_single_coord] += " " + clean_cont
 
             # If explicit cell lines were found, prioritize them and avoid table fallbacks
             if block_line_patches:
-                patches.update(block_line_patches)
+                for k, v in block_line_patches.items():
+                    patches[k] = cls._clean_patch_value(v)
                 continue
 
             # 2. Table parsing (only if no explicit cell lines found in this block)
             table_lines = [l for l in lines if l.startswith("|") and l.endswith("|")]
             if len(table_lines) >= 2:
-                hdr_parts = [p.strip() for p in table_lines[0].split("|")[1:-1]]
+                hdr_raw_parts = [p.strip() for p in re.split(r"(?<!\\)\|", table_lines[0])[1:-1]]
+                hdr_parts = [p.replace(r"\|", "|").strip() for p in hdr_raw_parts]
                 data_rows = []
                 for tl in table_lines[1:]:
-                    parts = [p.strip() for p in tl.split("|")[1:-1]]
-                    if parts and not all(re.match(r"^:?-+:?$", p) for p in parts):
-                        data_rows.append(parts)
+                    raw_parts = [p.strip() for p in re.split(r"(?<!\\)\|", tl)[1:-1]]
+                    if raw_parts and not all(re.match(r"^:?-+:?$", p) for p in raw_parts):
+                        cleaned_parts = [cls._clean_patch_value(p.replace(r"\|", "|").strip()) for p in raw_parts]
+                        data_rows.append(cleaned_parts)
 
                 # Format A: | Cell | Value |
                 if len(hdr_parts) == 2 and hdr_parts[0].lower() in ("cell", "coord", "coordinate", "ref"):
@@ -2813,9 +2910,9 @@ class SpreadsheetDiffDialog(tk.Toplevel):
         self.result = False
 
         self.title("Review AI Spreadsheet Changes")
-        self.geometry("680x500")
+        self.geometry("720x520")
         self.resizable(True, True)
-        self.minsize(580, 420)
+        self.minsize(600, 440)
         self.transient(parent)
         self.grab_set()
 
@@ -2824,8 +2921,8 @@ class SpreadsheetDiffDialog(tk.Toplevel):
         # Center on parent with auto-fitting geometry
         self.update_idletasks()
         try:
-            req_w = max(680, self.winfo_reqwidth() + 24)
-            req_h = max(500, self.winfo_reqheight() + 24)
+            req_w = max(720, self.winfo_reqwidth() + 24)
+            req_h = max(520, self.winfo_reqheight() + 24)
             x = parent.winfo_rootx() + (parent.winfo_width() - req_w) // 2
             y = parent.winfo_rooty() + (parent.winfo_height() - req_h) // 2
             self.geometry(f"{req_w}x{req_h}+{max(10, x)}+{max(10, y)}")
@@ -2836,12 +2933,24 @@ class SpreadsheetDiffDialog(tk.Toplevel):
         main_frame = ttk.Frame(self, padding=12)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
+        top_ctrl_frame = ttk.Frame(main_frame)
+        top_ctrl_frame.pack(fill=tk.X, pady=(0, 8))
+
         header_lbl = ttk.Label(
-            main_frame,
+            top_ctrl_frame,
             text=f"The AI proposed {len(self.patches)} cell edit(s). Select the changes to apply:",
             font=("Segoe UI", 10, "bold")
         )
-        header_lbl.pack(anchor=tk.W, pady=(0, 8))
+        header_lbl.pack(side=tk.LEFT)
+
+        self.var_only_empty = tk.BooleanVar(value=False)
+        self.cb_only_empty = ttk.Checkbutton(
+            top_ctrl_frame,
+            text="Target empty cells only (protect populated cells)",
+            variable=self.var_only_empty,
+            command=self._on_toggle_empty_only
+        )
+        self.cb_only_empty.pack(side=tk.RIGHT)
 
         # Treeview table of proposed changes
         columns = ("apply", "cell", "old_val", "new_val", "computed")
@@ -2854,9 +2963,9 @@ class SpreadsheetDiffDialog(tk.Toplevel):
 
         self.tree.column("apply", width=60, anchor="center")
         self.tree.column("cell", width=70, anchor="center")
-        self.tree.column("old_val", width=140, anchor="w")
-        self.tree.column("new_val", width=160, anchor="w")
-        self.tree.column("computed", width=140, anchor="w")
+        self.tree.column("old_val", width=150, anchor="w")
+        self.tree.column("new_val", width=170, anchor="w")
+        self.tree.column("computed", width=150, anchor="w")
 
         scroll = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
@@ -2880,17 +2989,33 @@ class SpreadsheetDiffDialog(tk.Toplevel):
         self.row_checked: Dict[str, bool] = {}
         for coord_str, new_val in sorted(self.patches.items(), key=_coord_sort_key):
             pos = parse_cell_ref(coord_str)
-            old_val = self.tab.engine.get_raw(pos[0], pos[1]) if pos else ""
+            old_val = str(self.tab.engine.get_raw(pos[0], pos[1])) if pos else ""
             comp_val = str(temp_engine.get_value(pos[0], pos[1])) if pos else ""
 
-            item_id = self.tree.insert("", tk.END, values=("☑", coord_str, old_val, new_val, comp_val))
-            self.row_checked[item_id] = True
+            # Check by default only if proposed value differs from current value
+            is_checked = (old_val != new_val)
+            mark = "☑" if is_checked else "☐"
+
+            item_id = self.tree.insert("", tk.END, values=(mark, coord_str, old_val, new_val, comp_val))
+            self.row_checked[item_id] = is_checked
 
         self.tree.bind("<Button-1>", self._on_tree_click)
 
         # Action Buttons
         btn_frame = ttk.Frame(main_frame, padding=(0, 10, 0, 0))
         btn_frame.pack(fill=tk.X)
+
+        b_empty = ttk.Button(btn_frame, text="Select Empty Only", command=self._select_empty_only)
+        b_empty.pack(side=tk.LEFT, padx=4)
+        ToolTip(b_empty, "Check only cells that are currently empty (protects existing data and sample rows)")
+
+        b_select_all = ttk.Button(btn_frame, text="Select All", command=self._select_all)
+        b_select_all.pack(side=tk.LEFT, padx=4)
+        ToolTip(b_select_all, "Check all proposed changes")
+
+        b_clear = ttk.Button(btn_frame, text="Clear All", command=self._clear_all)
+        b_clear.pack(side=tk.LEFT, padx=4)
+        ToolTip(b_clear, "Uncheck all proposed changes")
 
         b_cancel = ttk.Button(btn_frame, text="Cancel", command=self.destroy)
         b_cancel.pack(side=tk.RIGHT, padx=4)
@@ -2915,47 +3040,46 @@ class SpreadsheetDiffDialog(tk.Toplevel):
             vals[0] = mark
             self.tree.item(item_id, values=vals)
 
-    def _accept_all(self):
-        for item_id in self.row_checked:
-            self.row_checked[item_id] = True
-        self._apply_selected()
-
-    def _apply_selected(self):
-        selected_patches = {}
-        for item_id, checked in self.row_checked.items():
-            if checked:
-                vals = self.tree.item(item_id, "values")
-                coord = vals[1]
-                new_val = vals[3]
-                selected_patches[coord] = new_val
-
-        if self.on_apply:
-            self.on_apply(selected_patches)
-        elif self.tab:
-            for coord, val in selected_patches.items():
-                pos = parse_cell_ref(coord)
-                if pos:
-                    self.tab.engine.set_cell(pos[0], pos[1], val)
-            self.tab.engine.recalculate_all()
-            self.tab.grid_widget.recompute_bounds()
-            self.tab.grid_widget.redraw()
-
-        self.destroy()
-
-    def _on_tree_click(self, event):
-        item_id = self.tree.identify_row(event.y)
-        col = self.tree.identify_column(event.x)
-        if item_id and col == "#1":  # Clicked 'apply' column
-            is_checked = self.row_checked.get(item_id, True)
-            self.row_checked[item_id] = not is_checked
-            mark = "☑" if not is_checked else "☐"
+    def _on_toggle_empty_only(self):
+        only_empty = self.var_only_empty.get()
+        for item_id in self.tree.get_children():
             vals = list(self.tree.item(item_id, "values"))
-            vals[0] = mark
+            old_val = vals[2]
+            new_val = vals[3]
+            if only_empty:
+                should_check = (old_val == "")
+            else:
+                should_check = (old_val != new_val)
+            self.row_checked[item_id] = should_check
+            vals[0] = "☑" if should_check else "☐"
+            self.tree.item(item_id, values=vals)
+
+    def _select_all(self):
+        self.var_only_empty.set(False)
+        for item_id in self.tree.get_children():
+            self.row_checked[item_id] = True
+            vals = list(self.tree.item(item_id, "values"))
+            vals[0] = "☑"
+            self.tree.item(item_id, values=vals)
+
+    def _select_empty_only(self):
+        self.var_only_empty.set(True)
+        self._on_toggle_empty_only()
+
+    def _clear_all(self):
+        self.var_only_empty.set(False)
+        for item_id in self.tree.get_children():
+            self.row_checked[item_id] = False
+            vals = list(self.tree.item(item_id, "values"))
+            vals[0] = "☐"
             self.tree.item(item_id, values=vals)
 
     def _accept_all(self):
-        for item_id in self.row_checked:
+        for item_id in self.tree.get_children():
             self.row_checked[item_id] = True
+            vals = list(self.tree.item(item_id, "values"))
+            vals[0] = "☑"
+            self.tree.item(item_id, values=vals)
         self._apply_selected()
 
     def _apply_selected(self):
@@ -2966,6 +3090,10 @@ class SpreadsheetDiffDialog(tk.Toplevel):
                 coord = vals[1]
                 new_val = vals[3]
                 selected_patches[coord] = new_val
+
+        if not selected_patches:
+            messagebox.showinfo("Spreadsheet Edits", "No cell edits were selected to apply.", parent=self)
+            return
 
         if self.on_apply:
             self.on_apply(selected_patches)

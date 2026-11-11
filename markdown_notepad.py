@@ -6241,10 +6241,12 @@ class MarkdownNotepad(tk.Tk):
                 SpreadsheetDiffDialog(self, self.current_tab, patches, on_apply=_do_apply_patches)
                 return
             else:
-                self.current_tab.clipboard_clear()
-                self.current_tab.clipboard_append(replacement_text)
-                self.current_tab.grid_widget.paste_clipboard()
-                self._set_status("Pasted AI response into spreadsheet cells")
+                messagebox.showinfo(
+                    "Spreadsheet Edits",
+                    "No structured cell edits (e.g. C3: value or spreadsheet-edits block) were found in this AI message.",
+                    parent=self
+                )
+                self._set_status("No structured spreadsheet patches found in AI message")
                 return
 
         default_mode = "replace"
