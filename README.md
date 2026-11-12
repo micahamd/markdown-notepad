@@ -50,15 +50,41 @@ A feature-rich markdown notepad application built with Python and Tkinter, power
 - 📚 **Outlook** messages (.msg)
 
 ### Integrated Spreadsheet Processor
-- **Excel-Style 2D Grid**: Smooth, virtualized canvas grid rendering columns (A, B, C...) and rows (1, 2, 3...) with Royal Purple selection styling
-- **Formula Engine**:
+- **Excel-Style 2D Grid**: Smooth, virtualized canvas grid rendering columns (A, B, C...) and rows (1, 2, 3...) with Royal Purple selection styling, interactive column and row divider resizing, and double-click auto-fit
+- **Toggleable Word Wrap & Dynamic Auto-Row-Height**:
+  - `↵ Wrap` toolbar toggle, context menu action, and `Ctrl+Shift+W` shortcut for cell or sheet-level text wrapping
+  - Automatically calculates and expands row heights to accommodate multi-line wrapped text with zero vertical overlap
+  - Expandable multi-line cell editor supporting `Alt+Enter` newline insertion
+- **Smart Single-Line Text Layout**:
+  - Seamless Excel-style horizontal overflow across contiguous empty right-neighbor cells
+  - Crisp single-line ellipsis truncation (`…`) upon encountering populated neighbor cells, preventing row collisions
+- **High-Speed Keyboard Navigation & Section Jumps**:
+  - Full `Shift+Arrow` multi-cell range extension across rows and columns
+  - `Ctrl+Arrow` rapid jumps across populated data blocks and empty section gaps
+  - `Ctrl+Shift+Arrow` block-boundary jump selections
+  - `Shift+Space` to select entire rows; `Ctrl+Space` to select entire columns
+  - `Home` (Column A), `Ctrl+Home` (Cell A1), `Ctrl+End` (bottom-right populated cell), `PageUp`, `PageDown`, `<Shift-Tab>`, and `<Shift-Return>`
+  - `<Up>` / `<Down>` commit-and-step transitions directly from the inline editor
+- **Sub-Millisecond Rendering & Coordinate Caching**:
+  - `O(1)` prefix-sum coordinate caching and `O(log N)` binary-search coordinate mapping
+  - Dedicated selection-overlay fast path (`< 0.2ms`) delivering instant 60+ FPS navigation without canvas teardown
+- **Freeze Top Row (`❄ Freeze`)**:
+  - One-click toolbar toggle to pin Row 1 headers permanently beneath column letters while scrolling through large datasets
+- **One-Click Table Sorting (`Sort A→Z` / `Sort Z→A`)**:
+  - Multi-column table sorting that preserves table headers, moves entire row styles and values intact, and supports single-step `Ctrl+Z` undo
+- **Live Formula Result Preview & Cell Hover Inspector**:
+  - Real-time result badge (`= 1,450.00`) next to formula bar evaluating formulas as you type before committing
+  - Floating cell hover inspector displaying full text for truncated cells or detailed formula breakdowns (`fx: =SUM(...) => $1,450.00`)
+- **Expanded Formula Engine**:
   - Math: `=SUM(range)`, `=AVERAGE(range)`, `=ROUND(val, digits)`, `=ROUNDUP()`, `=ROUNDDOWN()`, `=MIN()`, `=MAX()`, `=ABS()`, `=SQRT()`, `=POWER()`, `=MOD()`, `=INT()`, `=PRODUCT()`
-  - Statistics: `=MEDIAN()`, `=STDEV()`, `=VAR()`
-  - Logic & Counting: `=IF(cond, true_val, false_val)`, `=IFERROR(val, fallback)`, `=COUNT(range)`, `=COUNTA(range)`, `=SUMIF(range, criteria, sum_range)`, `=COUNTIF(range, criteria)`, `=AND()`, `=OR()`, `=NOT()`
+  - Statistics: `=MEDIAN()`, `=STDEV()`, `=VAR()`, `=SPARKLINE(range)` (inline Unicode trendlines ` ▂▄▆█▃`)
+  - Logic & Counting: `=IF(cond, true_val, false_val)`, `=IFERROR(val, fallback)`, `=COUNT(range)`, `=COUNTA(range)`, `=SUMIF(range, criteria, sum_range)`, `=COUNTIF(range, criteria)`, `=AVERAGEIF()`, `=AND()`, `=OR()`, `=NOT()`
+  - Lookup & Reference: `=VLOOKUP(val, range, col_idx, [exact])`, `=INDEX(range, row, [col])`, `=MATCH(val, range)`
   - Text: `=CONCAT()`, `=LEN()`, `=UPPER()`, `=LOWER()`, `=TRIM()`, `=LEFT()`, `=RIGHT()`
   - Error detection: Circular reference protection (`#CIRC!`), division by zero (`#DIV/0!`), invalid names (`#NAME?`), and reference errors (`#REF!`)
-- **Formula Bar & Quick Actions**: Dedicated formula bar (`fx`) with active coordinate display, point-and-click cell referencing during formula entry, quick formula buttons (`∑ Sum`, `x̄ Avg`, `Round`), row/col insertion, and instant **Export to Markdown Table** (`📋 MD Table`)
-- **Clipboard Interoperability**: Seamless copy/paste with Microsoft Excel, Google Sheets, LibreOffice Calc, and raw TSV/CSV data
+- **Rich Clipboard Interoperability**:
+  - Smart Paste (`Ctrl+V`) automatically detects Markdown pipe tables, CSV, or TSV and populates the grid
+  - Rich Copy options via context menu: Copy as TSV (standard Excel), Copy as Markdown Table, Copy as LaTeX `tabular`, and Copy as CSV
 - **Bidirectional AI Chat Integration**:
   - Right-click selected cells to **Transfer Selection to AI Chat** or **Ask AI About Selection**
   - Toggle **Include Document** to furnish the AI with full structural grid geometry and populated data
