@@ -1041,8 +1041,19 @@ class SpreadsheetGrid(tk.Canvas):
         # Freeze Top Row (Row 1 pinned header)
         self.freeze_top_row: bool = False
 
+        # Re-entrancy guard to prevent recursive redraw during scroll synchronization
+        self._is_redrawing: bool = False
+
+        # Optional reference to parent SpreadsheetTab
+        self.tab = None
+
         self._setup_bindings()
         self.recompute_bounds()
+
+    @property
+    def tab_owner(self):
+        """Resolve owner SpreadsheetTab instance if attached."""
+        return getattr(self, "tab", None) or getattr(self, "parent", None)
 
     # -------------------------------------------------------------------------
     # Layout & Metrics Calculations (O(1) Cached)
@@ -1091,7 +1102,7 @@ class SpreadsheetGrid(tk.Canvas):
         if row in self.row_heights:
             return max(16, int(self.row_heights[row] * self.zoom_factor))
         base_h = self.DEFAULT_ROW_HEIGHT
-        default_wrap = getattr(self.parent, "default_wrap", False) if hasattr(self, "parent") else False
+        default_wrap = getattr(self.tab_owner, "default_wrap", False)
 
         # Dynamic expansion for wrapped cells
         max_req_h = base_h
@@ -1165,16 +1176,56 @@ class SpreadsheetGrid(tk.Canvas):
             return 0
         return self.y_to_row(int(cy))
 
+    def _check_and_redraw_if_moved(self):
+        """Redraw virtualized viewport if canvas scroll offset has shifted."""
+        if self._is_redrawing:
+            return
+        vx0 = self.canvasx(0)
+        vy0 = self.canvasy(0)
+        if (
+            self._last_vx0 is None
+            or self._last_vy0 is None
+            or abs(vx0 - self._last_vx0) > 0.5
+            or abs(vy0 - self._last_vy0) > 0.5
+        ):
+            self.redraw()
+
     def xview(self, *args):
         """Override canvas xview to guarantee virtualized viewport redraw."""
         res = super().xview(*args)
-        self.redraw()
+        if args:
+            self._check_and_redraw_if_moved()
         return res
 
     def yview(self, *args):
         """Override canvas yview to guarantee virtualized viewport redraw."""
         res = super().yview(*args)
-        self.redraw()
+        if args:
+            self._check_and_redraw_if_moved()
+        return res
+
+    def xview_scroll(self, number: int, what: str):
+        """Scroll horizontally and guarantee virtualized viewport redraw."""
+        res = super().xview_scroll(number, what)
+        self._check_and_redraw_if_moved()
+        return res
+
+    def yview_scroll(self, number: int, what: str):
+        """Scroll vertically and guarantee virtualized viewport redraw."""
+        res = super().yview_scroll(number, what)
+        self._check_and_redraw_if_moved()
+        return res
+
+    def xview_moveto(self, fraction: float):
+        """Move horizontal scroll to fraction and guarantee virtualized viewport redraw."""
+        res = super().xview_moveto(fraction)
+        self._check_and_redraw_if_moved()
+        return res
+
+    def yview_moveto(self, fraction: float):
+        """Move vertical scroll to fraction and guarantee virtualized viewport redraw."""
+        res = super().yview_moveto(fraction)
+        self._check_and_redraw_if_moved()
         return res
 
     def recompute_bounds(self):
@@ -1201,6 +1252,15 @@ class SpreadsheetGrid(tk.Canvas):
 
     def redraw(self):
         """Full virtualized render of cells, headers, grid lines, selection, and frozen row."""
+        if self._is_redrawing:
+            return
+        self._is_redrawing = True
+        try:
+            self._do_redraw()
+        finally:
+            self._is_redrawing = False
+
+    def _do_redraw(self):
         self.delete("all")
         vx0 = self.canvasx(0)
         vy0 = self.canvasy(0)
@@ -1212,13 +1272,13 @@ class SpreadsheetGrid(tk.Canvas):
         self._last_vx0 = vx0
         self._last_vy0 = vy0
 
-        start_col = max(0, self.x_to_col(int(vx0)))
-        end_col = min(self.total_cols - 1, self.x_to_col(int(vx1)) + 1)
-        start_row = max(0, self.y_to_row(int(vy0)))
-        end_row = min(self.total_rows - 1, self.y_to_row(int(vy1)) + 1)
+        start_col = max(0, self.x_to_col(int(vx0)) - 2)
+        end_col = min(self.total_cols - 1, self.x_to_col(int(vx1)) + 2)
+        start_row = max(0, self.y_to_row(int(vy0)) - 2)
+        end_row = min(self.total_rows - 1, self.y_to_row(int(vy1)) + 2)
 
         f_size = max(7, min(24, int(9 * self.zoom_factor)))
-        default_wrap = getattr(self.parent, "default_wrap", False) if hasattr(self, "parent") else False
+        default_wrap = getattr(self.tab_owner, "default_wrap", False)
 
         # 1. Draw Cell Grid Lines & Content
         for r in range(start_row, end_row + 1):
@@ -1649,10 +1709,10 @@ class SpreadsheetGrid(tk.Canvas):
         vx1 = vx0 + vw
         vy1 = vy0 + vh
 
-        start_col = max(0, self.x_to_col(int(vx0)))
-        end_col = min(self.total_cols - 1, self.x_to_col(int(vx1)) + 1)
-        start_row = max(0, self.y_to_row(int(vy0)))
-        end_row = min(self.total_rows - 1, self.y_to_row(int(vy1)) + 1)
+        start_col = max(0, self.x_to_col(int(vx0)) - 2)
+        end_col = min(self.total_cols - 1, self.x_to_col(int(vx1)) + 2)
+        start_row = max(0, self.y_to_row(int(vy0)) - 2)
+        end_row = min(self.total_rows - 1, self.y_to_row(int(vy1)) + 2)
 
         self._draw_selection_layers(start_col, end_col, start_row, end_row)
         self._draw_header_highlights(start_col, end_col, start_row, end_row)
@@ -2427,7 +2487,7 @@ class SpreadsheetGrid(tk.Canvas):
         h = self.get_row_height(r)
 
         st = self.engine.cell_styles.get((r, c), {})
-        default_wrap = getattr(self.parent, "default_wrap", False) if hasattr(self, "parent") else False
+        default_wrap = getattr(self.tab_owner, "default_wrap", False)
         is_wrap = st.get("wrap", False) or default_wrap
         is_multiline = is_wrap or ("\n" in edit_text) or len(edit_text) > 60
 
@@ -2884,17 +2944,34 @@ class SpreadsheetTab(ttk.Frame):
             on_modified=self._on_grid_modified,
             theme=self.theme
         )
+        self.grid_widget.tab = self
         self.grid_widget.pack(fill=tk.BOTH, expand=True)
 
         self.grid_widget.config(
-            xscrollcommand=self.h_scroll.set,
-            yscrollcommand=self.v_scroll.set
+            xscrollcommand=self._on_grid_xscroll,
+            yscrollcommand=self._on_grid_yscroll
         )
         self.h_scroll.config(command=self.grid_widget.xview)
         self.v_scroll.config(command=self.grid_widget.yview)
 
         # Bind Context Menu
         self.grid_widget.bind("<Button-3>", self._show_context_menu)
+
+    # -------------------------------------------------------------------------
+    # Scroll Synchronization Handlers
+    # -------------------------------------------------------------------------
+
+    def _on_grid_xscroll(self, *args):
+        """Synchronize horizontal scrollbar thumb and refresh canvas if viewport moved."""
+        self.h_scroll.set(*args)
+        if hasattr(self, "grid_widget"):
+            self.grid_widget._check_and_redraw_if_moved()
+
+    def _on_grid_yscroll(self, *args):
+        """Synchronize vertical scrollbar thumb and refresh canvas if viewport moved."""
+        self.v_scroll.set(*args)
+        if hasattr(self, "grid_widget"):
+            self.grid_widget._check_and_redraw_if_moved()
 
     # -------------------------------------------------------------------------
     # Formula Bar & UI Synchronization
