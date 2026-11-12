@@ -1101,7 +1101,7 @@ class SpreadsheetGrid(tk.Canvas):
                 if raw:
                     w = self.get_col_width(c)
                     val = self.engine.get_value(r, c)
-                    txt = str(val) if val is not None else ""
+                    txt = str(val) if (val != "" and val is not None) else str(raw)
                     if txt:
                         font_obj = self._get_font("Segoe UI", max(7, min(24, int(9 * self.zoom_factor))), "normal")
                         avail_w = max(24, w - 12)
@@ -1156,6 +1156,15 @@ class SpreadsheetGrid(tk.Canvas):
         idx = bisect.bisect_right(self._row_offsets, rel_y) - 1
         return max(0, min(self.total_rows - 1, idx))
 
+    def canvas_y_to_row(self, cy: float) -> int:
+        """Convert canvas y coordinate to row index, taking frozen top row into account."""
+        vy0 = self.canvasy(0)
+        if cy < vy0 + self.header_row_height:
+            return -1
+        if self.freeze_top_row and vy0 > 0 and cy < vy0 + self.header_row_height + self.get_row_height(0):
+            return 0
+        return self.y_to_row(int(cy))
+
     def xview(self, *args):
         """Override canvas xview to guarantee virtualized viewport redraw."""
         res = super().xview(*args)
@@ -1195,8 +1204,10 @@ class SpreadsheetGrid(tk.Canvas):
         self.delete("all")
         vx0 = self.canvasx(0)
         vy0 = self.canvasy(0)
-        vx1 = vx0 + self.winfo_width()
-        vy1 = vy0 + self.winfo_height()
+        vw = max(600, self.winfo_width())
+        vh = max(400, self.winfo_height())
+        vx1 = vx0 + vw
+        vy1 = vy0 + vh
 
         self._last_vx0 = vx0
         self._last_vy0 = vy0
@@ -1206,41 +1217,10 @@ class SpreadsheetGrid(tk.Canvas):
         start_row = max(0, self.y_to_row(int(vy0)))
         end_row = min(self.total_rows - 1, self.y_to_row(int(vy1)) + 1)
 
-        # 1. Selection Fill & Border
-        min_sr = min(self.sel_start[0], self.sel_end[0])
-        max_sr = max(self.sel_start[0], self.sel_end[0])
-        min_sc = min(self.sel_start[1], self.sel_end[1])
-        max_sc = max(self.sel_start[1], self.sel_end[1])
-
-        sel_x1 = self.col_to_x(min_sc)
-        sel_y1 = self.row_to_y(min_sr)
-        sel_x2 = self.col_to_x(max_sc) + self.get_col_width(max_sc)
-        sel_y2 = self.row_to_y(max_sr) + self.get_row_height(max_sr)
-
-        if max_sr > min_sr or max_sc > min_sc:
-            self.create_rectangle(
-                sel_x1, sel_y1, sel_x2, sel_y2,
-                fill=self._selection_bg, outline=self._selection_border, width=1.5,
-                tags="sel_overlay"
-            )
-
-        # Draw fill-drag preview rectangle if dragging fill handle
-        if self.is_dragging_fill and self.fill_start_range and self.fill_current_cell:
-            (sr1, sc1), (sr2, sc2) = self.fill_start_range
-            fr, fc = self.fill_current_cell
-            px1 = self.col_to_x(min(sc1, fc))
-            py1 = self.row_to_y(min(sr1, fr))
-            px2 = self.col_to_x(max(sc2, fc)) + self.get_col_width(max(sc2, fc))
-            py2 = self.row_to_y(max(sr2, fr)) + self.get_row_height(max(sr2, fr))
-            self.create_rectangle(
-                px1, py1, px2, py2,
-                outline=self._accent_color, width=1.5, dash=(4, 3), tags="sel_overlay"
-            )
-
-        # 2. Draw Cell Grid Lines & Content
         f_size = max(7, min(24, int(9 * self.zoom_factor)))
         default_wrap = getattr(self.parent, "default_wrap", False) if hasattr(self, "parent") else False
 
+        # 1. Draw Cell Grid Lines & Content
         for r in range(start_row, end_row + 1):
             y = self.row_to_y(r)
             h = self.get_row_height(r)
@@ -1337,55 +1317,75 @@ class SpreadsheetGrid(tk.Canvas):
                             font=font_spec, fill=fg_color, tags="cell_text"
                         )
 
-        # 3. Active Single Cell Highlight & Fill Handle
-        ac_r, ac_c = self.active_cell
-        ac_x = self.col_to_x(ac_c)
-        ac_y = self.row_to_y(ac_r)
-        ac_w = self.get_col_width(ac_c)
-        ac_h = self.get_row_height(ac_r)
+        # 2. Freeze Top Row (Pinned Header Row 1)
+        if self.freeze_top_row:
+            if vy0 > 0:
+                frozen_y0 = vy0 + self.header_row_height
+                frozen_h = self.get_row_height(0)
+                frozen_y1 = frozen_y0 + frozen_h
 
-        self.create_rectangle(
-            ac_x, ac_y, ac_x + ac_w, ac_y + ac_h,
-            outline=self._accent_color, width=2, tags="sel_overlay"
-        )
-        fh_x = sel_x2
-        fh_y = sel_y2
-        self.create_rectangle(
-            fh_x - 4, fh_y - 4, fh_x + 2, fh_y + 2,
-            fill=self._accent_color, outline="#ffffff", width=1, tags="sel_overlay"
-        )
-
-        # 4. Freeze Top Row (Pinned Header Row 1)
-        if self.freeze_top_row and vy0 > 0:
-            frozen_y0 = vy0 + self.header_row_height
-            frozen_h = self.get_row_height(0)
-            frozen_y1 = frozen_y0 + frozen_h
-
-            self.create_rectangle(
-                vx0, frozen_y0, vx1, frozen_y1,
-                fill="#f8fafc", outline="", tags="frozen_row"
-            )
-            for c in range(start_col, end_col + 1):
-                x = self.col_to_x(c)
-                w = self.get_col_width(c)
                 self.create_rectangle(
-                    x, frozen_y0, x + w, frozen_y1,
-                    outline=self._grid_line_color, fill="#f8fafc", tags="frozen_row"
+                    vx0, frozen_y0, vx1, frozen_y1,
+                    fill="#fcfaff", outline="", tags="frozen_row"
                 )
-                val = self.engine.get_value(0, c)
-                if val != "" and val is not None:
-                    txt = self._format_display_value(val, 0, c)
-                    self.create_text(
-                        x + 6, frozen_y0 + frozen_h // 2,
-                        text=txt, anchor="w", font=("Segoe UI", f_size, "bold"),
-                        fill="#1e1b4b", tags="frozen_row"
+                for c in range(start_col, end_col + 1):
+                    x = self.col_to_x(c)
+                    w = self.get_col_width(c)
+                    self.create_rectangle(
+                        x, frozen_y0, x + w, frozen_y1,
+                        outline=self._grid_line_color, fill="#fcfaff", tags="frozen_row"
                     )
-            self.create_line(
-                vx0, frozen_y1, vx1, frozen_y1,
-                fill=self._accent_color, width=1.5, tags="frozen_row"
-            )
+                    val = self.engine.get_value(0, c)
+                    if val != "" and val is not None:
+                        txt = self._format_display_value(val, 0, c)
+                        st = self.engine.cell_styles.get((0, c), {})
+                        align = st.get("align", "auto")
+                        is_bold = st.get("bold", True)
+                        f_spec = ("Segoe UI", f_size, "bold" if is_bold else "normal")
+                        f_obj = self._get_font("Segoe UI", f_size, "bold" if is_bold else "normal")
+                        single_txt = txt.replace("\r\n", " ").replace("\n", " ")
+                        avail_px = max(10, w - 10)
+                        if f_obj.measure(single_txt) <= avail_px:
+                            disp_txt = single_txt
+                        else:
+                            low, high, best = 1, len(single_txt), ""
+                            while low <= high:
+                                mid = (low + high) // 2
+                                candidate = single_txt[:mid] + "…"
+                                if f_obj.measure(candidate) <= avail_px:
+                                    best = candidate
+                                    low = mid + 1
+                                else:
+                                    high = mid - 1
+                            disp_txt = best if best else single_txt[:1]
+                        if align == "right" or (align == "auto" and isinstance(val, (int, float)) and not isinstance(val, bool)):
+                            tx = x + w - 6
+                            anchor = "e"
+                        elif align == "center":
+                            tx = x + w // 2
+                            anchor = "center"
+                        else:
+                            tx = x + 6
+                            anchor = "w"
+                        self.create_text(
+                            tx, frozen_y0 + frozen_h // 2,
+                            text=disp_txt, anchor=anchor, font=f_spec,
+                            fill="#1e1b4b", tags="frozen_row"
+                        )
+                # Prominent 2px royal purple divider line
+                self.create_line(
+                    vx0, frozen_y1, vx1, frozen_y1,
+                    fill=self._accent_color, width=2, tags="frozen_row"
+                )
+            else:
+                # vy0 == 0: Still draw the distinct freeze divider line below Row 1
+                r0_y1 = self.row_to_y(0) + self.get_row_height(0)
+                self.create_line(
+                    vx0, r0_y1, vx1, r0_y1,
+                    fill=self._accent_color, width=2, tags="frozen_row"
+                )
 
-        # 5. Floating Header Row (Columns A, B, C...)
+        # 3. Floating Header Row (Columns A, B, C...)
         hdr_y0 = vy0
         hdr_y1 = vy0 + self.header_row_height
 
@@ -1397,21 +1397,17 @@ class SpreadsheetGrid(tk.Canvas):
         for c in range(start_col, end_col + 1):
             x = self.col_to_x(c)
             w = self.get_col_width(c)
-            is_active_col = (min_sc <= c <= max_sc)
-            bg_col = self._header_active_bg if is_active_col else self._header_bg
-            fg_col = self._header_active_fg if is_active_col else self._header_fg
-
             self.create_rectangle(
                 x, hdr_y0, x + w, hdr_y1,
-                fill=bg_col, outline=self._grid_line_color, width=1, tags="header_row"
+                fill=self._header_bg, outline=self._grid_line_color, width=1, tags="header_row"
             )
             self.create_text(
                 x + w // 2, hdr_y0 + self.header_row_height // 2,
-                text=col_index_to_letter(c), font=("Segoe UI", f_size, "bold" if is_active_col else "normal"),
-                fill=fg_col, tags="header_row"
+                text=col_index_to_letter(c), font=("Segoe UI", f_size, "normal"),
+                fill=self._header_fg, tags="header_row"
             )
 
-        # 6. Floating Header Column (Rows 1, 2, 3...)
+        # 4. Floating Header Column (Rows 1, 2, 3...)
         hdr_x0 = vx0
         hdr_x1 = vx0 + self.header_col_width
 
@@ -1423,9 +1419,9 @@ class SpreadsheetGrid(tk.Canvas):
         for r in range(start_row, end_row + 1):
             y = self.row_to_y(r)
             h = self.get_row_height(r)
-            is_active_row = (min_sr <= r <= max_sr)
-            bg_row = self._header_active_bg if is_active_row else self._header_bg
-            fg_row = self._header_active_fg if is_active_row else self._header_fg
+            is_frozen_row0 = (r == 0 and self.freeze_top_row)
+            bg_row = "#ede9fe" if is_frozen_row0 else self._header_bg
+            fg_row = self._accent_color if is_frozen_row0 else self._header_fg
 
             self.create_rectangle(
                 hdr_x0, y, hdr_x1, y + h,
@@ -1433,11 +1429,26 @@ class SpreadsheetGrid(tk.Canvas):
             )
             self.create_text(
                 hdr_x0 + self.header_col_width // 2, y + h // 2,
-                text=str(r + 1), font=("Segoe UI", f_size, "bold" if is_active_row else "normal"),
+                text=str(r + 1), font=("Segoe UI", f_size, "bold" if is_frozen_row0 else "normal"),
                 fill=fg_row, tags="header_col"
             )
 
-        # 7. Top-Left Corner Box
+        # 5. Pinned Row 1 Header in Left Gutter when scrolled down
+        if self.freeze_top_row and vy0 > 0:
+            frozen_y0 = vy0 + self.header_row_height
+            frozen_h = self.get_row_height(0)
+            frozen_y1 = frozen_y0 + frozen_h
+            self.create_rectangle(
+                hdr_x0, frozen_y0, hdr_x1, frozen_y1,
+                fill="#ede9fe", outline=self._grid_line_color, width=1, tags="corner"
+            )
+            self.create_text(
+                hdr_x0 + self.header_col_width // 2, frozen_y0 + frozen_h // 2,
+                text="1", font=("Segoe UI", f_size, "bold"),
+                fill=self._accent_color, tags="corner"
+            )
+
+        # 6. Top-Left Corner Box
         self.create_rectangle(
             vx0, vy0, vx0 + self.header_col_width, vy0 + self.header_row_height,
             fill="#e9e5f5", outline=self._grid_line_color, width=1, tags="corner"
@@ -1449,11 +1460,13 @@ class SpreadsheetGrid(tk.Canvas):
             fill="#a78bfa", outline="", tags="corner"
         )
 
-    def _redraw_selection_only(self):
-        """Sub-millisecond fast-path: updates selection rectangle, active cell, and header highlights."""
-        self.delete("sel_overlay")
-        self.delete("hdr_overlay")
+        # 7. Selection Layers & Header Highlights
+        self._draw_selection_layers(start_col, end_col, start_row, end_row)
+        self._draw_header_highlights(start_col, end_col, start_row, end_row)
 
+    def _draw_selection_layers(self, start_col: int, end_col: int, start_row: int, end_row: int):
+        """Draw selection tint (background) and hollow selection borders (foreground)."""
+        self.delete("sel_overlay")
         vx0 = self.canvasx(0)
         vy0 = self.canvasy(0)
 
@@ -1467,13 +1480,41 @@ class SpreadsheetGrid(tk.Canvas):
         sel_x2 = self.col_to_x(max_sc) + self.get_col_width(max_sc)
         sel_y2 = self.row_to_y(max_sr) + self.get_row_height(max_sr)
 
+        # 1. Background selection tint layer ("sel_bg") - only for multi-cell selections
         if max_sr > min_sr or max_sc > min_sc:
             self.create_rectangle(
                 sel_x1, sel_y1, sel_x2, sel_y2,
-                fill=self._selection_bg, outline=self._selection_border, width=1.5,
-                tags="sel_overlay"
+                fill=self._selection_bg, outline="",
+                tags=("sel_overlay", "sel_bg")
+            )
+            # Active anchor cell remains white inside multi-cell selection (Excel convention)
+            ac_r, ac_c = self.active_cell
+            ac_x = self.col_to_x(ac_c)
+            ac_y = self.row_to_y(ac_r)
+            ac_w = self.get_col_width(ac_c)
+            ac_h = self.get_row_height(ac_r)
+            st = self.engine.cell_styles.get((ac_r, ac_c), {})
+            anchor_bg = st.get("bg", "#ffffff")
+            self.create_rectangle(
+                ac_x, ac_y, ac_x + ac_w, ac_y + ac_h,
+                fill=anchor_bg, outline="",
+                tags=("sel_overlay", "sel_bg")
+            )
+            # Lower sel_bg below grid and cell_text so text and grid are ALWAYS on top
+            if self.find_withtag("grid"):
+                self.tag_lower("sel_bg", "grid")
+            else:
+                self.tag_lower("sel_bg")
+
+        # 2. Foreground outline layer ("sel_fg") - hollow borders and fill handle
+        if max_sr > min_sr or max_sc > min_sc:
+            self.create_rectangle(
+                sel_x1, sel_y1, sel_x2, sel_y2,
+                fill="", outline=self._selection_border, width=1.5,
+                tags=("sel_overlay", "sel_fg")
             )
 
+        # Drag-fill preview rectangle
         if self.is_dragging_fill and self.fill_start_range and self.fill_current_cell:
             (sr1, sc1), (sr2, sc2) = self.fill_start_range
             fr, fc = self.fill_current_cell
@@ -1483,59 +1524,138 @@ class SpreadsheetGrid(tk.Canvas):
             py2 = self.row_to_y(max(sr2, fr)) + self.get_row_height(max(sr2, fr))
             self.create_rectangle(
                 px1, py1, px2, py2,
-                outline=self._accent_color, width=1.5, dash=(4, 3), tags="sel_overlay"
+                fill="", outline=self._accent_color, width=1.5, dash=(4, 3),
+                tags=("sel_overlay", "sel_fg")
             )
 
+        # Active single cell border
         ac_r, ac_c = self.active_cell
         ac_x = self.col_to_x(ac_c)
         ac_y = self.row_to_y(ac_r)
         ac_w = self.get_col_width(ac_c)
         ac_h = self.get_row_height(ac_r)
-
         self.create_rectangle(
             ac_x, ac_y, ac_x + ac_w, ac_y + ac_h,
-            outline=self._accent_color, width=2, tags="sel_overlay"
+            fill="", outline=self._accent_color, width=2,
+            tags=("sel_overlay", "sel_fg")
         )
+
+        # If Row 0 is active cell and frozen row is pinned while scrolled down:
+        if self.freeze_top_row and vy0 > 0 and ac_r == 0:
+            frozen_y0 = vy0 + self.header_row_height
+            frozen_y1 = frozen_y0 + self.get_row_height(0)
+            self.create_rectangle(
+                ac_x, frozen_y0, ac_x + ac_w, frozen_y1,
+                fill="", outline=self._accent_color, width=2,
+                tags=("sel_overlay", "sel_fg")
+            )
+
+        # Fill handle square
         fh_x = sel_x2
         fh_y = sel_y2
         self.create_rectangle(
             fh_x - 4, fh_y - 4, fh_x + 2, fh_y + 2,
-            fill=self._accent_color, outline="#ffffff", width=1, tags="sel_overlay"
+            fill=self._accent_color, outline="#ffffff", width=1,
+            tags=("sel_overlay", "sel_fg")
         )
 
-        # Header highlights
+        # Lower sel_fg below floating headers and corner box
+        for hdr_tag in ("frozen_row", "header_row", "header_col", "corner"):
+            if self.find_withtag(hdr_tag):
+                self.tag_lower("sel_fg", hdr_tag)
+                break
+
+    def _draw_header_highlights(self, start_col: int, end_col: int, start_row: int, end_row: int):
+        """Draw active column and row header highlights tagged 'hdr_overlay'."""
+        self.delete("hdr_overlay")
+        vx0 = self.canvasx(0)
+        vy0 = self.canvasy(0)
         f_size = max(7, min(24, int(9 * self.zoom_factor)))
+
+        min_sr = min(self.sel_start[0], self.sel_end[0])
+        max_sr = max(self.sel_start[0], self.sel_end[0])
+        min_sc = min(self.sel_start[1], self.sel_end[1])
+        max_sc = max(self.sel_start[1], self.sel_end[1])
+
+        # Active Column Header Highlights
         hdr_y0 = vy0
         hdr_y1 = vy0 + self.header_row_height
-        for c in range(min_sc, max_sc + 1):
+        vis_min_c = max(min_sc, start_col)
+        vis_max_c = min(max_sc, end_col)
+        for c in range(vis_min_c, vis_max_c + 1):
             if c < self.total_cols:
                 x = self.col_to_x(c)
                 w = self.get_col_width(c)
-                self.create_rectangle(
-                    x, hdr_y0, x + w, hdr_y1,
-                    fill=self._header_active_bg, outline=self._grid_line_color, width=1, tags="hdr_overlay"
-                )
-                self.create_text(
-                    x + w // 2, hdr_y0 + self.header_row_height // 2,
-                    text=col_index_to_letter(c), font=("Segoe UI", f_size, "bold"),
-                    fill=self._header_active_fg, tags="hdr_overlay"
-                )
+                if x + w > vx0 + self.header_col_width:
+                    bx1 = max(x, vx0 + self.header_col_width)
+                    self.create_rectangle(
+                        bx1, hdr_y0, x + w, hdr_y1,
+                        fill=self._header_active_bg, outline=self._grid_line_color, width=1,
+                        tags="hdr_overlay"
+                    )
+                    self.create_text(
+                        x + w // 2, hdr_y0 + self.header_row_height // 2,
+                        text=col_index_to_letter(c), font=("Segoe UI", f_size, "bold"),
+                        fill=self._header_active_fg, tags="hdr_overlay"
+                    )
 
+        # Active Row Header Highlights
         hdr_x0 = vx0
         hdr_x1 = vx0 + self.header_col_width
-        for r in range(min_sr, max_sr + 1):
+        vis_min_r = max(min_sr, start_row)
+        vis_max_r = min(max_sr, end_row)
+        for r in range(vis_min_r, vis_max_r + 1):
             if r < self.total_rows:
                 y = self.row_to_y(r)
                 h = self.get_row_height(r)
-                self.create_rectangle(
-                    hdr_x0, y, hdr_x1, y + h,
-                    fill=self._header_active_bg, outline=self._grid_line_color, width=1, tags="hdr_overlay"
-                )
-                self.create_text(
-                    hdr_x0 + self.header_col_width // 2, y + h // 2,
-                    text=str(r + 1), font=("Segoe UI", f_size, "bold"),
-                    fill=self._header_active_fg, tags="hdr_overlay"
-                )
+                if y + h > vy0 + self.header_row_height:
+                    by1 = max(y, vy0 + self.header_row_height)
+                    self.create_rectangle(
+                        hdr_x0, by1, hdr_x1, y + h,
+                        fill=self._header_active_bg, outline=self._grid_line_color, width=1,
+                        tags="hdr_overlay"
+                    )
+                    self.create_text(
+                        hdr_x0 + self.header_col_width // 2, y + h // 2,
+                        text=str(r + 1), font=("Segoe UI", f_size, "bold"),
+                        fill=self._header_active_fg, tags="hdr_overlay"
+                    )
+
+        # If Row 0 is selected and freeze_top_row is active while scrolled down:
+        if self.freeze_top_row and vy0 > 0 and min_sr <= 0 <= max_sr:
+            frozen_y0 = vy0 + self.header_row_height
+            frozen_y1 = frozen_y0 + self.get_row_height(0)
+            self.create_rectangle(
+                hdr_x0, frozen_y0, hdr_x1, frozen_y1,
+                fill=self._header_active_bg, outline=self._grid_line_color, width=1,
+                tags="hdr_overlay"
+            )
+            self.create_text(
+                hdr_x0 + self.header_col_width // 2, frozen_y0 + self.get_row_height(0) // 2,
+                text="1", font=("Segoe UI", f_size, "bold"),
+                fill=self._header_active_fg, tags="hdr_overlay"
+            )
+
+        # Lower hdr_overlay below corner box
+        if self.find_withtag("corner"):
+            self.tag_lower("hdr_overlay", "corner")
+
+    def _redraw_selection_only(self):
+        """Sub-millisecond fast-path: updates selection layers and header highlights."""
+        vx0 = self.canvasx(0)
+        vy0 = self.canvasy(0)
+        vw = max(600, self.winfo_width())
+        vh = max(400, self.winfo_height())
+        vx1 = vx0 + vw
+        vy1 = vy0 + vh
+
+        start_col = max(0, self.x_to_col(int(vx0)))
+        end_col = min(self.total_cols - 1, self.x_to_col(int(vx1)) + 1)
+        start_row = max(0, self.y_to_row(int(vy0)))
+        end_row = min(self.total_rows - 1, self.y_to_row(int(vy1)) + 1)
+
+        self._draw_selection_layers(start_col, end_col, start_row, end_row)
+        self._draw_header_highlights(start_col, end_col, start_row, end_row)
 
     def _fast_or_full_redraw(self):
         """Redraw selection layer quickly if viewport offset has not changed."""
@@ -1698,7 +1818,7 @@ class SpreadsheetGrid(tk.Canvas):
         self.config(cursor="")
 
         # 4. Schedule cell hover inspector tooltip
-        r = self.y_to_row(int(cy))
+        r = self.canvas_y_to_row(cy)
         c = self.x_to_col(int(cx))
         if r >= 0 and c >= 0 and not self.is_editing:
             self._schedule_hover_tooltip(r, c, event.x_root, event.y_root)
@@ -1716,6 +1836,11 @@ class SpreadsheetGrid(tk.Canvas):
 
     def _get_divider_row_at_y(self, cy: float) -> Optional[int]:
         """Detect if cursor is within 4 pixels of a row divider."""
+        vy0 = self.canvasy(0)
+        if self.freeze_top_row and vy0 > 0:
+            frozen_y1 = vy0 + self.header_row_height + self.get_row_height(0)
+            if abs(cy - frozen_y1) <= 4:
+                return 0
         cur_y = self.header_row_height
         for r in range(self.total_rows):
             cur_y += self.get_row_height(r)
@@ -1824,7 +1949,7 @@ class SpreadsheetGrid(tk.Canvas):
         if abs(cx - fh_x) <= 6 and abs(cy - fh_y) <= 6:
             self.is_dragging_fill = True
             self.fill_start_range = ((min_r, min_c), (max_r, max_c))
-            self.fill_current_cell = (self.y_to_row(int(cy)), self.x_to_col(int(cx)))
+            self.fill_current_cell = (self.canvas_y_to_row(cy), self.x_to_col(int(cx)))
             return
 
         # 2. Column divider drag
@@ -1844,7 +1969,7 @@ class SpreadsheetGrid(tk.Canvas):
             return
 
         # 4. Point-and-click formula reference insertion
-        row = self.y_to_row(int(cy))
+        row = self.canvas_y_to_row(cy)
         col = self.x_to_col(int(cx))
         if self._is_expecting_formula_ref() and row >= 0 and col >= 0:
             self.is_dragging_ref = True
@@ -1889,7 +2014,7 @@ class SpreadsheetGrid(tk.Canvas):
 
         # Click on Row Header -> Select Rows (with Shift drag/click support)
         if cx < self.header_col_width:
-            row = self.y_to_row(int(cy))
+            row = self.canvas_y_to_row(cy)
             if row >= 0:
                 self.select_mode = "row"
                 self.is_selecting = True
@@ -1935,7 +2060,7 @@ class SpreadsheetGrid(tk.Canvas):
 
         cx = self.canvasx(event.x)
         cy = self.canvasy(event.y)
-        row = self.y_to_row(int(cy))
+        row = self.canvas_y_to_row(cy)
         col = self.x_to_col(int(cx))
 
         if self.is_dragging_fill:
@@ -2010,7 +2135,7 @@ class SpreadsheetGrid(tk.Canvas):
 
         # Double click column divider -> auto-fit column width
         divider_col = self._get_divider_col_at_x(cx)
-        if cy <= self.canvasy(0) + self.HEADER_ROW_HEIGHT and divider_col is not None:
+        if cy <= self.canvasy(0) + self.header_row_height and divider_col is not None:
             self._autofit_column_width(divider_col)
             return
 
@@ -2020,7 +2145,7 @@ class SpreadsheetGrid(tk.Canvas):
             self._autofit_row_height(divider_row)
             return
 
-        row = self.y_to_row(int(cy))
+        row = self.canvas_y_to_row(cy)
         col = self.x_to_col(int(cx))
         if row >= 0 and col >= 0:
             self.active_cell = (row, col)
@@ -2259,8 +2384,8 @@ class SpreadsheetGrid(tk.Canvas):
         """Scroll canvas viewport if necessary to keep cell in view."""
         vx0 = self.canvasx(0)
         vy0 = self.canvasy(0)
-        vw = self.winfo_width()
-        vh = self.winfo_height()
+        vw = max(600, self.winfo_width())
+        vh = max(400, self.winfo_height())
 
         cx = self.col_to_x(col)
         cw = self.get_col_width(col)
@@ -2272,10 +2397,14 @@ class SpreadsheetGrid(tk.Canvas):
         elif cx < vx0 + self.header_col_width:
             self.xview_moveto(max(0, cx - self.header_col_width - 20) / (self.col_to_x(self.total_cols) + 100))
 
+        top_margin = self.header_row_height
+        if self.freeze_top_row and row > 0:
+            top_margin += self.get_row_height(0)
+
         if cy + ch > vy0 + vh:
             self.yview_moveto((cy + ch - vh + 40) / (self.row_to_y(self.total_rows) + 100))
-        elif cy < vy0 + self.header_row_height:
-            self.yview_moveto(max(0, cy - self.header_row_height - 20) / (self.row_to_y(self.total_rows) + 100))
+        elif cy < vy0 + top_margin:
+            self.yview_moveto(max(0, cy - top_margin - 20) / (self.row_to_y(self.total_rows) + 100))
 
     # -------------------------------------------------------------------------
     # Inline Cell Editor Management (Expandable Multi-line & Alt+Enter)
@@ -2290,7 +2419,10 @@ class SpreadsheetGrid(tk.Canvas):
         edit_text = initial_text if initial_text is not None else raw_val
 
         x = self.col_to_x(c)
-        y = self.row_to_y(r)
+        if r == 0 and self.freeze_top_row and self.canvasy(0) > 0:
+            y = self.canvasy(0) + self.header_row_height
+        else:
+            y = self.row_to_y(r)
         w = self.get_col_width(c)
         h = self.get_row_height(r)
 
@@ -2692,13 +2824,13 @@ class SpreadsheetTab(ttk.Frame):
         b_rnd.pack(side=tk.LEFT, padx=1)
         ToolTip(b_rnd, "Round active cell formula or value to 2 decimal places")
 
-        b_wrap = ttk.Button(btn_frame, text="↵ Wrap", command=self.toggle_wrap_selection, width=5, style="Toolbar.TButton")
-        b_wrap.pack(side=tk.LEFT, padx=1)
-        ToolTip(b_wrap, "Toggle word wrap on selected cells or entire sheet (Ctrl+Shift+W)")
+        self.b_wrap = ttk.Button(btn_frame, text="↵ Wrap", command=self.toggle_wrap_selection, style="Toolbar.TButton")
+        self.b_wrap.pack(side=tk.LEFT, padx=1)
+        ToolTip(self.b_wrap, "Toggle word wrap on selected cells or entire sheet (Ctrl+Shift+W)")
 
-        b_freeze = ttk.Button(btn_frame, text="❄ Freeze", command=self.toggle_freeze_top_row, width=6, style="Toolbar.TButton")
-        b_freeze.pack(side=tk.LEFT, padx=1)
-        ToolTip(b_freeze, "Freeze/pin top Row 1 headers while scrolling")
+        self.b_freeze = ttk.Button(btn_frame, text="❄ Freeze", command=self.toggle_freeze_top_row, style="Toolbar.TButton")
+        self.b_freeze.pack(side=tk.LEFT, padx=1)
+        ToolTip(self.b_freeze, "Freeze/pin top Row 1 headers while scrolling")
 
         b_sort_az = ttk.Button(btn_frame, text="A→Z", command=lambda: self.sort_active_column(True), width=4, style="Toolbar.TButton")
         b_sort_az.pack(side=tk.LEFT, padx=1)
@@ -3116,7 +3248,15 @@ class SpreadsheetTab(ttk.Frame):
         table_str = "\n".join(md_lines)
         self.clipboard_clear()
         self.clipboard_append(table_str)
-        messagebox.showinfo("Copied", f"Copied {len(rows)}x{len(headers)} table to clipboard as Markdown.", parent=self)
+        self._notify_status(f"Copied {len(rows)}x{len(headers)} table to clipboard as Markdown")
+
+    def _notify_status(self, message: str):
+        """Update status bar or formula preview non-blockingly."""
+        notepad = self.winfo_toplevel()
+        if hasattr(notepad, "_set_status"):
+            notepad._set_status(message)
+        elif hasattr(self, "formula_preview_var"):
+            self.formula_preview_var.set(message)
 
     def to_markdown_document(self) -> str:
         """Render spreadsheet as a clean markdown document suitable for PDF/DOCX/HTML export."""
@@ -3166,11 +3306,19 @@ class SpreadsheetTab(ttk.Frame):
         self.grid_widget.recompute_bounds()
         self.grid_widget.redraw()
         self._on_grid_modified()
+        if hasattr(self, "b_wrap"):
+            self.b_wrap.config(text="↵ Wrap ✓" if new_wrap else "↵ Wrap")
+        self._notify_status(f"Word wrap {'enabled' if new_wrap else 'disabled'} on selection")
 
     def toggle_freeze_top_row(self):
         """Toggle pinned header row 1."""
         self.grid_widget.freeze_top_row = not self.grid_widget.freeze_top_row
+        is_frozen = self.grid_widget.freeze_top_row
+        if hasattr(self, "b_freeze"):
+            self.b_freeze.config(text="❄ Frozen ✓" if is_frozen else "❄ Freeze")
         self.grid_widget.redraw()
+        msg = "Row 1 frozen (pinned at top while scrolling)" if is_frozen else "Row 1 unfrozen"
+        self._notify_status(msg)
 
     def sort_active_column(self, ascending: bool = True):
         """Sort rows by active column preserving row integrity, styles, and headers."""
@@ -3232,11 +3380,16 @@ class SpreadsheetTab(ttk.Frame):
         new_cells = dict(self.engine.raw_cells)
         new_styles = dict(self.engine.cell_styles)
 
-        for target_idx, (_, _, raw_map, style_map) in enumerate(rows_sorted):
+        for target_idx, (orig_r, _, raw_map, style_map) in enumerate(rows_sorted):
             target_r = first_data_r + target_idx
+            dr = target_r - orig_r
             for c in range(col_span[0], col_span[1] + 1):
                 raw_val = raw_map.get(c, "")
-                new_cells[(target_r, c)] = raw_val
+                if isinstance(raw_val, str) and raw_val.startswith("=") and dr != 0:
+                    shifted_val = shift_formula_references(raw_val, dr, 0)
+                else:
+                    shifted_val = raw_val
+                new_cells[(target_r, c)] = shifted_val
                 if c in style_map and style_map[c]:
                     new_styles[(target_r, c)] = style_map[c]
                 else:
@@ -3274,7 +3427,7 @@ class SpreadsheetTab(ttk.Frame):
         latex_str = "\n".join(lines)
         self.clipboard_clear()
         self.clipboard_append(latex_str)
-        messagebox.showinfo("Copied", f"Copied {max_r - min_r + 1}x{cols_count} table to clipboard as LaTeX tabular.", parent=self)
+        self._notify_status(f"Copied {max_r - min_r + 1}x{cols_count} table to clipboard as LaTeX tabular")
 
     def _copy_as_csv(self):
         """Format selection as CSV and copy to clipboard."""
@@ -3287,7 +3440,7 @@ class SpreadsheetTab(ttk.Frame):
         csv_str = out.getvalue()
         self.clipboard_clear()
         self.clipboard_append(csv_str)
-        messagebox.showinfo("Copied", "Copied selection to clipboard as CSV.", parent=self)
+        self._notify_status("Copied selection to clipboard as CSV")
 
     # -------------------------------------------------------------------------
     # Context Menu & AI Integration
@@ -3491,6 +3644,8 @@ class SpreadsheetTab(ttk.Frame):
             "col_widths": self.grid_widget.col_widths,
             "row_heights": self.grid_widget.row_heights,
             "styles": {f"{r},{c}": s for (r, c), s in self.engine.cell_styles.items()},
+            "freeze_top_row": self.grid_widget.freeze_top_row,
+            "default_wrap": self.default_wrap,
         }
         return json.dumps(data, indent=2)
 
@@ -3512,6 +3667,12 @@ class SpreadsheetTab(ttk.Frame):
                     for k, s in data.get("styles", {}).items():
                         r, c = map(int, k.split(","))
                         self.engine.cell_styles[(r, c)] = s
+                    self.grid_widget.freeze_top_row = bool(data.get("freeze_top_row", False))
+                    self.default_wrap = bool(data.get("default_wrap", False))
+                    if hasattr(self, "b_freeze"):
+                        self.b_freeze.config(text="❄ Frozen ✓" if self.grid_widget.freeze_top_row else "❄ Freeze")
+                    if hasattr(self, "b_wrap"):
+                        self.b_wrap.config(text="↵ Wrap ✓" if self.default_wrap else "↵ Wrap")
                     self.engine.recalculate_all()
                     self.grid_widget.recompute_bounds()
                     self.grid_widget.redraw()
@@ -3541,8 +3702,11 @@ class SpreadsheetTab(ttk.Frame):
     def set_wrap(self, wrap: bool):
         """Toggle sheet-level word wrap and redraw."""
         self.default_wrap = bool(wrap)
+        if hasattr(self, "b_wrap"):
+            self.b_wrap.config(text="↵ Wrap ✓" if self.default_wrap else "↵ Wrap")
         self.grid_widget.recompute_bounds()
         self.grid_widget.redraw()
+        self._notify_status(f"Sheet word wrap {'enabled' if self.default_wrap else 'disabled'}")
 
     def apply_desk_color(self, color: str):
         """Polymorphic no-op for DocumentTab desk color in focus mode."""
