@@ -8173,32 +8173,44 @@ class ThemeDialog(tk.Toplevel):
         'Light': {
             'source_bg': '#fefefe', 'source_fg': '#1a1a1a',
             'visual_bg': '#ffffff', 'visual_fg': '#1a1a1a',
-            'desk_bg': '#d9dce1',
+            'desk_bg': '#d9dce1', 'ribbon_bg': '#eef1f6',
+            'status_bg': '#334155', 'status_fg': '#f8fafc',
+            'accent_purple': '#2563eb',
         },
         'Paper (Word)': {
             'source_bg': '#ffffff', 'source_fg': '#000000',
             'visual_bg': '#ffffff', 'visual_fg': '#000000',
-            'desk_bg': '#e6e6e6',
+            'desk_bg': '#e6e6e6', 'ribbon_bg': '#f5f5f5',
+            'status_bg': '#2b579a', 'status_fg': '#ffffff',
+            'accent_purple': '#2b579a',
         },
         'Dark': {
             'source_bg': '#1e1e1e', 'source_fg': '#d4d4d4',
             'visual_bg': '#252526', 'visual_fg': '#cccccc',
-            'desk_bg': '#141414',
+            'desk_bg': '#141414', 'ribbon_bg': '#2d2d30',
+            'status_bg': '#007acc', 'status_fg': '#ffffff',
+            'accent_purple': '#3794ff',
         },
         'Sepia': {
             'source_bg': '#f4ecd8', 'source_fg': '#5b4636',
             'visual_bg': '#f9f5eb', 'visual_fg': '#5b4636',
-            'desk_bg': '#cdbf9f',
+            'desk_bg': '#cdbf9f', 'ribbon_bg': '#efe4cd',
+            'status_bg': '#5b4636', 'status_fg': '#f9f5eb',
+            'accent_purple': '#8b5e34',
         },
         'Solarized Light': {
             'source_bg': '#fdf6e3', 'source_fg': '#657b83',
             'visual_bg': '#fdf6e3', 'visual_fg': '#657b83',
-            'desk_bg': '#eee8d5',
+            'desk_bg': '#eee8d5', 'ribbon_bg': '#e6dfc8',
+            'status_bg': '#073642', 'status_fg': '#fdf6e3',
+            'accent_purple': '#268bd2',
         },
         'Solarized Dark': {
             'source_bg': '#002b36', 'source_fg': '#839496',
             'visual_bg': '#073642', 'visual_fg': '#93a1a1',
-            'desk_bg': '#001f27',
+            'desk_bg': '#001f27', 'ribbon_bg': '#003847',
+            'status_bg': '#002b36', 'status_fg': '#93a1a1',
+            'accent_purple': '#2aa198',
         },
     }
     
@@ -8364,6 +8376,7 @@ class ThemeDialog(tk.Toplevel):
             relief=tk.SUNKEN, bd=2, highlightthickness=0, bg="#ffffff"
         )
         self.preview_canvas.pack(fill=tk.BOTH, expand=True)
+        self.preview_canvas.bind("<Configure>", self._update_template_preview)
         ttk.Label(
             preview_frame,
             text="Live preview of Ribbon, Desk, Visual Document Page, Blockquote, Source Code Inset, and Status Bar.",
@@ -8460,9 +8473,19 @@ class ThemeDialog(tk.Toplevel):
         rib_btn_bg = "#3b235a" if self._is_dark_hex(rib_bg) else "#ffffff"
         rib_border = "#6b21a8" if self._is_dark_hex(rib_bg) else "#d8b4fe"
 
+        cw = max(340, c.winfo_width())
+        ch = max(490, c.winfo_height())
+        sb_y0 = ch - 28
+        page_w = min(cw - 32, 340)
+        px0 = max(16, (cw - page_w) // 2)
+        px1 = px0 + page_w
+        py0 = 46
+        page_h = max(250, min(320, ch - 208))
+        py1 = py0 + page_h
+
         # 1. Mini Word Ribbon Bar (y=0..32)
-        c.create_rectangle(0, 0, 340, 32, fill=rib_bg, outline="", tags="preview_ribbon")
-        c.create_line(0, 32, 340, 32, fill=accent, width=2, tags="preview_ribbon")
+        c.create_rectangle(0, 0, cw, 32, fill=rib_bg, outline="", tags="preview_ribbon")
+        c.create_line(0, 32, cw, 32, fill=accent, width=2, tags="preview_ribbon")
         px = 10
         for pill_lbl in ("New", "Save", "B", "I", "Theme"):
             pw = max(22, len(pill_lbl) * 6 + 10)
@@ -8474,15 +8497,16 @@ class ThemeDialog(tk.Toplevel):
             )
             px += pw + 6
 
-        # 2. Desk Surface (y=33..462)
-        c.create_rectangle(0, 33, 340, 462, fill=d_bg, outline="", tags="preview_desk")
+        # 2. Desk Surface (y=33..sb_y0)
+        c.create_rectangle(0, 33, cw, sb_y0, fill=d_bg, outline="", tags="preview_desk")
 
-        # 3. Visual Document Page with Drop Shadow (x=20..320, y=46..328)
-        c.create_rectangle(24, 50, 324, 332, fill="#555555", outline="", tags="preview_page")
-        c.create_rectangle(20, 46, 320, 328, fill=v_bg, outline="#888888", width=1, tags="preview_page")
+        # 3. Visual Document Page with Drop Shadow
+        c.create_rectangle(px0 + 4, py0 + 4, px1 + 4, py1 + 4, fill="#555555", outline="", tags="preview_page")
+        c.create_rectangle(px0, py0, px1, py1, fill=v_bg, outline="#888888", width=1, tags="preview_page")
 
-        # Classic MS Word 2003 Margin Crop Marks (18px inner margins -> 38..302, 64..310)
-        ml, mr, mt, mb = 38, 302, 64, 310
+        # Classic MS Word 2003 Margin Crop Marks (18px inner margins)
+        ml, mr, mt, mb = px0 + 18, px1 - 18, py0 + 18, py1 - 18
+        text_wrap_w = max(180, (mr - ml) - 10)
         crop_col = "#94a3b8"
         c.create_line(ml - 7, mt, ml, mt, ml, mt - 7, fill=crop_col, width=1, tags="preview_page")
         c.create_line(mr + 7, mt, mr, mt, mr, mt - 7, fill=crop_col, width=1, tags="preview_page")
@@ -8504,7 +8528,7 @@ class ThemeDialog(tk.Toplevel):
         )
         c.create_text(
             ml + 4, mt + 36, text=body_text,
-            font=(v_font, v_scaled), fill=v_fg, width=254, anchor="nw", tags="preview_page"
+            font=(v_font, v_scaled), fill=v_fg, width=text_wrap_w, anchor="nw", tags="preview_page"
         )
 
         # Blockquote Sample Box inside Page
@@ -8524,7 +8548,8 @@ class ThemeDialog(tk.Toplevel):
         c.create_text(
             bq_tx, (bq_y0 + bq_y1) // 2,
             text="\"Blockquote style & indentation preview.\"",
-            font=(bq_font, bq_scaled, bq_style), fill=bq_fg, anchor=bq_anc, width=224, tags="preview_page"
+            font=(bq_font, bq_scaled, bq_style), fill=bq_fg, anchor=bq_anc,
+            width=max(160, text_wrap_w - 30), tags="preview_page"
         )
 
         # Sample Bulleted List Rows inside Page
@@ -8534,24 +8559,26 @@ class ThemeDialog(tk.Toplevel):
             font=(v_font, max(7, v_scaled - 1)), fill=v_fg, anchor="nw", tags="preview_page"
         )
 
-        # 4. Source Editor Template Card (x=20..320, y=340..450)
-        c.create_rectangle(24, 344, 324, 454, fill="#555555", outline="", tags="preview_source")
-        c.create_rectangle(20, 340, 320, 450, fill=s_bg, outline="#888888", width=1, tags="preview_source")
-        c.create_rectangle(20, 340, 175, 358, fill=accent, outline="", tags="preview_source")
+        # 4. Source Editor Template Card
+        sy0 = py1 + 12
+        sy1 = min(sb_y0 - 12, sy0 + 110)
+        c.create_rectangle(px0 + 4, sy0 + 4, px1 + 4, sy1 + 4, fill="#555555", outline="", tags="preview_source")
+        c.create_rectangle(px0, sy0, px1, sy1, fill=s_bg, outline="#888888", width=1, tags="preview_source")
+        c.create_rectangle(px0, sy0, px0 + 155, sy0 + 18, fill=accent, outline="", tags="preview_source")
         c.create_text(
-            28, 349, text="Source View (Markdown)",
+            px0 + 8, sy0 + 9, text="Source View (Markdown)",
             font=("Segoe UI", 7, "bold"), fill="#ffffff", anchor="w", tags="preview_source"
         )
         c.create_text(
-            32, 368,
+            px0 + 12, sy0 + 28,
             text="# Heading 1\n**Bold text** and `inline_code`\n> Markdown source preview",
             font=(s_font, s_scaled), fill=s_fg, anchor="nw", tags="preview_source"
         )
 
-        # 5. Mini Status Bar (y=462..490)
-        c.create_rectangle(0, 462, 340, 490, fill=stat_bg, outline="", tags="preview_status")
+        # 5. Mini Status Bar
+        c.create_rectangle(0, sb_y0, cw, ch, fill=stat_bg, outline="", tags="preview_status")
         c.create_text(
-            12, 476, text="Page 1  |  142 words  |  Visual View",
+            12, ch - 14, text="Page 1  |  142 words  |  Visual View",
             font=("Segoe UI", 8), fill=stat_fg, anchor="w", tags="preview_status"
         )
 

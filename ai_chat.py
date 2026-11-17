@@ -3968,6 +3968,10 @@ class AISettingsDialog(tk.Toplevel):
         self.settings.image_max_size = (self.img_size_var.get(), self.img_size_var.get())
 
         prompt_val = self.system_prompt_text.get(1.0, tk.END).strip()
+        for h in self._harnesses:
+            if h['name'] == self._active_harness:
+                h['prompt'] = prompt_val
+                break
         self.settings.prompt_harnesses = self._harnesses
         self.settings.active_harness = self._active_harness
         self.settings.system_prompt = prompt_val
@@ -3988,6 +3992,15 @@ class AISettingsDialog(tk.Toplevel):
             self.destroy()
         else:
             messagebox.showerror("Error", "Failed to save settings.", parent=self)
+
+    def destroy(self):
+        """Release global mousewheel binding if active before closing dialog."""
+        try:
+            if hasattr(self, "ctx_canvas") and self.ctx_canvas.winfo_exists():
+                self.ctx_canvas.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
+        super().destroy()
 
 
 # =============================================================================

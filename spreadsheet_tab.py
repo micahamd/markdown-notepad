@@ -1935,9 +1935,19 @@ class SpreadsheetGrid(tk.Canvas):
         self.bind("<Delete>", lambda e: self.clear_selected_cells())
         self.bind("<BackSpace>", lambda e: self.clear_selected_cells())
         self.bind("<F2>", lambda e: self.start_inline_edit())
+        self.bind("<Unmap>", self._on_grid_unmap_or_destroy)
+        self.bind("<Destroy>", self._on_grid_unmap_or_destroy)
 
         # Typing alphanumeric starts editing immediately
         self.bind("<Key>", self._on_key_press)
+
+    def _on_grid_unmap_or_destroy(self, event=None):
+        """Clean up floating popups and active timers when tab switches or grid is destroyed."""
+        if event is not None and getattr(event, "widget", self) is not self:
+            return
+        self._cancel_hover_tooltip()
+        self._hide_formula_autocomplete()
+        self._cancel_edge_auto_scroll()
 
     def _on_mousewheel(self, event):
         if not event.delta:
@@ -2268,7 +2278,11 @@ class SpreadsheetGrid(tk.Canvas):
                 else:
                     token = f"{cell_to_ref(min_r, min_c)}:{cell_to_ref(max_r, max_c)}"
 
-                if not isinstance(self.editor_entry, tk.Text):
+                if isinstance(self.editor_entry, tk.Text):
+                    start_idx = self._ref_token_start_idx or "1.0"
+                    self.editor_entry.delete(start_idx, tk.INSERT)
+                    self.editor_entry.insert(tk.INSERT, token)
+                else:
                     cur_txt = self.editor_entry.get()
                     start_idx = self._ref_token_start_idx if self._ref_token_start_idx is not None else 0
                     end_idx = start_idx
@@ -3049,6 +3063,9 @@ class SpreadsheetGrid(tk.Canvas):
         f_weight = "bold" if st.get("bold", False) else "normal"
 
         if self.find_withtag("editor_win"):
+            if r == 0 and self.freeze_top_row:
+                target_y = (self.canvasy(0) + self.header_row_height) if self.canvasy(0) > 0 else self.row_to_y(0)
+                self.coords("editor_win", self.col_to_x(c), target_y)
             if isinstance(self.editor_entry, tk.Text):
                 line_count = max(3, text.count("\n") + 1 + sum(max(0, len(ln) // 36) for ln in text.split("\n")))
                 new_h = min(240, max(base_h + 1, 75, line_count * 18 + 14))
@@ -4186,6 +4203,8 @@ class SpreadsheetTab(ttk.Frame):
         menu.add_command(label="Copy", command=self.grid_widget.copy_selection, accelerator="Ctrl+C")
         menu.add_command(label="Paste", command=self.grid_widget.paste_clipboard, accelerator="Ctrl+V")
         menu.add_command(label="Clear", command=self.grid_widget.clear_selected_cells, accelerator="Delete")
+        menu.add_command(label="Fill Down", command=self.grid_widget.fill_down_selection, accelerator="Ctrl+D")
+        menu.add_command(label="Fill Right", command=self.grid_widget.fill_right_selection, accelerator="Ctrl+R")
         menu.add_separator()
         menu.add_command(label="Sort A→Z (Ascending)", command=lambda: self.sort_active_column(True))
         menu.add_command(label="Sort Z→A (Descending)", command=lambda: self.sort_active_column(False))
