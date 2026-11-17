@@ -309,7 +309,7 @@ class AISettings:
         'agy_effort': 'low',
         'model': 'gemini-3.8-flash-low',
         'system_prompt': 'You are a helpful AI assistant. You help users with their markdown documents, answer questions, and provide writing assistance.',
-        'max_tokens': 4096,
+        'max_tokens': 1000000,
         'temperature': 0.7,
         'top_p': 1.0,  # Nucleus sampling: consider tokens with top_p cumulative probability
         'top_k': 0,    # Consider only top_k tokens (0 = disabled/use default)
@@ -412,7 +412,7 @@ class AISettings:
     
     @property
     def max_tokens(self) -> int:
-        val = self.settings.get('max_tokens', 4096)
+        val = self.settings.get('max_tokens', 1000000)
         try:
             return max(256, min(8192, int(val)))
         except (ValueError, TypeError):
@@ -736,7 +736,7 @@ class LLMClient(ABC):
         self,
         messages: List[ChatMessage],
         system_prompt: str = "",
-        max_tokens: int = 4096,
+        max_tokens: int = 1000000,
         temperature: float = 0.7,
         on_chunk: Optional[Callable[[str], None]] = None
     ) -> str:
@@ -818,7 +818,7 @@ class AnthropicClient(LLMClient):
         self,
         messages: List[ChatMessage],
         system_prompt: str = "",
-        max_tokens: int = 4096,
+        max_tokens: int = 1000000,
         temperature: float = 0.7,
         on_chunk: Optional[Callable[[str], None]] = None
     ) -> str:
@@ -944,7 +944,7 @@ class AnthropicClient(LLMClient):
         self,
         messages: List[Dict],
         system_prompt: str = "",
-        max_tokens: int = 4096,
+        max_tokens: int = 1000000,
         temperature: float = 0.7,
         top_p: float = 1.0,
         top_k: int = 0,
@@ -1000,7 +1000,7 @@ class AnthropicClient(LLMClient):
         
         try:
             # Clamp max_tokens to valid Anthropic output range [1, 8192]
-            safe_max_tokens = max(1, min(int(max_tokens or 4096), 8192))
+            safe_max_tokens = max(1, min(int(max_tokens or 1000000), 2000000))
             # Build kwargs for the API call
             stream_kwargs = {
                 "model": model_name,
@@ -1138,7 +1138,7 @@ class GeminiClient(LLMClient):
         self,
         messages: List[ChatMessage],
         system_prompt: str = "",
-        max_tokens: int = 4096,
+        max_tokens: int = 1000000,
         temperature: float = 0.7,
         top_p: float = 1.0,
         top_k: int = 0,
@@ -1230,7 +1230,7 @@ class GeminiClient(LLMClient):
         self,
         messages: List[Dict],
         system_prompt: str = "",
-        max_tokens: int = 4096,
+        max_tokens: int = 1000000,
         temperature: float = 0.7,
         top_p: float = 1.0,
         top_k: int = 0,
@@ -1402,7 +1402,7 @@ class OllamaClient(LLMClient):
         self,
         messages: List[ChatMessage],
         system_prompt: str = "",
-        max_tokens: int = 4096,
+        max_tokens: int = 1000000,
         temperature: float = 0.7,
         on_chunk: Optional[Callable[[str], None]] = None
     ) -> str:
@@ -1488,7 +1488,7 @@ class OllamaClient(LLMClient):
         self,
         messages: List[Dict],
         system_prompt: str = "",
-        max_tokens: int = 4096,
+        max_tokens: int = 1000000,
         temperature: float = 0.7,
         top_p: float = 1.0,
         top_k: int = 0,
@@ -1652,7 +1652,7 @@ class DeepSeekClient(LLMClient):
         self,
         messages: List[ChatMessage],
         system_prompt: str = "",
-        max_tokens: int = 4096,
+        max_tokens: int = 1000000,
         temperature: float = 0.7,
         on_chunk: Optional[Callable[[str], None]] = None
     ) -> str:
@@ -1714,7 +1714,7 @@ class DeepSeekClient(LLMClient):
         self,
         messages: List[Dict],
         system_prompt: str = "",
-        max_tokens: int = 4096,
+        max_tokens: int = 1000000,
         temperature: float = 0.7,
         top_p: float = 1.0,
         top_k: int = 0,
@@ -1750,7 +1750,7 @@ class DeepSeekClient(LLMClient):
             })
         
         try:
-            safe_max_tokens = max(1, min(int(max_tokens or 4096), 8192))
+            safe_max_tokens = max(1, min(int(max_tokens or 1000000), 2000000))
             stream = self.client.chat.completions.create(
                 model=model_name,
                 messages=api_messages,
@@ -2256,7 +2256,7 @@ class AgyClient(LLMClient):
         self.effort = effort or "low"
         self.cli_command = cli_command or find_antigravity_cli_command()
 
-    def send_message(self, messages, system_prompt='', max_tokens=4096,
+    def send_message(self, messages, system_prompt='', max_tokens=1000000,
                      temperature=0.7, on_chunk=None, **kwargs) -> str:
         user_parts = []
         for msg in messages:
@@ -2282,7 +2282,7 @@ class AgyClient(LLMClient):
             on_chunk(response)
         return response
 
-    def send_message_stream(self, messages, system_prompt='', max_tokens=4096,
+    def send_message_stream(self, messages, system_prompt='', max_tokens=1000000,
                             temperature=0.7, top_p=1.0, top_k=0,
                             images=None, model=None, on_chunk=None,
                             **kwargs):
@@ -2366,14 +2366,14 @@ class CliClient(LLMClient):
     # LLMClient ABC                                                        #
     # ------------------------------------------------------------------ #
 
-    def send_message(self, messages, system_prompt='', max_tokens=4096,
+    def send_message(self, messages, system_prompt='', max_tokens=1000000,
                      temperature=0.7, on_chunk=None, **kwargs) -> str:
         full = ''
         for chunk in self.send_message_stream(messages, system_prompt=system_prompt, **kwargs):
             full += chunk
         return full
 
-    def send_message_stream(self, messages, system_prompt='', max_tokens=4096,
+    def send_message_stream(self, messages, system_prompt='', max_tokens=1000000,
                             temperature=0.7, top_p=1.0, top_k=0,
                             images=None, model=None, on_chunk=None,
                             **kwargs):
@@ -3051,8 +3051,8 @@ class AISettingsDialog(tk.Toplevel):
 
         # Max Tokens
         ttk.Label(params_frame, text="Max Tokens:").grid(row=0, column=0, sticky=tk.W, pady=4)
-        self.max_tokens_var = tk.IntVar(value=4096)
-        ttk.Spinbox(params_frame, from_=256, to=8192,
+        self.max_tokens_var = tk.IntVar(value=1000000)
+        ttk.Spinbox(params_frame, from_=256, to=2000000,
                     textvariable=self.max_tokens_var, width=10).grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
         max_t_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
         max_t_tip.grid(row=0, column=2, padx=(4, 0))

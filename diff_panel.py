@@ -429,7 +429,7 @@ class DiffPanel(tk.Toplevel):
             for chunk in self.llm_client.send_message_stream(
                 self.messages,
                 system_prompt=self.settings.system_prompt if self.settings else "",
-                max_tokens=self.settings.max_tokens if self.settings else 4096,
+                max_tokens=self.settings.max_tokens if self.settings else 1000000,
                 temperature=self.settings.temperature if self.settings else 0.7,
                 top_p=self.settings.top_p if self.settings else 1.0,
                 top_k=self.settings.top_k if self.settings else 0,
