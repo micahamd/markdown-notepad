@@ -9,6 +9,7 @@ bidirectional AI Chat integration, and Excel/TSV/CSV/Markdown table interoperabi
 import ast
 import bisect
 import csv
+import datetime
 import io
 import json
 import math
@@ -961,9 +962,51 @@ class SpreadsheetGrid(tk.Canvas):
     MIN_ROWS = 100
     MIN_COLS = 26
 
+    FORMULA_CATALOG: List[Tuple[str, str, str]] = [
+        ("SUM", "SUM(range_or_vals...)", "Add all numeric values in range or arguments."),
+        ("AVERAGE", "AVERAGE(range_or_vals...)", "Compute arithmetic mean of numeric values."),
+        ("AVG", "AVG(range_or_vals...)", "Alias for AVERAGE."),
+        ("AVERAGEIF", "AVERAGEIF(criteria_range, criteria, [avg_range])", "Average cells meeting a condition."),
+        ("COUNT", "COUNT(range_or_vals...)", "Count cells containing numbers."),
+        ("COUNTA", "COUNTA(range_or_vals...)", "Count non-empty cells."),
+        ("COUNTIF", "COUNTIF(criteria_range, criteria)", "Count cells matching a condition."),
+        ("SUMIF", "SUMIF(criteria_range, criteria, [sum_range])", "Sum cells meeting a condition."),
+        ("MIN", "MIN(range_or_vals...)", "Return smallest numeric value."),
+        ("MAX", "MAX(range_or_vals...)", "Return largest numeric value."),
+        ("ROUND", "ROUND(val, [digits])", "Round value to specified decimal places."),
+        ("ROUNDUP", "ROUNDUP(val, [digits])", "Round value away from zero."),
+        ("ROUNDDOWN", "ROUNDDOWN(val, [digits])", "Round value toward zero."),
+        ("ABS", "ABS(val)", "Return absolute value."),
+        ("SQRT", "SQRT(val)", "Return square root."),
+        ("POWER", "POWER(base, exponent)", "Raise base to exponent."),
+        ("MOD", "MOD(x, y)", "Return remainder of x divided by y."),
+        ("INT", "INT(val)", "Truncate to integer."),
+        ("PRODUCT", "PRODUCT(range_or_vals...)", "Multiply all numeric values."),
+        ("MEDIAN", "MEDIAN(range_or_vals...)", "Return median value."),
+        ("STDEV", "STDEV(range_or_vals...)", "Compute sample standard deviation."),
+        ("VAR", "VAR(range_or_vals...)", "Compute sample variance."),
+        ("IF", "IF(condition, true_val, [false_val])", "Conditional evaluation."),
+        ("IFERROR", "IFERROR(val, fallback_val)", "Return fallback if formula errors."),
+        ("AND", "AND(cond1, cond2, ...)", "Return True if all arguments are truthy."),
+        ("OR", "OR(cond1, cond2, ...)", "Return True if any argument is truthy."),
+        ("NOT", "NOT(val)", "Invert boolean value."),
+        ("VLOOKUP", "VLOOKUP(lookup_val, range, col_idx, [exact])", "Vertical lookup by leftmost column."),
+        ("INDEX", "INDEX(range, row_num, [col_num])", "Return value at row/col offset in range."),
+        ("MATCH", "MATCH(lookup_val, range, [match_type])", "Return 1-based position of match in range."),
+        ("LEN", "LEN(text)", "Return character length of text."),
+        ("UPPER", "UPPER(text)", "Convert text to uppercase."),
+        ("LOWER", "LOWER(text)", "Convert text to lowercase."),
+        ("TRIM", "TRIM(text)", "Strip leading/trailing whitespace."),
+        ("LEFT", "LEFT(text, [n])", "Return leftmost n characters."),
+        ("RIGHT", "RIGHT(text, [n])", "Return rightmost n characters."),
+        ("CONCAT", "CONCAT(val1, val2, ...)", "Join values into a single string."),
+        ("CONCATENATE", "CONCATENATE(val1, val2, ...)", "Join values into a single string."),
+        ("SPARKLINE", "SPARKLINE(range)", "Render Unicode bar sparkline chart."),
+    ]
+
     def __init__(self, parent, engine: FormulaEngine, on_cell_select: Optional[Callable] = None,
                  on_modified: Optional[Callable] = None, theme: Optional[Dict] = None):
-        super().__init__(parent, bg="#ffffff", highlightthickness=0)
+        super().__init__(parent, bg="#ffffff", highlightthickness=0, xscrollincrement=20, yscrollincrement=24)
         self.parent = parent
         self.engine = engine
         self.on_cell_select_cb = on_cell_select
@@ -1041,8 +1084,18 @@ class SpreadsheetGrid(tk.Canvas):
         # Freeze Top Row (Row 1 pinned header)
         self.freeze_top_row: bool = False
 
-        # Re-entrancy guard to prevent recursive redraw during scroll synchronization
+        # Re-entrancy guard & buffered scroll tracking
         self._is_redrawing: bool = False
+        self._rendered_cell_bounds: Optional[Tuple[int, int, int, int]] = None
+
+        # Edge drag auto-scroll state
+        self._auto_scroll_after_id = None
+        self._last_drag_xy: Optional[Tuple[int, int]] = None
+
+        # Formula autocomplete & inline editor dynamic sizing
+        self._formula_ac_window: Optional[tk.Toplevel] = None
+        self._formula_ac_matches: List[Tuple[str, str, str]] = []
+        self._editor_base_size: Tuple[int, int] = (self.DEFAULT_COL_WIDTH, self.DEFAULT_ROW_HEIGHT)
 
         # Optional reference to parent SpreadsheetTab
         self.tab = None
@@ -1177,7 +1230,7 @@ class SpreadsheetGrid(tk.Canvas):
         return self.y_to_row(int(cy))
 
     def _check_and_redraw_if_moved(self):
-        """Redraw virtualized viewport if canvas scroll offset has shifted."""
+        """Redraw virtualized viewport (or reposition headers if within buffer) when scrolled."""
         if self._is_redrawing:
             return
         vx0 = self.canvasx(0)
@@ -1188,6 +1241,29 @@ class SpreadsheetGrid(tk.Canvas):
             or abs(vx0 - self._last_vx0) > 0.5
             or abs(vy0 - self._last_vy0) > 0.5
         ):
+            vw = max(600, self.winfo_width())
+            vh = max(400, self.winfo_height())
+            vx1 = vx0 + vw
+            vy1 = vy0 + vh
+            if self._rendered_cell_bounds is not None:
+                r_c0, r_c1, r_r0, r_r1 = self._rendered_cell_bounds
+                vis_c0 = max(0, self.x_to_col(int(vx0)))
+                vis_c1 = min(self.total_cols - 1, self.x_to_col(int(vx1)) + 1)
+                vis_r0 = max(0, self.y_to_row(int(vy0)))
+                vis_r1 = min(self.total_rows - 1, self.y_to_row(int(vy1)) + 1)
+                if vis_c0 >= r_c0 and vis_c1 <= r_c1 and vis_r0 >= r_r0 and vis_r1 <= r_r1:
+                    self._is_redrawing = True
+                    try:
+                        self._last_vx0 = vx0
+                        self._last_vy0 = vy0
+                        if self.freeze_top_row and self.active_cell[0] == 0:
+                            self._draw_selection_layers(r_c0, r_c1, r_r0, r_r1)
+                        self._draw_floating_headers_and_corner(vx0, vy0, vx1, vy1, r_c0, r_c1, r_r0, r_r1)
+                        if self.is_editing and self.editor_entry:
+                            self._refresh_editing_overlays()
+                    finally:
+                        self._is_redrawing = False
+                    return
             self.redraw()
 
     def xview(self, *args):
@@ -1245,6 +1321,7 @@ class SpreadsheetGrid(tk.Canvas):
         total_w = self.col_to_x(self.total_cols) + 100
         total_h = self.row_to_y(self.total_rows) + 100
         self.config(scrollregion=(0, 0, total_w, total_h))
+        self._rendered_cell_bounds = None
 
     # -------------------------------------------------------------------------
     # Virtualized Canvas Rendering & Fast-Path Selection Layer
@@ -1261,7 +1338,14 @@ class SpreadsheetGrid(tk.Canvas):
             self._is_redrawing = False
 
     def _do_redraw(self):
-        self.delete("all")
+        if self.is_editing and self.find_withtag("editor_win"):
+            self.delete(
+                "grid", "cell_text", "cell_bg", "frozen_row",
+                "header_row", "header_col", "corner", "sel_overlay",
+                "hdr_overlay", "formula_ref_hl"
+            )
+        else:
+            self.delete("all")
         vx0 = self.canvasx(0)
         vy0 = self.canvasy(0)
         vw = max(600, self.winfo_width())
@@ -1272,10 +1356,11 @@ class SpreadsheetGrid(tk.Canvas):
         self._last_vx0 = vx0
         self._last_vy0 = vy0
 
-        start_col = max(0, self.x_to_col(int(vx0)) - 2)
-        end_col = min(self.total_cols - 1, self.x_to_col(int(vx1)) + 2)
-        start_row = max(0, self.y_to_row(int(vy0)) - 2)
-        end_row = min(self.total_rows - 1, self.y_to_row(int(vy1)) + 2)
+        start_col = max(0, self.x_to_col(int(vx0)) - 4)
+        end_col = min(self.total_cols - 1, self.x_to_col(int(vx1)) + 4)
+        start_row = max(0, self.y_to_row(int(vy0)) - 6)
+        end_row = min(self.total_rows - 1, self.y_to_row(int(vy1)) + 6)
+        self._rendered_cell_bounds = (start_col, end_col, start_row, end_row)
 
         f_size = max(7, min(24, int(9 * self.zoom_factor)))
         default_wrap = getattr(self.tab_owner, "default_wrap", False)
@@ -1377,7 +1462,28 @@ class SpreadsheetGrid(tk.Canvas):
                             font=font_spec, fill=fg_color, tags="cell_text"
                         )
 
-        # 2. Freeze Top Row (Pinned Header Row 1)
+        # 2. Selection Layers & Floating Headers / Frozen Row / Corner Box
+        self._draw_selection_layers(start_col, end_col, start_row, end_row)
+        self._draw_floating_headers_and_corner(vx0, vy0, vx1, vy1, start_col, end_col, start_row, end_row)
+        if self.is_editing and self.editor_entry:
+            self._refresh_editing_overlays()
+
+    def _draw_floating_headers_and_corner(
+        self,
+        vx0: float,
+        vy0: float,
+        vx1: float,
+        vy1: float,
+        start_col: int,
+        end_col: int,
+        start_row: int,
+        end_row: int,
+    ):
+        """Render or reposition floating column/row headers, frozen top row, corner, and header highlights."""
+        self.delete("frozen_row", "header_row", "header_col", "corner", "hdr_overlay")
+        f_size = max(7, min(24, int(9 * self.zoom_factor)))
+
+        # Freeze Top Row (Pinned Header Row 1)
         if self.freeze_top_row:
             if vy0 > 0:
                 frozen_y0 = vy0 + self.header_row_height
@@ -1432,20 +1538,18 @@ class SpreadsheetGrid(tk.Canvas):
                             text=disp_txt, anchor=anchor, font=f_spec,
                             fill="#1e1b4b", tags="frozen_row"
                         )
-                # Prominent 2px royal purple divider line
                 self.create_line(
                     vx0, frozen_y1, vx1, frozen_y1,
                     fill=self._accent_color, width=2, tags="frozen_row"
                 )
             else:
-                # vy0 == 0: Still draw the distinct freeze divider line below Row 1
                 r0_y1 = self.row_to_y(0) + self.get_row_height(0)
                 self.create_line(
                     vx0, r0_y1, vx1, r0_y1,
                     fill=self._accent_color, width=2, tags="frozen_row"
                 )
 
-        # 3. Floating Header Row (Columns A, B, C...)
+        # Floating Header Row (Columns A, B, C...)
         hdr_y0 = vy0
         hdr_y1 = vy0 + self.header_row_height
 
@@ -1467,7 +1571,7 @@ class SpreadsheetGrid(tk.Canvas):
                 fill=self._header_fg, tags="header_row"
             )
 
-        # 4. Floating Header Column (Rows 1, 2, 3...)
+        # Floating Header Column (Rows 1, 2, 3...)
         hdr_x0 = vx0
         hdr_x1 = vx0 + self.header_col_width
 
@@ -1493,7 +1597,7 @@ class SpreadsheetGrid(tk.Canvas):
                 fill=fg_row, tags="header_col"
             )
 
-        # 5. Pinned Row 1 Header in Left Gutter when scrolled down
+        # Pinned Row 1 Header in Left Gutter when scrolled down
         if self.freeze_top_row and vy0 > 0:
             frozen_y0 = vy0 + self.header_row_height
             frozen_h = self.get_row_height(0)
@@ -1508,7 +1612,7 @@ class SpreadsheetGrid(tk.Canvas):
                 fill=self._accent_color, tags="corner"
             )
 
-        # 6. Top-Left Corner Box
+        # Top-Left Corner Box
         self.create_rectangle(
             vx0, vy0, vx0 + self.header_col_width, vy0 + self.header_row_height,
             fill="#e9e5f5", outline=self._grid_line_color, width=1, tags="corner"
@@ -1520,9 +1624,15 @@ class SpreadsheetGrid(tk.Canvas):
             fill="#a78bfa", outline="", tags="corner"
         )
 
-        # 7. Selection Layers & Header Highlights
-        self._draw_selection_layers(start_col, end_col, start_row, end_row)
+        # Ensure active selection outlines remain below newly created headers/corner
+        for hdr_tag in ("frozen_row", "header_row", "header_col", "corner"):
+            if self.find_withtag(hdr_tag) and self.find_withtag("sel_fg"):
+                self.tag_lower("sel_fg", hdr_tag)
+                break
+
         self._draw_header_highlights(start_col, end_col, start_row, end_row)
+        if self.find_withtag("editor_win"):
+            self.tag_raise("editor_win")
 
     def _draw_selection_layers(self, start_col: int, end_col: int, start_row: int, end_row: int):
         """Draw selection tint (background) and hollow selection borders (foreground)."""
@@ -1803,8 +1913,17 @@ class SpreadsheetGrid(tk.Canvas):
         self.bind("<Control-space>", self._on_select_col_shortcut)
 
         # Toggle word wrap on selection
-        self.bind("<Control-Shift-W>", lambda e: self.parent.toggle_wrap_selection() if hasattr(self.parent, "toggle_wrap_selection") else None)
-        self.bind("<Control-Shift-w>", lambda e: self.parent.toggle_wrap_selection() if hasattr(self.parent, "toggle_wrap_selection") else None)
+        self.bind("<Control-Shift-W>", lambda e: (self.tab_owner.toggle_wrap_selection() if hasattr(self.tab_owner, "toggle_wrap_selection") else None, "break")[1])
+        self.bind("<Control-Shift-w>", lambda e: (self.tab_owner.toggle_wrap_selection() if hasattr(self.tab_owner, "toggle_wrap_selection") else None, "break")[1])
+
+        # Rapid fill, date insertion & formatting shortcuts
+        self.bind("<Control-d>", lambda e: (self.fill_down_selection(), "break")[1])
+        self.bind("<Control-D>", lambda e: (self.fill_down_selection(), "break")[1])
+        self.bind("<Control-r>", lambda e: (self.fill_right_selection(), "break")[1])
+        self.bind("<Control-R>", lambda e: (self.fill_right_selection(), "break")[1])
+        self.bind("<Control-semicolon>", lambda e: (self.insert_today_date(), "break")[1])
+        self.bind("<Control-b>", lambda e: (self.toggle_bold_selection(), "break")[1])
+        self.bind("<Control-B>", lambda e: (self.toggle_bold_selection(), "break")[1])
 
         # Home / End / Page Navigation
         self.bind("<Home>", self._on_home_key)
@@ -1821,13 +1940,17 @@ class SpreadsheetGrid(tk.Canvas):
         self.bind("<Key>", self._on_key_press)
 
     def _on_mousewheel(self, event):
-        delta = int(-1 * (event.delta / 120)) if event.delta else 0
-        self.yview_scroll(delta * 3, "units")
+        if not event.delta:
+            return "break"
+        steps = int(-1 * (event.delta / 120) * 3) if abs(event.delta) >= 120 else (-1 if event.delta > 0 else 1)
+        self.yview_scroll(steps, "units")
         return "break"
 
     def _on_shift_mousewheel(self, event):
-        delta = int(-1 * (event.delta / 120)) if event.delta else 0
-        self.xview_scroll(delta * 3, "units")
+        if not event.delta:
+            return "break"
+        steps = int(-1 * (event.delta / 120) * 3) if abs(event.delta) >= 120 else (-1 if event.delta > 0 else 1)
+        self.xview_scroll(steps, "units")
         return "break"
 
     def _on_ctrl_mousewheel(self, event):
@@ -1840,6 +1963,10 @@ class SpreadsheetGrid(tk.Canvas):
     def set_zoom(self, zoom_factor: float):
         """Set spreadsheet zoom scale (0.5 to 2.5) and refresh layout."""
         self.zoom_factor = max(0.5, min(2.5, float(zoom_factor)))
+        self.config(
+            xscrollincrement=max(10, int(20 * self.zoom_factor)),
+            yscrollincrement=max(12, int(24 * self.zoom_factor)),
+        )
         self.recompute_bounds()
         self.redraw()
 
@@ -2124,12 +2251,14 @@ class SpreadsheetGrid(tk.Canvas):
         col = self.x_to_col(int(cx))
 
         if self.is_dragging_fill:
+            self._check_edge_auto_scroll(event.x, event.y)
             if row >= 0 and col >= 0:
                 self.fill_current_cell = (row, col)
                 self._fast_or_full_redraw()
             return
 
         if self.is_dragging_ref and self.ref_start_cell and self.editor_entry:
+            self._check_edge_auto_scroll(event.x, event.y)
             if row >= 0 and col >= 0:
                 r1, c1 = self.ref_start_cell
                 min_r, max_r = min(r1, row), max(r1, row)
@@ -2153,6 +2282,7 @@ class SpreadsheetGrid(tk.Canvas):
             return
 
         if self.is_selecting:
+            self._check_edge_auto_scroll(event.x, event.y)
             if self.select_mode == "col" and col >= 0:
                 self.sel_end = (self.total_rows - 1, col)
                 self._notify_select()
@@ -2166,7 +2296,78 @@ class SpreadsheetGrid(tk.Canvas):
                 self._notify_select()
                 self._fast_or_full_redraw()
 
+    def _check_edge_auto_scroll(self, ex: int, ey: int):
+        """Start or maintain repeating edge scroll timer while pointer drags near viewport borders."""
+        self._last_drag_xy = (ex, ey)
+        vw = max(100, self.winfo_width())
+        vh = max(100, self.winfo_height())
+        near_edge = (
+            ex < self.header_col_width + 18
+            or ex > vw - 24
+            or ey < self.header_row_height + 18
+            or ey > vh - 24
+        )
+        if near_edge:
+            if self._auto_scroll_after_id is None:
+                self._auto_scroll_after_id = self.after(45, self._perform_edge_auto_scroll)
+        else:
+            self._cancel_edge_auto_scroll()
+
+    def _cancel_edge_auto_scroll(self):
+        if self._auto_scroll_after_id is not None:
+            try:
+                self.after_cancel(self._auto_scroll_after_id)
+            except Exception:
+                pass
+            self._auto_scroll_after_id = None
+
+    def _perform_edge_auto_scroll(self):
+        """Advance viewport smoothly when drag-selecting past canvas edges."""
+        self._auto_scroll_after_id = None
+        if not (self.is_selecting or self.is_dragging_fill or self.is_dragging_ref):
+            return
+        if not self._last_drag_xy or not self.winfo_exists():
+            return
+        ex, ey = self._last_drag_xy
+        vw = max(100, self.winfo_width())
+        vh = max(100, self.winfo_height())
+        scrolled = False
+
+        if ex > vw - 24:
+            self.xview_scroll(2, "units")
+            scrolled = True
+        elif ex < self.header_col_width + 18 and self.canvasx(0) > 0:
+            self.xview_scroll(-2, "units")
+            scrolled = True
+
+        if ey > vh - 24:
+            self.yview_scroll(2, "units")
+            scrolled = True
+        elif ey < self.header_row_height + 18 and self.canvasy(0) > 0:
+            self.yview_scroll(-2, "units")
+            scrolled = True
+
+        if scrolled:
+            cx = self.canvasx(ex)
+            cy = self.canvasy(ey)
+            row = max(0, min(self.total_rows - 1, self.canvas_y_to_row(cy)))
+            col = max(0, min(self.total_cols - 1, self.x_to_col(int(cx))))
+            if self.is_dragging_fill:
+                self.fill_current_cell = (row, col)
+                self._fast_or_full_redraw()
+            elif self.is_selecting:
+                if self.select_mode == "col":
+                    self.sel_end = (self.total_rows - 1, col)
+                elif self.select_mode == "row":
+                    self.sel_end = (row, self.total_cols - 1)
+                else:
+                    self.sel_end = (row, col)
+                self._notify_select()
+                self._fast_or_full_redraw()
+            self._auto_scroll_after_id = self.after(45, self._perform_edge_auto_scroll)
+
     def _on_b1_release(self, event):
+        self._cancel_edge_auto_scroll()
         self.resizing_col = None
         self.resizing_row = None
         self.is_selecting = False
@@ -2188,6 +2389,133 @@ class SpreadsheetGrid(tk.Canvas):
             if self.editor_entry:
                 self.editor_entry.focus_set()
             return
+
+    def _execute_fill(self, start_range: Tuple[Tuple[int, int], Tuple[int, int]], target_cell: Tuple[int, int]):
+        """Perform smart auto-fill or formula extrapolation when drag-filling."""
+        (min_r, min_c), (max_r, max_c) = start_range
+        tgt_r, tgt_c = target_cell
+
+        old_cells = {}
+        new_cells = {}
+
+        if tgt_r > max_r:
+            h = max_r - min_r + 1
+            for c in range(min_c, max_c + 1):
+                vals = [self.engine.get_value(r, c) for r in range(min_r, max_r + 1)]
+                num_vals = []
+                for v in vals:
+                    try:
+                        num_vals.append(float(v) if v != "" and v is not None else None)
+                    except (ValueError, TypeError):
+                        num_vals.append(None)
+
+                is_numeric_series = len(num_vals) >= 2 and all(v is not None for v in num_vals)
+                if is_numeric_series:
+                    step = (num_vals[-1] - num_vals[0]) / (len(num_vals) - 1)
+                    for r in range(max_r + 1, tgt_r + 1):
+                        delta_steps = r - max_r
+                        new_num = num_vals[-1] + step * delta_steps
+                        val_str = str(int(new_num)) if new_num.is_integer() else f"{new_num:.2f}"
+                        old_cells[(r, c)] = self.engine.get_raw(r, c)
+                        new_cells[(r, c)] = val_str
+                        self.engine.set_cell(r, c, val_str)
+                else:
+                    for r in range(max_r + 1, tgt_r + 1):
+                        src_r = min_r + ((r - max_r - 1) % h)
+                        raw_src = self.engine.get_raw(src_r, c)
+                        dr = r - src_r
+                        shifted = shift_formula_references(raw_src, dr, 0) if raw_src.startswith("=") else raw_src
+                        old_cells[(r, c)] = self.engine.get_raw(r, c)
+                        new_cells[(r, c)] = shifted
+                        self.engine.set_cell(r, c, shifted)
+
+            self.sel_end = (tgt_r, max_c)
+
+        elif tgt_c > max_c:
+            w = max_c - min_c + 1
+            for r in range(min_r, max_r + 1):
+                vals = [self.engine.get_value(r, c) for c in range(min_c, max_c + 1)]
+                num_vals = []
+                for v in vals:
+                    try:
+                        num_vals.append(float(v) if v != "" and v is not None else None)
+                    except (ValueError, TypeError):
+                        num_vals.append(None)
+
+                is_numeric_series = len(num_vals) >= 2 and all(v is not None for v in num_vals)
+                if is_numeric_series:
+                    step = (num_vals[-1] - num_vals[0]) / (len(num_vals) - 1)
+                    for c in range(max_c + 1, tgt_c + 1):
+                        delta_steps = c - max_c
+                        new_num = num_vals[-1] + step * delta_steps
+                        val_str = str(int(new_num)) if new_num.is_integer() else f"{new_num:.2f}"
+                        old_cells[(r, c)] = self.engine.get_raw(r, c)
+                        new_cells[(r, c)] = val_str
+                        self.engine.set_cell(r, c, val_str)
+                else:
+                    for c in range(max_c + 1, tgt_c + 1):
+                        src_c = min_c + ((c - max_c - 1) % w)
+                        raw_src = self.engine.get_raw(r, src_c)
+                        dc = c - src_c
+                        shifted = shift_formula_references(raw_src, 0, dc) if raw_src.startswith("=") else raw_src
+                        old_cells[(r, c)] = self.engine.get_raw(r, c)
+                        new_cells[(r, c)] = shifted
+                        self.engine.set_cell(r, c, shifted)
+
+            self.sel_end = (max_r, tgt_c)
+
+        if old_cells:
+            self._save_undo_state({"type": "batch_cells", "old_cells": old_cells, "new_cells": new_cells})
+            self.engine.recalculate_all()
+            self.recompute_bounds()
+            self.redraw()
+            self._notify_select()
+            if self.on_modified_cb:
+                self.on_modified_cb()
+
+    def toggle_bold_selection(self):
+        """Toggle bold font on selected cells."""
+        (min_r, min_c), (max_r, max_c) = self.get_selected_range()
+        old_styles = dict(self.engine.cell_styles)
+        first_bold = self.engine.cell_styles.get((min_r, min_c), {}).get("bold", False)
+        new_bold = not first_bold
+        for r in range(min_r, max_r + 1):
+            for c in range(min_c, max_c + 1):
+                st = dict(self.engine.cell_styles.get((r, c), {}))
+                st["bold"] = new_bold
+                self.engine.cell_styles[(r, c)] = st
+        self._save_undo_state({"type": "styles", "old_styles": old_styles, "new_styles": dict(self.engine.cell_styles)})
+        self.redraw()
+        if self.on_modified_cb:
+            self.on_modified_cb()
+
+    def format_selection(self, fmt: str):
+        """Apply number format (currency, percent, fixed2, general) to selection."""
+        (min_r, min_c), (max_r, max_c) = self.get_selected_range()
+        old_styles = dict(self.engine.cell_styles)
+        for r in range(min_r, max_r + 1):
+            for c in range(min_c, max_c + 1):
+                st = dict(self.engine.cell_styles.get((r, c), {}))
+                st["format"] = fmt
+                self.engine.cell_styles[(r, c)] = st
+        self._save_undo_state({"type": "styles", "old_styles": old_styles, "new_styles": dict(self.engine.cell_styles)})
+        self.redraw()
+        if self.on_modified_cb:
+            self.on_modified_cb()
+
+    def set_alignment(self, align: str):
+        """Apply alignment (left, center, right) to selection."""
+        (min_r, min_c), (max_r, max_c) = self.get_selected_range()
+        old_styles = dict(self.engine.cell_styles)
+        for r in range(min_r, max_r + 1):
+            for c in range(min_c, max_c + 1):
+                st = dict(self.engine.cell_styles.get((r, c), {}))
+                st["align"] = align
+                self.engine.cell_styles[(r, c)] = st
+        self._save_undo_state({"type": "styles", "old_styles": old_styles, "new_styles": dict(self.engine.cell_styles)})
+        self.redraw()
+        if self.on_modified_cb:
+            self.on_modified_cb()
 
     def _on_double_click(self, event):
         cx = self.canvasx(event.x)
@@ -2409,25 +2737,146 @@ class SpreadsheetGrid(tk.Canvas):
         self._move_active(20, 0, extend)
         return "break"
 
+    def _advance_in_selection_or_grid(self, dr: int, dc: int):
+        """Advance active cell within multi-cell selection (Excel Enter/Tab cycling) or step on grid."""
+        if self.is_editing:
+            self.commit_inline_edit()
+        (min_r, min_c), (max_r, max_c) = self.get_selected_range()
+        if max_r > min_r or max_c > min_c:
+            r, c = self.active_cell
+            r = max(min_r, min(max_r, r))
+            c = max(min_c, min(max_c, c))
+            if dr > 0:
+                r += 1
+                if r > max_r:
+                    r = min_r
+                    c = min_c if c + 1 > max_c else c + 1
+            elif dr < 0:
+                r -= 1
+                if r < min_r:
+                    r = max_r
+                    c = max_c if c - 1 < min_c else c - 1
+            elif dc > 0:
+                c += 1
+                if c > max_c:
+                    c = min_c
+                    r = min_r if r + 1 > max_r else r + 1
+            elif dc < 0:
+                c -= 1
+                if c < min_c:
+                    c = max_c
+                    r = max_r if r - 1 < min_r else r - 1
+            self.active_cell = (r, c)
+            self._ensure_cell_visible(r, c)
+            self._notify_select()
+            self._fast_or_full_redraw()
+        else:
+            self._move_active(dr, dc)
+
     def _on_tab_key(self, event):
-        self._move_active(0, 1)
+        self._advance_in_selection_or_grid(0, 1)
         return "break"
 
     def _on_shift_tab_key(self, event):
-        self._move_active(0, -1)
+        self._advance_in_selection_or_grid(0, -1)
         return "break"
 
     def _on_return_key(self, event):
         if self.is_editing:
             self.commit_inline_edit()
-        self._move_active(1, 0)
+        self._advance_in_selection_or_grid(1, 0)
         return "break"
 
     def _on_shift_return_key(self, event):
         if self.is_editing:
             self.commit_inline_edit()
-        self._move_active(-1, 0)
+        self._advance_in_selection_or_grid(-1, 0)
         return "break"
+
+    def fill_down_selection(self):
+        """Copy top row of selection (or row above active cell) downward (Ctrl+D)."""
+        (min_r, min_c), (max_r, max_c) = self.get_selected_range()
+        if max_r == min_r:
+            if min_r == 0:
+                return
+            src_r = min_r - 1
+            dst_rows = range(min_r, min_r + 1)
+        else:
+            src_r = min_r
+            dst_rows = range(min_r + 1, max_r + 1)
+
+        old_cells: Dict[Tuple[int, int], str] = {}
+        new_cells: Dict[Tuple[int, int], str] = {}
+        for r in dst_rows:
+            dr = r - src_r
+            for c in range(min_c, max_c + 1):
+                raw_src = self.engine.get_raw(src_r, c)
+                shifted = shift_formula_references(raw_src, dr, 0) if raw_src.startswith("=") else raw_src
+                old_cells[(r, c)] = self.engine.get_raw(r, c)
+                new_cells[(r, c)] = shifted
+                self.engine.set_cell(r, c, shifted)
+
+        if old_cells:
+            self._save_undo_state({"type": "batch_cells", "old_cells": old_cells, "new_cells": new_cells})
+            self.engine.recalculate_all()
+            self.recompute_bounds()
+            self.redraw()
+            self._notify_select()
+            if self.on_modified_cb:
+                self.on_modified_cb()
+
+    def fill_right_selection(self):
+        """Copy leftmost column of selection (or left neighbor) rightward (Ctrl+R)."""
+        (min_r, min_c), (max_r, max_c) = self.get_selected_range()
+        if max_c == min_c:
+            if min_c == 0:
+                return
+            src_c = min_c - 1
+            dst_cols = range(min_c, min_c + 1)
+        else:
+            src_c = min_c
+            dst_cols = range(min_c + 1, max_c + 1)
+
+        old_cells: Dict[Tuple[int, int], str] = {}
+        new_cells: Dict[Tuple[int, int], str] = {}
+        for c in dst_cols:
+            dc = c - src_c
+            for r in range(min_r, max_r + 1):
+                raw_src = self.engine.get_raw(r, src_c)
+                shifted = shift_formula_references(raw_src, 0, dc) if raw_src.startswith("=") else raw_src
+                old_cells[(r, c)] = self.engine.get_raw(r, c)
+                new_cells[(r, c)] = shifted
+                self.engine.set_cell(r, c, shifted)
+
+        if old_cells:
+            self._save_undo_state({"type": "batch_cells", "old_cells": old_cells, "new_cells": new_cells})
+            self.engine.recalculate_all()
+            self.recompute_bounds()
+            self.redraw()
+            self._notify_select()
+            if self.on_modified_cb:
+                self.on_modified_cb()
+
+    def insert_today_date(self):
+        """Insert today's ISO date into the active cell or open editor (Ctrl+;)."""
+        today_str = datetime.date.today().isoformat()
+        if self.is_editing and self.editor_entry:
+            if isinstance(self.editor_entry, tk.Text):
+                self.editor_entry.insert(tk.INSERT, today_str)
+            else:
+                self.editor_entry.insert(tk.INSERT, today_str)
+            self._on_editor_change()
+            return
+        r, c = self.active_cell
+        old_val = self.engine.get_raw(r, c)
+        self._save_undo_state({"type": "set_cell", "r": r, "c": c, "old": old_val, "new": today_str})
+        self.engine.set_cell(r, c, today_str)
+        self.engine.recalculate_all()
+        self.recompute_bounds()
+        self.redraw()
+        self._notify_select()
+        if self.on_modified_cb:
+            self.on_modified_cb()
 
     def _on_key_press(self, event):
         """Typing a printable character begins editing active cell, ignoring Ctrl/Alt shortcuts."""
@@ -2485,6 +2934,7 @@ class SpreadsheetGrid(tk.Canvas):
             y = self.row_to_y(r)
         w = self.get_col_width(c)
         h = self.get_row_height(r)
+        self._editor_base_size = (w, h)
 
         st = self.engine.cell_styles.get((r, c), {})
         default_wrap = getattr(self.tab_owner, "default_wrap", False)
@@ -2494,6 +2944,12 @@ class SpreadsheetGrid(tk.Canvas):
         f_size = max(8, int(9 * self.zoom_factor))
         f_weight = "bold" if st.get("bold", False) else "normal"
         font_spec = ("Segoe UI", f_size, f_weight)
+
+        def _on_editor_tab(e):
+            if self._accept_formula_autocomplete():
+                return "break"
+            self.commit_inline_edit(move_right=True)
+            return "break"
 
         if is_multiline:
             box_w = max(w + 1, 240)
@@ -2514,16 +2970,16 @@ class SpreadsheetGrid(tk.Canvas):
 
             def _insert_newline(e):
                 self.editor_entry.insert(tk.INSERT, "\n")
-                st = dict(self.engine.cell_styles.get((r, c), {}))
-                st["wrap"] = True
-                self.engine.cell_styles[(r, c)] = st
+                cell_st = dict(self.engine.cell_styles.get((r, c), {}))
+                cell_st["wrap"] = True
+                self.engine.cell_styles[(r, c)] = cell_st
                 self._on_editor_change()
                 return "break"
 
             self.editor_entry.bind("<Alt-Return>", _insert_newline)
             self.editor_entry.bind("<Return>", lambda e: (self.commit_inline_edit(move_down=True), "break")[1])
             self.editor_entry.bind("<Shift-Return>", lambda e: (self.commit_inline_edit(move_up=True), "break")[1])
-            self.editor_entry.bind("<Tab>", lambda e: (self.commit_inline_edit(move_right=True), "break")[1])
+            self.editor_entry.bind("<Tab>", _on_editor_tab)
             self.editor_entry.bind("<ISO_Left_Tab>", lambda e: (self.commit_inline_edit(move_left=True), "break")[1])
             self.editor_entry.bind("<Shift-Tab>", lambda e: (self.commit_inline_edit(move_left=True), "break")[1])
             self.editor_entry.bind("<Escape>", lambda e: (self.cancel_inline_edit(), "break")[1])
@@ -2555,31 +3011,226 @@ class SpreadsheetGrid(tk.Canvas):
                 pos = self.editor_entry.index(tk.INSERT)
                 cur_val = cur_val[:pos] + "\n" + cur_val[pos:]
                 self._cleanup_editor()
-                st = dict(self.engine.cell_styles.get((r, c), {}))
-                st["wrap"] = True
-                self.engine.cell_styles[(r, c)] = st
+                cell_st = dict(self.engine.cell_styles.get((r, c), {}))
+                cell_st["wrap"] = True
+                self.engine.cell_styles[(r, c)] = cell_st
                 self.start_inline_edit(initial_text=cur_val)
                 return "break"
 
             self.editor_entry.bind("<Alt-Return>", _convert_to_multiline)
-            self.editor_entry.bind("<Return>", lambda e: self.commit_inline_edit(move_down=True))
-            self.editor_entry.bind("<Shift-Return>", lambda e: self.commit_inline_edit(move_up=True))
-            self.editor_entry.bind("<Tab>", lambda e: self.commit_inline_edit(move_right=True))
-            self.editor_entry.bind("<ISO_Left_Tab>", lambda e: self.commit_inline_edit(move_left=True))
-            self.editor_entry.bind("<Shift-Tab>", lambda e: self.commit_inline_edit(move_left=True))
+            self.editor_entry.bind("<Return>", lambda e: (self.commit_inline_edit(move_down=True), "break")[1])
+            self.editor_entry.bind("<Shift-Return>", lambda e: (self.commit_inline_edit(move_up=True), "break")[1])
+            self.editor_entry.bind("<Tab>", _on_editor_tab)
+            self.editor_entry.bind("<ISO_Left_Tab>", lambda e: (self.commit_inline_edit(move_left=True), "break")[1])
+            self.editor_entry.bind("<Shift-Tab>", lambda e: (self.commit_inline_edit(move_left=True), "break")[1])
             self.editor_entry.bind("<Up>", _on_entry_up)
             self.editor_entry.bind("<Down>", _on_entry_down)
-            self.editor_entry.bind("<Escape>", lambda e: self.cancel_inline_edit())
+            self.editor_entry.bind("<Escape>", lambda e: (self.cancel_inline_edit(), "break")[1])
             self.editor_entry.bind("<KeyRelease>", lambda e: self._on_editor_change())
 
-    def _on_editor_change(self):
-        """Sync live typing to parent formula bar."""
-        if self.editor_entry and self.on_cell_select_cb:
+        self._refresh_editing_overlays()
+
+    def _get_editor_text(self) -> str:
+        if not self.editor_entry:
+            return ""
+        if isinstance(self.editor_entry, tk.Text):
+            return self.editor_entry.get("1.0", "end-1c")
+        return self.editor_entry.get()
+
+    def _refresh_editing_overlays(self):
+        """Auto-expand editor window, draw formula ref highlights, and refresh autocomplete."""
+        if not self.is_editing or not self.editor_entry:
+            return
+        text = self._get_editor_text()
+        base_w, base_h = self._editor_base_size
+        r, c = self.active_cell
+        st = self.engine.cell_styles.get((r, c), {})
+        f_size = max(8, int(9 * self.zoom_factor))
+        f_weight = "bold" if st.get("bold", False) else "normal"
+
+        if self.find_withtag("editor_win"):
             if isinstance(self.editor_entry, tk.Text):
-                text = self.editor_entry.get("1.0", "end-1c")
+                line_count = max(3, text.count("\n") + 1 + sum(max(0, len(ln) // 36) for ln in text.split("\n")))
+                new_h = min(240, max(base_h + 1, 75, line_count * 18 + 14))
+                self.itemconfig("editor_win", height=new_h)
             else:
-                text = self.editor_entry.get()
+                measured_w = self._get_font("Segoe UI", f_size, f_weight).measure(text) + 28
+                new_w = max(base_w + 1, min(480, measured_w))
+                self.itemconfig("editor_win", width=new_w)
+            self.tag_raise("editor_win")
+
+        self._draw_formula_ref_highlights(text)
+        self._update_formula_autocomplete()
+
+    def _on_editor_change(self):
+        """Sync live typing to parent formula bar, auto-size editor, and update formula helpers."""
+        if self.editor_entry and self.on_cell_select_cb:
+            text = self._get_editor_text()
             self.on_cell_select_cb(self.active_cell, text, in_editor=True)
+        self._refresh_editing_overlays()
+
+    def _draw_formula_ref_highlights(self, formula_text: str):
+        """Highlight cell and range references parsed from active formula with distinct dashed frames."""
+        self.delete("formula_ref_hl")
+        if not isinstance(formula_text, str) or not formula_text.startswith("="):
+            return
+
+        colors = ["#2563eb", "#d97706", "#059669", "#dc2626", "#7c3aed"]
+        cleaned = re.sub(r'"[^"]*"', lambda m: " " * len(m.group(0)), formula_text[1:])
+        seen: Set[Tuple[int, int, int, int]] = set()
+        color_idx = 0
+
+        for m in re.finditer(r"\$?([A-Za-z]{1,3})\$?([0-9]+)(?::\$?([A-Za-z]{1,3})\$?([0-9]+))?", cleaned):
+            c1 = col_letter_to_index(m.group(1))
+            r1 = int(m.group(2)) - 1
+            if m.group(3) and m.group(4):
+                c2 = col_letter_to_index(m.group(3))
+                r2 = int(m.group(4)) - 1
+            else:
+                r2, c2 = r1, c1
+            min_r, max_r = min(r1, r2), max(r1, r2)
+            min_c, max_c = min(c1, c2), max(c1, c2)
+            if not (0 <= min_r < self.total_rows and 0 <= max_r < self.total_rows and 0 <= min_c < self.total_cols and 0 <= max_c < self.total_cols):
+                continue
+            key = (min_r, min_c, max_r, max_c)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            x1 = self.col_to_x(min_c)
+            y1 = self.row_to_y(min_r)
+            x2 = self.col_to_x(max_c) + self.get_col_width(max_c)
+            y2 = self.row_to_y(max_r) + self.get_row_height(max_r)
+            col_hex = colors[color_idx % len(colors)]
+            color_idx += 1
+
+            self.create_rectangle(
+                x1 + 1, y1 + 1, x2 - 1, y2 - 1,
+                fill="", outline=col_hex, width=2, dash=(4, 2), tags="formula_ref_hl"
+            )
+
+        for hdr_tag in ("frozen_row", "header_row", "header_col", "corner", "editor_win"):
+            if self.find_withtag(hdr_tag) and self.find_withtag("formula_ref_hl"):
+                self.tag_lower("formula_ref_hl", hdr_tag)
+                break
+
+    def _update_formula_autocomplete(self):
+        """Show matching formula function popup when typing an identifier inside '=' formulas."""
+        if not self.is_editing or not self.editor_entry:
+            self._hide_formula_autocomplete()
+            return
+
+        if isinstance(self.editor_entry, tk.Text):
+            before_cursor = self.editor_entry.get("1.0", tk.INSERT)
+        else:
+            pos = self.editor_entry.index(tk.INSERT)
+            before_cursor = self.editor_entry.get()[:pos]
+
+        if not before_cursor.lstrip().startswith("="):
+            self._hide_formula_autocomplete()
+            return
+
+        m = re.search(r"(?:^|[=+\-*/,(:\s&<>!])([A-Za-z]+)$", before_cursor)
+        if not m:
+            self._hide_formula_autocomplete()
+            return
+
+        prefix = m.group(1).upper()
+        matches = [item for item in self.FORMULA_CATALOG if item[0].startswith(prefix)][:5]
+        if matches:
+            self._show_formula_autocomplete(matches)
+        else:
+            self._hide_formula_autocomplete()
+
+    def _show_formula_autocomplete(self, matches: List[Tuple[str, str, str]]):
+        """Render non-focus-stealing formula autocomplete callout below the active cell."""
+        self._formula_ac_matches = matches
+        self._hide_formula_autocomplete(clear_matches=False)
+        if not self.winfo_exists():
+            return
+        try:
+            ac_r, ac_c = self.active_cell
+            cx = self.col_to_x(ac_c)
+            if ac_r == 0 and self.freeze_top_row and self.canvasy(0) > 0:
+                cy = self.canvasy(0) + self.header_row_height + self.get_row_height(0)
+            else:
+                cy = self.row_to_y(ac_r) + self.get_row_height(ac_r)
+
+            vx0 = self.canvasx(0)
+            vy0 = self.canvasy(0)
+            screen_x = self.winfo_rootx() + int(cx - vx0)
+            screen_y = self.winfo_rooty() + int(cy - vy0) + 4
+
+            tw = tk.Toplevel(self)
+            tw.wm_overrideredirect(True)
+            frame = tk.Frame(tw, bg="#ffffff", highlightbackground="#7c3aed", highlightthickness=1)
+            frame.pack(fill=tk.BOTH, expand=True)
+
+            for idx, (fn_name, sig, desc) in enumerate(matches):
+                row_bg = "#ede9fe" if idx == 0 else "#ffffff"
+                row_fr = tk.Frame(frame, bg=row_bg, cursor="hand2")
+                row_fr.pack(fill=tk.X, padx=1, pady=1)
+                lbl_fn = tk.Label(row_fr, text=sig, font=("Segoe UI", 9, "bold" if idx == 0 else "normal"),
+                                  fg="#4c1d95" if idx == 0 else "#1e293b", bg=row_bg, anchor="w")
+                lbl_fn.pack(side=tk.LEFT, padx=(6, 8), pady=2)
+                lbl_desc = tk.Label(row_fr, text=desc, font=("Segoe UI", 8),
+                                    fg="#64748b", bg=row_bg, anchor="w")
+                lbl_desc.pack(side=tk.RIGHT, padx=(4, 6), pady=2)
+                for w_clk in (row_fr, lbl_fn, lbl_desc):
+                    w_clk.bind("<Button-1>", lambda e, i=idx: self._accept_formula_autocomplete(i))
+
+            hint_lbl = tk.Label(frame, text="Tab: insert function", font=("Segoe UI", 7, "italic"),
+                                fg="#7c3aed", bg="#faf5ff", anchor="w", padx=6, pady=1)
+            hint_lbl.pack(fill=tk.X)
+
+            tw.update_idletasks()
+            tw.wm_geometry(f"+{screen_x}+{screen_y}")
+            self._formula_ac_window = tw
+        except Exception:
+            self._formula_ac_window = None
+
+    def _hide_formula_autocomplete(self, clear_matches: bool = True):
+        if clear_matches:
+            self._formula_ac_matches = []
+        if self._formula_ac_window is not None:
+            try:
+                self._formula_ac_window.destroy()
+            except Exception:
+                pass
+            self._formula_ac_window = None
+
+    def _accept_formula_autocomplete(self, idx: int = 0) -> bool:
+        """Complete active formula function token with selected suggestion and opening parenthesis."""
+        if not self._formula_ac_matches or not self.is_editing or not self.editor_entry:
+            return False
+        if not (0 <= idx < len(self._formula_ac_matches)):
+            idx = 0
+        fn_name = self._formula_ac_matches[idx][0]
+
+        if isinstance(self.editor_entry, tk.Text):
+            before = self.editor_entry.get("1.0", tk.INSERT)
+            m = re.search(r"([A-Za-z]+)$", before)
+            if not m:
+                return False
+            prefix_len = len(m.group(1))
+            self.editor_entry.delete(f"{tk.INSERT}-{prefix_len}c", tk.INSERT)
+            self.editor_entry.insert(tk.INSERT, f"{fn_name}(")
+        else:
+            full_txt = self.editor_entry.get()
+            pos = self.editor_entry.index(tk.INSERT)
+            before = full_txt[:pos]
+            m = re.search(r"([A-Za-z]+)$", before)
+            if not m:
+                return False
+            start_pos = pos - len(m.group(1))
+            new_txt = full_txt[:start_pos] + f"{fn_name}(" + full_txt[pos:]
+            self.editor_entry.delete(0, tk.END)
+            self.editor_entry.insert(0, new_txt)
+            self.editor_entry.icursor(start_pos + len(fn_name) + 1)
+
+        self._hide_formula_autocomplete()
+        self._on_editor_change()
+        return True
 
     def commit_inline_edit(self, move_down: bool = False, move_right: bool = False,
                            move_up: bool = False, move_left: bool = False):
@@ -2602,13 +3253,13 @@ class SpreadsheetGrid(tk.Canvas):
 
         self._cleanup_editor()
         if move_down:
-            self._move_active(1, 0)
+            self._advance_in_selection_or_grid(1, 0)
         elif move_right:
-            self._move_active(0, 1)
+            self._advance_in_selection_or_grid(0, 1)
         elif move_up:
-            self._move_active(-1, 0)
+            self._advance_in_selection_or_grid(-1, 0)
         elif move_left:
-            self._move_active(0, -1)
+            self._advance_in_selection_or_grid(0, -1)
         else:
             self.redraw()
 
@@ -2620,6 +3271,8 @@ class SpreadsheetGrid(tk.Canvas):
         self.redraw()
 
     def _cleanup_editor(self):
+        self._hide_formula_autocomplete()
+        self.delete("formula_ref_hl")
         self.is_editing = False
         if self.editor_entry:
             self.editor_entry.destroy()
@@ -3025,6 +3678,8 @@ class SpreadsheetTab(ttk.Frame):
                 self.grid_widget.editor_entry.delete(0, tk.END)
                 self.grid_widget.editor_entry.insert(0, txt)
 
+        self.grid_widget._draw_formula_ref_highlights(txt)
+
         # Update live formula preview badge
         if txt.startswith("=") and len(txt) > 2:
             try:
@@ -3042,6 +3697,7 @@ class SpreadsheetTab(ttk.Frame):
 
     def _on_formula_bar_submit(self, event):
         """Commit formula bar text to active cell."""
+        self.grid_widget.delete("formula_ref_hl")
         new_val = self.formula_var.get()
         r, c = self.grid_widget.active_cell
         old_val = self.engine.get_raw(r, c)

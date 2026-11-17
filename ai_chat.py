@@ -26,7 +26,7 @@ from typing import List, Dict, Any, Optional, Callable, Iterator
 from dataclasses import dataclass, field, asdict
 from abc import ABC, abstractmethod
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext, filedialog, font
+from tkinter import ttk, messagebox, scrolledtext, filedialog, font, simpledialog
 
 # Try to import PIL for image handling
 try:
@@ -297,6 +297,29 @@ class AISettings:
         "gpt-oss-120b-medium",
     ]
     AGY_EFFORTS = ["low", "medium", "high"]
+
+    DEFAULT_HARNESSES = [
+        {
+            'name': 'Default Assistant',
+            'prompt': 'You are a helpful AI assistant. You help users with their markdown documents, answer questions, and provide writing assistance.',
+        },
+        {
+            'name': 'Academic & Formal Editor',
+            'prompt': 'You are a formal, objective academic editor. Use a professional, scholarly, and emotionally neutral tone. Focus on conveying information clearly, concisely, and rigorously.',
+        },
+        {
+            'name': 'Spreadsheet & Data Analyst',
+            'prompt': 'You are a quantitative spreadsheet and data analyst. Provide accurate Excel-compatible formulas (SUM, AVERAGEIF, VLOOKUP, INDEX, MATCH, SPARKLINE), verify row/column structure, and format tabular outputs cleanly.',
+        },
+        {
+            'name': 'Technical Documentation Writer',
+            'prompt': 'You are a senior technical writer. Produce structured, unambiguous Markdown documentation with clear headings, tables, and reproducible examples.',
+        },
+        {
+            'name': 'Code & LaTeX Specialist',
+            'prompt': 'You are a software engineering and LaTeX typesetting specialist. Provide clean, well-structured code and valid LaTeX/KaTeX mathematical notation with minimal conversational filler.',
+        },
+    ]
     
     DEFAULT_SETTINGS = {
         'provider': 'agy',
@@ -309,6 +332,8 @@ class AISettings:
         'agy_effort': 'low',
         'model': 'gemini-3.8-flash-low',
         'system_prompt': 'You are a helpful AI assistant. You help users with their markdown documents, answer questions, and provide writing assistance.',
+        'active_harness': 'Default Assistant',
+        'prompt_harnesses': [h.copy() for h in DEFAULT_HARNESSES],
         'max_tokens': 1000000,
         'temperature': 0.7,
         'top_p': 1.0,  # Nucleus sampling: consider tokens with top_p cumulative probability
@@ -335,6 +360,7 @@ class AISettings:
     
     def __init__(self):
         self.settings = self.DEFAULT_SETTINGS.copy()
+        self.settings['prompt_harnesses'] = [h.copy() for h in self.DEFAULT_HARNESSES]
         self.load()
     
     def load(self) -> bool:
@@ -344,6 +370,18 @@ class AISettings:
                 with open(self.CONFIG_FILE, 'r', encoding='utf-8') as f:
                     saved = json.load(f)
                     self.settings.update(saved)
+                # Ensure prompt harnesses are valid and non-empty
+                harnesses = self.settings.get('prompt_harnesses')
+                if not isinstance(harnesses, list) or not harnesses:
+                    self.settings['prompt_harnesses'] = [h.copy() for h in self.DEFAULT_HARNESSES]
+                else:
+                    clean_h = [
+                        {'name': str(h['name']).strip(), 'prompt': str(h.get('prompt', ''))}
+                        for h in harnesses if isinstance(h, dict) and str(h.get('name', '')).strip()
+                    ]
+                    self.settings['prompt_harnesses'] = clean_h if clean_h else [h.copy() for h in self.DEFAULT_HARNESSES]
+                if not self.settings.get('active_harness'):
+                    self.settings['active_harness'] = self.settings['prompt_harnesses'][0]['name']
                 # Sanitize stale cached AGY models from older fallback lists
                 cached_agy = self.settings.get('cached_agy_models', [])
                 if cached_agy:
@@ -414,9 +452,9 @@ class AISettings:
     def max_tokens(self) -> int:
         val = self.settings.get('max_tokens', 1000000)
         try:
-            return max(256, min(8192, int(val)))
+            return max(256, min(2000000, int(val)))
         except (ValueError, TypeError):
-            return 4096
+            return 1000000
     
     @max_tokens.setter
     def max_tokens(self, value: int):
@@ -586,6 +624,111 @@ class AISettings:
     def get_enabled_context_actions(self) -> list:
         """Get only enabled context menu actions"""
         return [a for a in self.context_menu_actions if a.get('enabled', True)]
+
+    # ------------------------------------------------------------------
+    # Reusable System Instruction Harnesses
+    # ------------------------------------------------------------------
+
+    @property
+    def prompt_harnesses(self) -> List[Dict[str, str]]:
+        """Get list of saved instruction harnesses ({'name': ..., 'prompt': ...})."""
+        harnesses = self.settings.get('prompt_harnesses')
+        if not isinstance(harnesses, list) or not harnesses:
+            harnesses = [h.copy() for h in self.DEFAULT_HARNESSES]
+            self.settings['prompt_harnesses'] = harnesses
+        return harnesses
+
+    @prompt_harnesses.setter
+    def prompt_harnesses(self, value: List[Dict[str, str]]):
+        clean = [
+            {'name': str(h['name']).strip(), 'prompt': str(h.get('prompt', ''))}
+            for h in (value or []) if isinstance(h, dict) and str(h.get('name', '')).strip()
+        ]
+        self.settings['prompt_harnesses'] = clean if clean else [h.copy() for h in self.DEFAULT_HARNESSES]
+
+    @property
+    def active_harness(self) -> str:
+        name = self.settings.get('active_harness', '')
+        names = self.get_harness_names()
+        if name in names:
+            return name
+        return names[0] if names else 'Default Assistant'
+
+    @active_harness.setter
+    def active_harness(self, value: str):
+        self.settings['active_harness'] = str(value).strip()
+
+    def get_harness_names(self) -> List[str]:
+        return [h['name'] for h in self.prompt_harnesses]
+
+    def get_harness_prompt(self, name: str) -> Optional[str]:
+        for h in self.prompt_harnesses:
+            if h['name'] == name:
+                return h.get('prompt', '')
+        return None
+
+    def save_harness(self, name: str, prompt: str) -> bool:
+        """Insert or update a named instruction harness, set it active, and persist."""
+        clean_name = str(name or '').strip()
+        if not clean_name:
+            return False
+        harnesses = [dict(h) for h in self.prompt_harnesses]
+        updated = False
+        for h in harnesses:
+            if h['name'] == clean_name:
+                h['prompt'] = prompt
+                updated = True
+                break
+        if not updated:
+            harnesses.append({'name': clean_name, 'prompt': prompt})
+        self.settings['prompt_harnesses'] = harnesses
+        self.settings['active_harness'] = clean_name
+        self.settings['system_prompt'] = prompt
+        return self.save()
+
+    def rename_harness(self, old_name: str, new_name: str) -> bool:
+        """Rename an existing harness if new_name is non-empty and unused."""
+        old_clean = str(old_name or '').strip()
+        new_clean = str(new_name or '').strip()
+        if not old_clean or not new_clean or old_clean == new_clean:
+            return False
+        harnesses = [dict(h) for h in self.prompt_harnesses]
+        if any(h['name'] == new_clean for h in harnesses):
+            return False
+        found = False
+        for h in harnesses:
+            if h['name'] == old_clean:
+                h['name'] = new_clean
+                found = True
+                break
+        if not found:
+            return False
+        self.settings['prompt_harnesses'] = harnesses
+        if self.settings.get('active_harness') == old_clean:
+            self.settings['active_harness'] = new_clean
+        return self.save()
+
+    def delete_harness(self, name: str) -> bool:
+        """Delete a named harness while ensuring at least one harness always remains."""
+        clean_name = str(name or '').strip()
+        harnesses = [dict(h) for h in self.prompt_harnesses if h['name'] != clean_name]
+        if not harnesses:
+            harnesses = [self.DEFAULT_HARNESSES[0].copy()]
+        self.settings['prompt_harnesses'] = harnesses
+        if self.settings.get('active_harness') == clean_name or self.active_harness not in [h['name'] for h in harnesses]:
+            self.settings['active_harness'] = harnesses[0]['name']
+            self.settings['system_prompt'] = harnesses[0]['prompt']
+        return self.save()
+
+    def select_harness(self, name: str) -> Optional[str]:
+        """Activate a named harness, sync system_prompt to its instructions, and persist."""
+        prompt = self.get_harness_prompt(name)
+        if prompt is None:
+            return None
+        self.settings['active_harness'] = name
+        self.settings['system_prompt'] = prompt
+        self.save()
+        return prompt
 
 
 # =============================================================================
@@ -2853,325 +2996,583 @@ def get_llm_client(settings: AISettings) -> Optional[LLMClient]:
 # =============================================================================
 
 class AISettingsDialog(tk.Toplevel):
-    """Dialog for configuring AI settings"""
-    
-    def __init__(self, parent, settings: AISettings = None, on_save: Optional[Callable] = None):
+    """Dialog for configuring AI providers, generation parameters, instruction harnesses, and actions."""
+
+    PROVIDER_DESCRIPTIONS = {
+        'agy': 'Google Antigravity CLI — Local Bridge',
+        'anthropic': 'Anthropic Claude — Cloud API',
+        'gemini': 'Google Gemini — Generative AI API',
+        'deepseek': 'DeepSeek — Chat & Reasoner API',
+        'ollama': 'Ollama — Local Open-Weight Models',
+        'cli': 'Interactive CLI — Custom Terminal Session',
+    }
+
+    def __init__(
+        self,
+        parent,
+        settings: AISettings = None,
+        on_save: Optional[Callable] = None,
+        initial_tab: int = 0,
+    ):
         super().__init__(parent)
         self.parent = parent
         self.settings = settings if settings else get_ai_settings()
         self.on_save = on_save
+        self.initial_tab = initial_tab
         self.result = None
-        
-        self.title("AI Settings")
-        self.geometry("580x640")
+
+        # Staged working copy of reusable instruction harnesses
+        self._harnesses: List[Dict[str, str]] = [dict(h) for h in self.settings.prompt_harnesses]
+        self._active_harness: str = self.settings.active_harness
+
+        self.title("AI Assistant Configuration")
+        self.geometry("660x700")
         self.resizable(True, True)
-        self.minsize(540, 580)
+        self.minsize(620, 620)
         self.transient(parent)
         self.grab_set()
-        
+        self.bind("<Escape>", lambda e: self.destroy())
+
         self._setup_ui()
         self._load_current_settings()
-        
-        # Center on parent
+
+        # Center safely on parent
         self.update_idletasks()
-        x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
-        self.geometry(f"+{x}+{y}")
-    
+        try:
+            x = max(10, parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2)
+            y = max(10, parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2)
+            self.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
     def _create_tooltip(self, widget, text):
-        """Create a tooltip for a widget"""
-        def show_tooltip(event):
-            tooltip = tk.Toplevel(widget)
-            tooltip.wm_overrideredirect(True)
-            tooltip.wm_geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
-            label = ttk.Label(tooltip, text=text, background="#ffffe0", 
-                             relief="solid", borderwidth=1, padding=5,
-                             wraplength=300)
-            label.pack()
-            widget._tooltip = tooltip
-            
-            def hide_tooltip(event=None):
-                if hasattr(widget, '_tooltip') and widget._tooltip:
-                    widget._tooltip.destroy()
-                    widget._tooltip = None
-            
-            widget.bind('<Leave>', hide_tooltip)
-            tooltip.bind('<Leave>', hide_tooltip)
-            widget.after(5000, hide_tooltip)  # Auto-hide after 5 seconds
-        
-        widget.bind('<Enter>', show_tooltip)
-    
+        """Attach boundary-clamped tooltip to a configuration control."""
+        return ToolTip(widget, text)
+
     def _setup_ui(self):
-        """Setup the dialog UI with a compact, tabbed layout."""
-        main_frame = ttk.Frame(self, padding=10)
+        """Setup the redesigned three-tab configuration interface."""
+        # Top Royal Purple Header Banner
+        banner = tk.Frame(self, bg="#3b1d6e", padx=14, pady=10)
+        banner.pack(fill=tk.X, side=tk.TOP)
+
+        title_col = tk.Frame(banner, bg="#3b1d6e")
+        title_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(
+            title_col, text="⚙ AI Assistant Configuration",
+            font=("Segoe UI", 12, "bold"), fg="#f5f3ff", bg="#3b1d6e", anchor="w"
+        ).pack(fill=tk.X)
+        tk.Label(
+            title_col,
+            text="Configure providers, models, generation parameters, and reusable instruction harnesses",
+            font=("Segoe UI", 8), fg="#ddd6fe", bg="#3b1d6e", anchor="w"
+        ).pack(fill=tk.X)
+
+        self.header_status_badge = tk.Label(
+            banner, text="● Ready", font=("Segoe UI", 8, "bold"),
+            bg="#4c1d95", fg="#bbf7d0", padx=9, pady=4
+        )
+        self.header_status_badge.pack(side=tk.RIGHT, padx=(8, 0))
+
+        main_frame = ttk.Frame(self, padding=12)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Notebook with 3 tabs
-        nb = ttk.Notebook(main_frame)
-        nb.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        # Notebook with 3 well-structured tabs
+        self.nb = ttk.Notebook(main_frame)
+        self.nb.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
-        # ── Tab 1: Connection ─────────────────────────────────────────── #
-        t_conn = ttk.Frame(nb, padding=8)
-        nb.add(t_conn, text="  Connection  ")
+        # ── Tab 1: Provider & Model ───────────────────────────────────── #
+        t_conn = ttk.Frame(self.nb, padding=10)
+        self.nb.add(t_conn, text="  🔌 Provider & Model  ")
 
-        prov_frame = ttk.LabelFrame(t_conn, text="Provider", padding=8)
+        prov_frame = ttk.LabelFrame(t_conn, text="AI Provider", padding=10)
         prov_frame.pack(fill=tk.X, pady=(0, 8))
+        prov_frame.columnconfigure(1, weight=0)
+        prov_frame.columnconfigure(2, weight=1)
 
-        ttk.Label(prov_frame, text="AI Provider:").grid(row=0, column=0, sticky=tk.W, pady=4)
+        ttk.Label(prov_frame, text="Active Provider:", width=15, anchor=tk.W).grid(row=0, column=0, sticky=tk.W, pady=2)
         self.provider_var = tk.StringVar(value="agy")
         provider_combo = ttk.Combobox(
             prov_frame, textvariable=self.provider_var,
             values=["agy", "anthropic", "gemini", "deepseek", "ollama", "cli"],
-            state="readonly", width=28)
-        provider_combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
+            state="readonly", width=22
+        )
+        provider_combo.grid(row=0, column=1, sticky=tk.W, padx=(6, 10))
         provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
 
-        # Dynamic credential panel — one sub-frame per provider
-        cred_outer = ttk.LabelFrame(t_conn, text="API Keys / Connection", padding=8)
+        self.provider_desc_label = ttk.Label(
+            prov_frame, text=self.PROVIDER_DESCRIPTIONS['agy'],
+            font=("Segoe UI", 8, "italic"), foreground="#5b21b6"
+        )
+        self.provider_desc_label.grid(row=0, column=2, sticky=tk.W)
+
+        # Dynamic credential panel — spacious 2-row layout per provider
+        cred_outer = ttk.LabelFrame(t_conn, text="Credentials & Connection", padding=10)
         cred_outer.pack(fill=tk.X, pady=(0, 8))
         self._cred_frames = {}
 
         # AGY (Google Antigravity CLI)
         f_agy = ttk.Frame(cred_outer)
         f_agy.columnconfigure(1, weight=1)
-        
-        ttk.Label(f_agy, text="AGY Path:", width=11, anchor=tk.W).grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Label(f_agy, text="Executable Path:", width=15, anchor=tk.W).grid(row=0, column=0, sticky=tk.W, pady=(2, 6))
         self.agy_path_var = tk.StringVar()
+        self.agy_path_var.trace_add("write", lambda *a: self._update_header_badge())
         self.agy_path_entry = ttk.Entry(f_agy, textvariable=self.agy_path_var)
-        self.agy_path_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0), pady=2)
-        
-        btn_frame = ttk.Frame(f_agy)
-        btn_frame.grid(row=0, column=2, padx=(4, 0), pady=2)
-        ttk.Button(btn_frame, text="Auto", command=self._auto_detect_agy_path).pack(side=tk.LEFT, padx=1)
-        ttk.Button(btn_frame, text="Browse", command=self._browse_agy_path).pack(side=tk.LEFT, padx=1)
-        ttk.Button(btn_frame, text="Test", command=lambda: self._test_connection('agy')).pack(side=tk.LEFT, padx=1)
-        
-        row2 = ttk.Frame(f_agy)
-        row2.grid(row=1, column=0, columnspan=3, sticky=tk.EW, pady=(4, 0))
-        ttk.Label(row2, text="Reasoning Effort:").pack(side=tk.LEFT)
-        self.agy_effort_var = tk.StringVar(value='low')
-        effort_combo = ttk.Combobox(row2, textvariable=self.agy_effort_var, values=AISettings.AGY_EFFORTS, state="readonly", width=8)
-        effort_combo.pack(side=tk.LEFT, padx=(4, 16))
-        
-        signin_btn = ttk.Button(row2, text="🔑 Launch Signin Console", command=launch_cli_auth_window)
+        self.agy_path_entry.grid(row=0, column=1, columnspan=2, sticky=tk.EW, padx=(6, 0), pady=(2, 6))
+
+        agy_row2 = ttk.Frame(f_agy)
+        agy_row2.grid(row=1, column=0, columnspan=3, sticky=tk.EW, pady=(2, 0))
+        auto_btn = ttk.Button(agy_row2, text="🔍 Auto-Detect", width=13, command=self._auto_detect_agy_path)
+        auto_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._create_tooltip(auto_btn, "Locate the installed 'agy' CLI executable automatically on PATH or standard install locations.")
+
+        browse_btn = ttk.Button(agy_row2, text="📂 Browse...", width=11, command=self._browse_agy_path)
+        browse_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        test_agy_btn = ttk.Button(agy_row2, text="⚡ Test Connection", width=16, command=lambda: self._test_connection('agy'))
+        test_agy_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        signin_btn = ttk.Button(agy_row2, text="🔑 Sign-in Console", width=16, command=launch_cli_auth_window)
         signin_btn.pack(side=tk.LEFT)
         self._create_tooltip(signin_btn, "Open external terminal window running 'agy signin' for interactive authentication.")
-        
+
+        self.agy_effort_var = tk.StringVar(value='low')
+        effort_combo = ttk.Combobox(agy_row2, textvariable=self.agy_effort_var, values=AISettings.AGY_EFFORTS, state="readonly", width=8)
+        effort_combo.pack(side=tk.RIGHT)
+        ttk.Label(agy_row2, text="Effort:").pack(side=tk.RIGHT, padx=(8, 4))
         self._cred_frames['agy'] = f_agy
 
-        # Anthropic
-        f = ttk.Frame(cred_outer)
-        f.columnconfigure(1, weight=1)
-        ttk.Label(f, text="API Key:", width=11, anchor=tk.W).grid(row=0, column=0, sticky=tk.W)
-        self.api_key_var = tk.StringVar()
-        self.api_key_entry = ttk.Entry(f, textvariable=self.api_key_var, show="•")
-        self.api_key_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0))
-        self.show_key_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(f, text="Show", variable=self.show_key_var,
-                        command=self._toggle_key_visibility).grid(row=0, column=2, padx=(4, 0))
-        ttk.Button(f, text="Test", width=6,
-                   command=lambda: self._test_connection('anthropic')).grid(row=0, column=3, padx=(4, 0))
-        self._cred_frames['anthropic'] = f
+        # Helper to build uniform 2-row API key provider panels
+        def _build_key_panel(prov_key: str, var_attr: str, entry_attr: str, show_var_attr: str, toggle_cmd):
+            f_p = ttk.Frame(cred_outer)
+            f_p.columnconfigure(1, weight=1)
+            ttk.Label(f_p, text="API Key:", width=15, anchor=tk.W).grid(row=0, column=0, sticky=tk.W, pady=(2, 6))
+            key_var = tk.StringVar()
+            key_var.trace_add("write", lambda *a: self._update_header_badge())
+            setattr(self, var_attr, key_var)
+            key_ent = ttk.Entry(f_p, textvariable=key_var, show="•")
+            key_ent.grid(row=0, column=1, sticky=tk.EW, padx=(6, 6), pady=(2, 6))
+            setattr(self, entry_attr, key_ent)
 
-        # Gemini
-        f = ttk.Frame(cred_outer)
-        f.columnconfigure(1, weight=1)
-        ttk.Label(f, text="API Key:", width=11, anchor=tk.W).grid(row=0, column=0, sticky=tk.W)
-        self.gemini_key_var = tk.StringVar()
-        self.gemini_key_entry = ttk.Entry(f, textvariable=self.gemini_key_var, show="•")
-        self.gemini_key_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0))
-        self.show_gemini_key_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(f, text="Show", variable=self.show_gemini_key_var,
-                        command=self._toggle_gemini_key_visibility).grid(row=0, column=2, padx=(4, 0))
-        ttk.Button(f, text="Test", width=6,
-                   command=lambda: self._test_connection('gemini')).grid(row=0, column=3, padx=(4, 0))
-        self._cred_frames['gemini'] = f
+            show_var = tk.BooleanVar(value=False)
+            setattr(self, show_var_attr, show_var)
+            ttk.Checkbutton(f_p, text="👁 Show", variable=show_var, command=toggle_cmd).grid(row=0, column=2, pady=(2, 6))
 
-        # DeepSeek
-        f = ttk.Frame(cred_outer)
-        f.columnconfigure(1, weight=1)
-        ttk.Label(f, text="API Key:", width=11, anchor=tk.W).grid(row=0, column=0, sticky=tk.W)
-        self.deepseek_key_var = tk.StringVar()
-        self.deepseek_key_entry = ttk.Entry(f, textvariable=self.deepseek_key_var, show="•")
-        self.deepseek_key_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0))
-        self.show_deepseek_key_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(f, text="Show", variable=self.show_deepseek_key_var,
-                        command=self._toggle_deepseek_key_visibility).grid(row=0, column=2, padx=(4, 0))
-        ttk.Button(f, text="Test", width=6,
-                   command=lambda: self._test_connection('deepseek')).grid(row=0, column=3, padx=(4, 0))
-        self._cred_frames['deepseek'] = f
+            r2 = ttk.Frame(f_p)
+            r2.grid(row=1, column=0, columnspan=3, sticky=tk.EW)
+            ttk.Button(
+                r2, text="⚡ Test Connection", width=16,
+                command=lambda k=prov_key: self._test_connection(k)
+            ).pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Label(
+                r2, text=f"Keys are stored locally in {AISettings.CONFIG_FILE.name}",
+                font=("Segoe UI", 8), foreground="#64748b"
+            ).pack(side=tk.LEFT)
+            self._cred_frames[prov_key] = f_p
+
+        _build_key_panel('anthropic', 'api_key_var', 'api_key_entry', 'show_key_var', self._toggle_key_visibility)
+        _build_key_panel('gemini', 'gemini_key_var', 'gemini_key_entry', 'show_gemini_key_var', self._toggle_gemini_key_visibility)
+        _build_key_panel('deepseek', 'deepseek_key_var', 'deepseek_key_entry', 'show_deepseek_key_var', self._toggle_deepseek_key_visibility)
 
         # Ollama
-        f = ttk.Frame(cred_outer)
-        f.columnconfigure(1, weight=1)
-        ttk.Label(f, text="URL:", width=11, anchor=tk.W).grid(row=0, column=0, sticky=tk.W)
+        f_oll = ttk.Frame(cred_outer)
+        f_oll.columnconfigure(1, weight=1)
+        ttk.Label(f_oll, text="Server URL:", width=15, anchor=tk.W).grid(row=0, column=0, sticky=tk.W, pady=(2, 6))
         self.ollama_url_var = tk.StringVar(value="http://localhost:11434")
-        self.ollama_url_entry = ttk.Entry(f, textvariable=self.ollama_url_var)
-        self.ollama_url_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0))
-        ttk.Button(f, text="Test", width=6,
-                   command=lambda: self._test_connection('ollama')).grid(row=0, column=2, padx=(4, 0))
-        self._cred_frames['ollama'] = f
+        self.ollama_url_var.trace_add("write", lambda *a: self._update_header_badge())
+        self.ollama_url_entry = ttk.Entry(f_oll, textvariable=self.ollama_url_var)
+        self.ollama_url_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0), pady=(2, 6))
+        r2_oll = ttk.Frame(f_oll)
+        r2_oll.grid(row=1, column=0, columnspan=2, sticky=tk.EW)
+        ttk.Button(r2_oll, text="⚡ Test Connection", width=16, command=lambda: self._test_connection('ollama')).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(r2_oll, text="Default local endpoint: http://localhost:11434", font=("Segoe UI", 8), foreground="#64748b").pack(side=tk.LEFT)
+        self._cred_frames['ollama'] = f_oll
 
         # CLI
-        f = ttk.Frame(cred_outer)
-        f.columnconfigure(1, weight=1)
-        ttk.Label(f, text="Command:", width=11, anchor=tk.W).grid(row=0, column=0, sticky=tk.W)
+        f_cli = ttk.Frame(cred_outer)
+        f_cli.columnconfigure(1, weight=1)
+        ttk.Label(f_cli, text="CLI Command:", width=15, anchor=tk.W).grid(row=0, column=0, sticky=tk.W, pady=(2, 6))
         self.cli_cmd_var = tk.StringVar()
-        self.cli_cmd_entry = ttk.Entry(f, textvariable=self.cli_cmd_var)
-        self.cli_cmd_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0))
-        ttk.Button(f, text="Test", width=6,
-                   command=lambda: self._test_connection('cli')).grid(row=0, column=2, padx=(4, 0))
-        self._create_tooltip(self.cli_cmd_entry,
+        self.cli_cmd_var.trace_add("write", lambda *a: self._update_header_badge())
+        self.cli_cmd_entry = ttk.Entry(f_cli, textvariable=self.cli_cmd_var)
+        self.cli_cmd_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6, 0), pady=(2, 6))
+        self._create_tooltip(
+            self.cli_cmd_entry,
             "Enter the command that starts an interactive CLI session,\n"
             "e.g.  gh copilot chat  or  claude  or  gemini\n"
-            "The session stays alive while the app is open.\n"
-            "CLI commands like /clear, /model, /help are passed through.")
-        self._cred_frames['cli'] = f
+            "The session stays alive while the app is open."
+        )
+        r2_cli = ttk.Frame(f_cli)
+        r2_cli.grid(row=1, column=0, columnspan=2, sticky=tk.EW)
+        ttk.Button(r2_cli, text="⚡ Test Session", width=16, command=lambda: self._test_connection('cli')).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(r2_cli, text="Examples: gh copilot chat, claude, gemini", font=("Segoe UI", 8), foreground="#64748b").pack(side=tk.LEFT)
+        self._cred_frames['cli'] = f_cli
 
-        # ── Tab 2: Parameters ─────────────────────────────────────────── #
-        t_params = ttk.Frame(nb, padding=8)
-        nb.add(t_params, text="  Parameters  ")
+        # Active Model & Connection Status Card (unified on Tab 1)
+        model_frame = ttk.LabelFrame(t_conn, text="Active Model & Status", padding=10)
+        model_frame.pack(fill=tk.X, pady=(0, 6))
+        model_frame.columnconfigure(1, weight=1)
 
-        model_frame = ttk.LabelFrame(t_params, text="Model", padding=8)
-        model_frame.pack(fill=tk.X, pady=(0, 8))
-
-        ttk.Label(model_frame, text="Model:").grid(row=0, column=0, sticky=tk.W, pady=4)
+        ttk.Label(model_frame, text="Active Model:", width=15, anchor=tk.W).grid(row=0, column=0, sticky=tk.W, pady=4)
         self.model_var = tk.StringVar()
-        self.model_combo = ttk.Combobox(model_frame, textvariable=self.model_var,
-                                         values=AISettings.ANTHROPIC_MODELS, width=32)
-        self.model_combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
-        refresh_btn = ttk.Button(model_frame, text="🔄", width=3, command=self._refresh_models)
-        refresh_btn.grid(row=0, column=2, padx=(4, 0))
-        self._create_tooltip(refresh_btn,
-            "Refresh model list: Fetches the latest available models from the API. "
-            "Use this if you have access to new models that aren't showing in the dropdown.")
+        self.model_var.trace_add("write", lambda *a: self._update_header_badge())
+        self.model_combo = ttk.Combobox(model_frame, textvariable=self.model_var, values=AISettings.ANTHROPIC_MODELS, width=38)
+        self.model_combo.grid(row=0, column=1, sticky=tk.EW, padx=(6, 6), pady=4)
 
-        params_frame = ttk.LabelFrame(t_params, text="Generation Parameters", padding=8)
+        refresh_btn = ttk.Button(model_frame, text="🔄 Refresh List", width=14, command=self._refresh_models)
+        refresh_btn.grid(row=0, column=2, pady=4)
+        self._create_tooltip(
+            refresh_btn,
+            "Fetch the latest available models from the selected provider and cache them locally."
+        )
+
+        self.conn_feedback_var = tk.StringVar(value="ℹ Click Test Connection or Refresh List to verify availability.")
+        self.conn_feedback_lbl = ttk.Label(
+            model_frame, textvariable=self.conn_feedback_var,
+            font=("Segoe UI", 8), foreground="#475569", wraplength=540
+        )
+        self.conn_feedback_lbl.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(4, 0))
+
+        # ── Tab 2: Generation Parameters ──────────────────────────────── #
+        t_params = ttk.Frame(self.nb, padding=10)
+        self.nb.add(t_params, text="  🎛 Generation Parameters  ")
+
+        preset_bar = ttk.LabelFrame(t_params, text="Quick Parameter Presets", padding=10)
+        preset_bar.pack(fill=tk.X, pady=(0, 10))
+        ttk.Button(
+            preset_bar, text="🎯 Precise / Factual (0.2)",
+            command=lambda: self._apply_param_preset(0.2, 0.9)
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            preset_bar, text="⚖️ Balanced Default (0.7)",
+            command=lambda: self._apply_param_preset(0.7, 1.0)
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            preset_bar, text="✨ Creative / Brainstorm (1.1)",
+            command=lambda: self._apply_param_preset(1.1, 1.0)
+        ).pack(side=tk.LEFT)
+
+        params_frame = ttk.LabelFrame(t_params, text="Sampling & Output Bounds", padding=12)
         params_frame.pack(fill=tk.X, pady=(0, 8))
+        params_frame.columnconfigure(3, weight=1)
 
         # Max Tokens
-        ttk.Label(params_frame, text="Max Tokens:").grid(row=0, column=0, sticky=tk.W, pady=4)
+        ttk.Label(params_frame, text="Max Tokens:", width=18, anchor=tk.W).grid(row=0, column=0, sticky=tk.W, pady=6)
         self.max_tokens_var = tk.IntVar(value=1000000)
-        ttk.Spinbox(params_frame, from_=256, to=2000000,
-                    textvariable=self.max_tokens_var, width=10).grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
+        ttk.Spinbox(params_frame, from_=256, to=2000000, textvariable=self.max_tokens_var, width=12).grid(row=0, column=1, sticky=tk.W, padx=(6, 6))
         max_t_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
-        max_t_tip.grid(row=0, column=2, padx=(4, 0))
-        self._create_tooltip(max_t_tip,
-            "Maximum number of tokens to generate. Higher = longer responses but may cost more.\n"
-            "Common values: 1024 (short), 2048 (medium), 4096 (long), 8192 (very long).")
+        max_t_tip.grid(row=0, column=2, padx=(2, 8))
+        ttk.Label(params_frame, text="Output length limit (256 – 2,000,000 tokens)", font=("Segoe UI", 8), foreground="#64748b").grid(row=0, column=3, sticky=tk.W)
+        self._create_tooltip(
+            max_t_tip,
+            "Maximum number of tokens to generate. Higher = longer responses.\n"
+            "Common values: 2048 (concise), 8192 (detailed), 1000000 (extended)."
+        )
 
         # Temperature
-        ttk.Label(params_frame, text="Temperature:").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Label(params_frame, text="Temperature:", width=18, anchor=tk.W).grid(row=1, column=0, sticky=tk.W, pady=6)
         temp_inner = ttk.Frame(params_frame)
-        temp_inner.grid(row=1, column=1, sticky=tk.W, padx=(8, 0))
+        temp_inner.grid(row=1, column=1, sticky=tk.W, padx=(6, 6))
         self.temp_var = tk.DoubleVar(value=0.7)
-        self.temp_scale = ttk.Scale(temp_inner, from_=0.0, to=2.0, variable=self.temp_var,
-                                     orient=tk.HORIZONTAL, length=140, command=self._update_temp_label)
+        self.temp_scale = ttk.Scale(
+            temp_inner, from_=0.0, to=2.0, variable=self.temp_var,
+            orient=tk.HORIZONTAL, length=150, command=self._update_temp_label
+        )
         self.temp_scale.pack(side=tk.LEFT)
-        self.temp_label = ttk.Label(temp_inner, text="0.70", width=5)
-        self.temp_label.pack(side=tk.LEFT, padx=(4, 0))
+        self.temp_label = ttk.Label(temp_inner, text="0.70", width=5, font=("Segoe UI", 9, "bold"))
+        self.temp_label.pack(side=tk.LEFT, padx=(6, 0))
         temp_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
-        temp_tip.grid(row=1, column=2, padx=(4, 0))
-        self._create_tooltip(temp_tip,
-            "Controls randomness. Lower = more focused & deterministic. Higher = more creative.\n"
-            "Range 0-2. Recommended: 0.3-0.5 (factual), 0.7-0.9 (creative), 1.0+ (brainstorm).")
+        temp_tip.grid(row=1, column=2, padx=(2, 8))
+        ttk.Label(params_frame, text="0.0 = deterministic · 0.7 = balanced · 1.5+ = creative", font=("Segoe UI", 8), foreground="#64748b").grid(row=1, column=3, sticky=tk.W)
+        self._create_tooltip(
+            temp_tip,
+            "Controls randomness. Lower = more focused & deterministic. Higher = more creative."
+        )
 
         # Top-p
-        ttk.Label(params_frame, text="Top-p:").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Label(params_frame, text="Top-p (Nucleus):", width=18, anchor=tk.W).grid(row=2, column=0, sticky=tk.W, pady=6)
         top_p_inner = ttk.Frame(params_frame)
-        top_p_inner.grid(row=2, column=1, sticky=tk.W, padx=(8, 0))
+        top_p_inner.grid(row=2, column=1, sticky=tk.W, padx=(6, 6))
         self.top_p_var = tk.DoubleVar(value=1.0)
-        self.top_p_scale = ttk.Scale(top_p_inner, from_=0.0, to=1.0, variable=self.top_p_var,
-                                      orient=tk.HORIZONTAL, length=140, command=self._update_top_p_label)
+        self.top_p_scale = ttk.Scale(
+            top_p_inner, from_=0.0, to=1.0, variable=self.top_p_var,
+            orient=tk.HORIZONTAL, length=150, command=self._update_top_p_label
+        )
         self.top_p_scale.pack(side=tk.LEFT)
-        self.top_p_label = ttk.Label(top_p_inner, text="1.00", width=5)
-        self.top_p_label.pack(side=tk.LEFT, padx=(4, 0))
+        self.top_p_label = ttk.Label(top_p_inner, text="1.00", width=5, font=("Segoe UI", 9, "bold"))
+        self.top_p_label.pack(side=tk.LEFT, padx=(6, 0))
         top_p_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
-        top_p_tip.grid(row=2, column=2, padx=(4, 0))
-        self._create_tooltip(top_p_tip,
-            "Nucleus sampling: considers only tokens whose cumulative probability exceeds this value.\n"
-            "1.0 = all tokens; lower = more focused. Most users should leave at 1.0.")
+        top_p_tip.grid(row=2, column=2, padx=(2, 8))
+        ttk.Label(params_frame, text="Cumulative probability cutoff (1.0 = full vocabulary)", font=("Segoe UI", 8), foreground="#64748b").grid(row=2, column=3, sticky=tk.W)
+        self._create_tooltip(
+            top_p_tip,
+            "Nucleus sampling: considers tokens whose cumulative probability exceeds this threshold."
+        )
 
         # Top-k
-        ttk.Label(params_frame, text="Top-k:").grid(row=3, column=0, sticky=tk.W, pady=4)
+        ttk.Label(params_frame, text="Top-k:", width=18, anchor=tk.W).grid(row=3, column=0, sticky=tk.W, pady=6)
         self.top_k_var = tk.IntVar(value=0)
-        ttk.Spinbox(params_frame, from_=0, to=100,
-                    textvariable=self.top_k_var, width=10).grid(row=3, column=1, sticky=tk.W, padx=(8, 0))
+        ttk.Spinbox(params_frame, from_=0, to=100, textvariable=self.top_k_var, width=12).grid(row=3, column=1, sticky=tk.W, padx=(6, 6))
         top_k_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
-        top_k_tip.grid(row=3, column=2, padx=(4, 0))
-        self._create_tooltip(top_k_tip,
-            "Considers only the top-k most likely tokens. 0 = disabled (model default).\n"
-            "Lower = more focused. Leave at 0 for most use cases.")
+        top_k_tip.grid(row=3, column=2, padx=(2, 8))
+        ttk.Label(params_frame, text="0 = disabled (model default)", font=("Segoe UI", 8), foreground="#64748b").grid(row=3, column=3, sticky=tk.W)
+        self._create_tooltip(top_k_tip, "Consider only the top-k most likely candidate tokens. Leave at 0 for defaults.")
 
         # Image Max Size
-        ttk.Label(params_frame, text="Image Max Size:").grid(row=4, column=0, sticky=tk.W, pady=4)
+        ttk.Label(params_frame, text="Image Max Size:", width=18, anchor=tk.W).grid(row=4, column=0, sticky=tk.W, pady=6)
         img_inner = ttk.Frame(params_frame)
-        img_inner.grid(row=4, column=1, sticky=tk.W, padx=(8, 0))
+        img_inner.grid(row=4, column=1, sticky=tk.W, padx=(6, 6))
         self.img_size_var = tk.IntVar(value=512)
-        ttk.Spinbox(img_inner, from_=256, to=1024, increment=128,
-                    textvariable=self.img_size_var, width=10).pack(side=tk.LEFT)
+        ttk.Spinbox(img_inner, from_=256, to=1024, increment=128, textvariable=self.img_size_var, width=12).pack(side=tk.LEFT)
         ttk.Label(img_inner, text="px").pack(side=tk.LEFT, padx=(4, 0))
         img_tip = ttk.Label(params_frame, text="ℹ️", font=('Segoe UI', 10))
-        img_tip.grid(row=4, column=2, padx=(4, 0))
-        self._create_tooltip(img_tip,
-            "Maximum dimension for images sent to the AI.\n"
-            "Larger = more detail but slower and costlier.\n"
-            "Recommended: 512px (standard), 768px (detailed), 1024px (maximum).")
+        img_tip.grid(row=4, column=2, padx=(2, 8))
+        ttk.Label(params_frame, text="Downscale ceiling for attached screenshots & figures", font=("Segoe UI", 8), foreground="#64748b").grid(row=4, column=3, sticky=tk.W)
+        self._create_tooltip(img_tip, "Maximum dimension for images sent to multimodal models.")
 
-        # ── Tab 3: Prompt & Actions ───────────────────────────────────── #
-        t_prompt = ttk.Frame(nb, padding=8)
-        nb.add(t_prompt, text="  Prompt & Actions  ")
+        # ── Tab 3: Harnesses & Actions ─────────────────────────────────── #
+        t_prompt = ttk.Frame(self.nb, padding=10)
+        self.nb.add(t_prompt, text="  🧭 Harnesses & Actions  ")
 
-        prompt_frame = ttk.LabelFrame(t_prompt, text="System Prompt", padding=8)
+        prompt_frame = ttk.LabelFrame(t_prompt, text="System Instruction Harnesses (Reusable Prompts)", padding=10)
         prompt_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        self.system_prompt_text = tk.Text(prompt_frame, height=6, wrap=tk.WORD)
-        prompt_sb = ttk.Scrollbar(prompt_frame, orient=tk.VERTICAL,
-                                   command=self.system_prompt_text.yview)
+
+        harness_bar = ttk.Frame(prompt_frame)
+        harness_bar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(harness_bar, text="Saved Harness:").pack(side=tk.LEFT, padx=(0, 6))
+        self.harness_var = tk.StringVar(value=self._active_harness)
+        self.harness_combo = ttk.Combobox(
+            harness_bar, textvariable=self.harness_var,
+            values=[h['name'] for h in self._harnesses], state='readonly', width=22
+        )
+        self.harness_combo.pack(side=tk.LEFT, padx=(0, 6))
+        self.harness_combo.bind('<<ComboboxSelected>>', self._on_harness_selected)
+
+        h_save_btn = ttk.Button(harness_bar, text="💾 Save", width=8, command=self._save_current_harness)
+        h_save_btn.pack(side=tk.LEFT, padx=2)
+        self._create_tooltip(h_save_btn, "Update the selected harness with the instructions currently shown below.")
+
+        h_new_btn = ttk.Button(harness_bar, text="➕ Save As New...", width=14, command=self._save_harness_as_new)
+        h_new_btn.pack(side=tk.LEFT, padx=2)
+        self._create_tooltip(h_new_btn, "Save the current instructions as a new named reusable harness.")
+
+        h_ren_btn = ttk.Button(harness_bar, text="✏️ Rename", width=9, command=self._rename_current_harness)
+        h_ren_btn.pack(side=tk.LEFT, padx=2)
+
+        h_del_btn = ttk.Button(harness_bar, text="🗑 Delete", width=8, command=self._delete_current_harness)
+        h_del_btn.pack(side=tk.LEFT, padx=2)
+
+        text_container = ttk.Frame(prompt_frame)
+        text_container.pack(fill=tk.BOTH, expand=True)
+        self.system_prompt_text = tk.Text(text_container, height=7, wrap=tk.WORD, font=("Segoe UI", 9), padx=6, pady=4)
+        prompt_sb = ttk.Scrollbar(text_container, orient=tk.VERTICAL, command=self.system_prompt_text.yview)
         self.system_prompt_text.configure(yscrollcommand=prompt_sb.set)
         prompt_sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.system_prompt_text.pack(fill=tk.BOTH, expand=True)
+        self.system_prompt_text.bind("<KeyRelease>", lambda e: self._update_prompt_char_count())
 
-        ctx_frame = ttk.LabelFrame(t_prompt, text="Context Menu AI Actions", padding=8)
-        ctx_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        prompt_meta = ttk.Frame(prompt_frame)
+        prompt_meta.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(
+            prompt_meta,
+            text="Select a harness from the dropdown or edit below, then click Save to store updates for quick switching in AI Chat.",
+            font=("Segoe UI", 8), foreground="#64748b"
+        ).pack(side=tk.LEFT)
+        self.prompt_char_label = ttk.Label(prompt_meta, text="0 chars", font=("Segoe UI", 8), foreground="#5b21b6")
+        self.prompt_char_label.pack(side=tk.RIGHT)
+
+        ctx_frame = ttk.LabelFrame(t_prompt, text="Context Menu AI Actions", padding=10)
+        ctx_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
 
         ctx_top = ttk.Frame(ctx_frame)
         ctx_top.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(ctx_top, text="Right-click actions for selected text. Use {selection} as placeholder.",
-                  font=('Segoe UI', 8), foreground='#666666').pack(side=tk.LEFT)
-        ttk.Button(ctx_top, text="+ Add",
-                   command=self._add_context_action).pack(side=tk.RIGHT)
+        ttk.Label(
+            ctx_top, text="Right-click actions for selected text. Use {selection} as placeholder.",
+            font=('Segoe UI', 8), foreground='#64748b'
+        ).pack(side=tk.LEFT)
+        ttk.Button(ctx_top, text="➕ Add Action", command=self._add_context_action).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(ctx_top, text="↺ Reset Defaults", command=self._reset_context_actions).pack(side=tk.RIGHT)
 
         self.ctx_list_frame = ttk.Frame(ctx_frame)
         self.ctx_list_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.ctx_canvas = tk.Canvas(self.ctx_list_frame, height=120, bg='#ffffff', highlightthickness=0)
-        ctx_scrollbar = ttk.Scrollbar(self.ctx_list_frame, orient=tk.VERTICAL,
-                                       command=self.ctx_canvas.yview)
+        self.ctx_canvas = tk.Canvas(self.ctx_list_frame, height=115, bg='#ffffff', highlightthickness=0)
+        ctx_scrollbar = ttk.Scrollbar(self.ctx_list_frame, orient=tk.VERTICAL, command=self.ctx_canvas.yview)
         self.ctx_inner = ttk.Frame(self.ctx_canvas)
-        self.ctx_inner.bind('<Configure>',
-                             lambda e: self.ctx_canvas.configure(
-                                 scrollregion=self.ctx_canvas.bbox('all')))
+        self.ctx_inner.bind(
+            '<Configure>',
+            lambda e: self.ctx_canvas.configure(scrollregion=self.ctx_canvas.bbox('all'))
+        )
         self.ctx_canvas.create_window((0, 0), window=self.ctx_inner, anchor='nw')
         self.ctx_canvas.configure(yscrollcommand=ctx_scrollbar.set)
         self.ctx_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         ctx_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # Mousewheel support inside Context Menu Actions canvas
+        def _on_ctx_wheel(e):
+            if e.delta:
+                self.ctx_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        self.ctx_canvas.bind("<Enter>", lambda e: self.ctx_canvas.bind_all("<MouseWheel>", _on_ctx_wheel))
+        self.ctx_canvas.bind("<Leave>", lambda e: self.ctx_canvas.unbind_all("<MouseWheel>"))
+
         self.ctx_action_widgets = []
 
-        # ── Buttons (below notebook) ──────────────────────────────────── #
+        # ── Footer Separator & Action Buttons ─────────────────────────── #
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 8))
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X)
-        ttk.Button(btn_frame, text="Discard Changes",
-                   command=self.destroy).pack(side=tk.RIGHT, padx=(4, 0))
-        ttk.Button(btn_frame, text="Save Changes",
-                   command=self._save_settings).pack(side=tk.RIGHT)
-    
+
+        ttk.Button(btn_frame, text="↺ Reset Defaults", width=16, command=self._reset_to_defaults).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="✕ Discard Changes", width=16, command=self.destroy).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn_frame, text="✔ Save Changes", width=16, command=self._save_settings).pack(side=tk.RIGHT)
+
+        if isinstance(self.initial_tab, int) and 0 <= self.initial_tab < self.nb.index("end"):
+            self.nb.select(self.initial_tab)
+
+    def _update_header_badge(self):
+        if not hasattr(self, "header_status_badge"):
+            return
+        prov = self.provider_var.get()
+        names = {'agy': 'AGY', 'anthropic': 'Claude', 'gemini': 'Gemini', 'deepseek': 'DeepSeek', 'ollama': 'Ollama', 'cli': 'CLI'}
+        label = names.get(prov, prov.upper())
+        model = self.model_var.get().strip()
+
+        configured = False
+        if prov == 'agy':
+            configured = bool(self.agy_path_var.get().strip() or find_antigravity_cli_command())
+        elif prov == 'anthropic':
+            configured = bool(self.api_key_var.get().strip())
+        elif prov == 'gemini':
+            configured = bool(self.gemini_key_var.get().strip())
+        elif prov == 'deepseek':
+            configured = bool(self.deepseek_key_var.get().strip())
+        elif prov == 'ollama':
+            configured = bool(self.ollama_url_var.get().strip())
+        elif prov == 'cli':
+            configured = bool(self.cli_cmd_var.get().strip())
+
+        if configured:
+            short_model = (model[:22] + '…') if len(model) > 23 else model
+            badge_txt = f"● {label} · {short_model}" if short_model and short_model != '(managed by CLI)' else f"● {label} · Ready"
+            self.header_status_badge.config(text=badge_txt, fg="#bbf7d0", bg="#4c1d95")
+        else:
+            self.header_status_badge.config(text=f"○ {label} · Setup Required", fg="#fde68a", bg="#581c87")
+
+    def _apply_param_preset(self, temp: float, top_p: float):
+        self.temp_var.set(temp)
+        self.top_p_var.set(top_p)
+        self._update_temp_label()
+        self._update_top_p_label()
+
+    def _update_prompt_char_count(self):
+        if hasattr(self, "prompt_char_label") and hasattr(self, "system_prompt_text"):
+            cnt = len(self.system_prompt_text.get("1.0", "end-1c"))
+            self.prompt_char_label.config(text=f"{cnt:,} chars")
+
+    def _refresh_harness_combo(self):
+        names = [h['name'] for h in self._harnesses]
+        self.harness_combo['values'] = names
+        if self._active_harness not in names and names:
+            self._active_harness = names[0]
+        self.harness_var.set(self._active_harness)
+
+    def _on_harness_selected(self, event=None):
+        chosen = self.harness_var.get()
+        self._active_harness = chosen
+        for h in self._harnesses:
+            if h['name'] == chosen:
+                self.system_prompt_text.delete("1.0", tk.END)
+                self.system_prompt_text.insert("1.0", h['prompt'])
+                self._update_prompt_char_count()
+                break
+
+    def _save_current_harness(self):
+        name = self.harness_var.get().strip() or self._active_harness or 'Default Assistant'
+        prompt = self.system_prompt_text.get("1.0", "end-1c").strip()
+        for h in self._harnesses:
+            if h['name'] == name:
+                h['prompt'] = prompt
+                break
+        else:
+            self._harnesses.append({'name': name, 'prompt': prompt})
+        self._active_harness = name
+        self._refresh_harness_combo()
+        messagebox.showinfo("Harness Saved", f"Updated instruction harness '{name}'.", parent=self)
+
+    def _save_harness_as_new(self):
+        new_name = simpledialog.askstring("Save Harness As New", "Enter a name for this instruction harness:", parent=self)
+        if not new_name:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            return
+        prompt = self.system_prompt_text.get("1.0", "end-1c").strip()
+        for h in self._harnesses:
+            if h['name'] == new_name:
+                h['prompt'] = prompt
+                break
+        else:
+            self._harnesses.append({'name': new_name, 'prompt': prompt})
+        self._active_harness = new_name
+        self._refresh_harness_combo()
+
+    def _rename_current_harness(self):
+        old_name = self.harness_var.get().strip()
+        if not old_name:
+            return
+        new_name = simpledialog.askstring("Rename Harness", f"Rename '{old_name}' to:", initialvalue=old_name, parent=self)
+        if not new_name:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == old_name:
+            return
+        if any(h['name'] == new_name for h in self._harnesses):
+            messagebox.showwarning("Rename Harness", f"A harness named '{new_name}' already exists.", parent=self)
+            return
+        for h in self._harnesses:
+            if h['name'] == old_name:
+                h['name'] = new_name
+                break
+        self._active_harness = new_name
+        self._refresh_harness_combo()
+
+    def _delete_current_harness(self):
+        target = self.harness_var.get().strip()
+        if len(self._harnesses) <= 1:
+            messagebox.showwarning("Delete Harness", "At least one instruction harness must remain.", parent=self)
+            return
+        self._harnesses = [h for h in self._harnesses if h['name'] != target]
+        self._active_harness = self._harnesses[0]['name']
+        self._refresh_harness_combo()
+        self._on_harness_selected()
+
+    def _reset_context_actions(self):
+        for w in self.ctx_action_widgets:
+            w['frame'].destroy()
+        self.ctx_action_widgets.clear()
+        for action in AISettings.DEFAULT_SETTINGS['context_menu_actions']:
+            self._add_context_action_row(action.get('name', ''), action.get('prompt', ''), action.get('enabled', True))
+
+    def _reset_to_defaults(self):
+        if not messagebox.askyesno("Reset Defaults", "Reset generation parameters, harnesses prompt, and context actions to defaults?", parent=self):
+            return
+        self.max_tokens_var.set(1000000)
+        self._apply_param_preset(0.7, 1.0)
+        self.top_k_var.set(0)
+        self.img_size_var.set(512)
+        self._harnesses = [dict(h) for h in AISettings.DEFAULT_HARNESSES]
+        self._active_harness = 'Default Assistant'
+        self._refresh_harness_combo()
+        self._on_harness_selected()
+        self._reset_context_actions()
+
     def _auto_detect_agy_path(self):
         cmd = find_antigravity_cli_command()
         if cmd:
             self.agy_path_var.set(cmd)
+            self.conn_feedback_var.set(f"✔ Auto-detected AGY CLI at: {cmd}")
             messagebox.showinfo("Auto-detect", f"Found AGY CLI executable at:\n{cmd}", parent=self)
         else:
+            self.conn_feedback_var.set("⚠ Could not auto-detect AGY CLI executable.")
             messagebox.showwarning("Auto-detect", "Could not locate agy executable automatically. Please browse manually.", parent=self)
 
     def _browse_agy_path(self):
@@ -3199,33 +3600,35 @@ class AISettingsDialog(tk.Toplevel):
         self.top_p_var.set(self.settings.top_p)
         self.top_k_var.set(self.settings.top_k)
         self.img_size_var.set(self.settings.image_max_size[0])
-        self.system_prompt_text.insert(1.0, self.settings.system_prompt)
+        self._refresh_harness_combo()
+        self.system_prompt_text.delete("1.0", tk.END)
+        self.system_prompt_text.insert("1.0", self.settings.system_prompt)
+        self._update_prompt_char_count()
         self._update_temp_label()
         self._update_top_p_label()
-        self._on_provider_change()  # Update model list for current provider
-        
-        # Hide API key if already set
+        self._on_provider_change()
+
         if self.settings.api_key:
             self.api_key_entry.config(show="•")
         if self.settings.gemini_api_key:
             self.gemini_key_entry.config(show="•")
         if self.settings.deepseek_api_key:
             self.deepseek_key_entry.config(show="•")
-        
-        # Load context menu actions
+
         self._load_context_actions()
+        self._update_header_badge()
 
     def _load_context_actions(self):
         """Populate context menu actions list from settings"""
-        # Clear existing
         for w in self.ctx_action_widgets:
             w['frame'].destroy()
         self.ctx_action_widgets.clear()
-        
+
         actions = self.settings.context_menu_actions
         for action in actions:
-            self._add_context_action_row(action.get('name', ''), action.get('prompt', ''),
-                                          action.get('enabled', True))
+            self._add_context_action_row(
+                action.get('name', ''), action.get('prompt', ''), action.get('enabled', True)
+            )
 
     def _add_context_action(self):
         """Add a new empty context menu action row"""
@@ -3235,27 +3638,27 @@ class AISettingsDialog(tk.Toplevel):
         """Add a single context action row to the config UI"""
         row_frame = ttk.Frame(self.ctx_inner)
         row_frame.pack(fill=tk.X, pady=2, padx=2)
-        
+
         enabled_var = tk.BooleanVar(value=enabled)
         ttk.Checkbutton(row_frame, variable=enabled_var).pack(side=tk.LEFT, padx=(0, 3))
-        
+
         name_var = tk.StringVar(value=name)
-        name_entry = ttk.Entry(row_frame, textvariable=name_var, width=14)
-        name_entry.pack(side=tk.LEFT, padx=(0, 3))
-        
+        name_entry = ttk.Entry(row_frame, textvariable=name_var, width=15)
+        name_entry.pack(side=tk.LEFT, padx=(0, 4))
+
         prompt_var = tk.StringVar(value=prompt)
-        prompt_entry = ttk.Entry(row_frame, textvariable=prompt_var, width=35)
-        prompt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
-        
-        # Special handling: "Transfer to Chat" has no prompt field
-        is_transfer = (name == 'Transfer to Chat')
-        if is_transfer:
+        prompt_entry = ttk.Entry(row_frame, textvariable=prompt_var, width=38)
+        prompt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+
+        if name == 'Transfer to Chat':
             prompt_entry.config(state=tk.DISABLED)
-        
-        remove_btn = ttk.Button(row_frame, text="\u2212", width=2,
-                                 command=lambda: self._remove_context_action(row_frame))
+
+        remove_btn = ttk.Button(
+            row_frame, text="🗑", width=3,
+            command=lambda: self._remove_context_action(row_frame)
+        )
         remove_btn.pack(side=tk.RIGHT)
-        
+
         self.ctx_action_widgets.append({
             'frame': row_frame,
             'enabled_var': enabled_var,
@@ -3270,42 +3673,35 @@ class AISettingsDialog(tk.Toplevel):
                 self.ctx_action_widgets.remove(w)
                 break
         frame.destroy()
-    
+
     def _toggle_key_visibility(self):
         """Toggle Anthropic API key visibility"""
-        if self.show_key_var.get():
-            self.api_key_entry.config(show="")
-        else:
-            self.api_key_entry.config(show="•")
-    
+        self.api_key_entry.config(show="" if self.show_key_var.get() else "•")
+
     def _toggle_gemini_key_visibility(self):
         """Toggle Gemini API key visibility"""
-        if self.show_gemini_key_var.get():
-            self.gemini_key_entry.config(show="")
-        else:
-            self.gemini_key_entry.config(show="•")
-    
+        self.gemini_key_entry.config(show="" if self.show_gemini_key_var.get() else "•")
+
     def _toggle_deepseek_key_visibility(self):
         """Toggle DeepSeek API key visibility"""
-        if self.show_deepseek_key_var.get():
-            self.deepseek_key_entry.config(show="")
-        else:
-            self.deepseek_key_entry.config(show="•")
-    
+        self.deepseek_key_entry.config(show="" if self.show_deepseek_key_var.get() else "•")
+
     def _update_temp_label(self, *args):
         """Update temperature label"""
         self.temp_label.config(text=f"{self.temp_var.get():.2f}")
-    
+
     def _update_top_p_label(self, *args):
         """Update top-p label"""
         self.top_p_label.config(text=f"{self.top_p_var.get():.2f}")
-    
+
     def _on_provider_change(self, event=None):
-        """Handle provider change: update credential panel and model list."""
+        """Handle provider change: update credential panel, description, and model list."""
         provider = self.provider_var.get()
         current_model = self.model_var.get()
 
-        # Show only the relevant credential sub-frame
+        if hasattr(self, "provider_desc_label"):
+            self.provider_desc_label.config(text=self.PROVIDER_DESCRIPTIONS.get(provider, ''))
+
         for p, f in self._cred_frames.items():
             if p == provider:
                 f.pack(fill=tk.X)
@@ -3319,10 +3715,10 @@ class AISettingsDialog(tk.Toplevel):
             current_agy = self.settings.agy_model
             self.model_var.set(current_agy if current_agy in models else (models[0] if models else AISettings.AGY_MODELS[0]))
         elif provider == 'cli':
-            # CLI manages its own model; disable model selection
             self.model_combo['values'] = []
             self.model_var.set('(managed by CLI)')
             self.model_combo.config(state='disabled')
+            self._update_header_badge()
             return
 
         self.model_combo.config(state='normal')
@@ -3351,11 +3747,13 @@ class AISettingsDialog(tk.Toplevel):
             self.model_combo['values'] = models
             if current_model not in models:
                 self.model_var.set(models[0] if models else '')
-    
+
+        self._update_header_badge()
+
     def _refresh_models(self):
         """Fetch available models from the API and cache them"""
         provider = self.provider_var.get()
-        
+
         if provider in ('agy', 'antigravity'):
             cli_cmd = self.agy_path_var.get().strip()
             try:
@@ -3366,10 +3764,13 @@ class AISettingsDialog(tk.Toplevel):
                         self.model_var.set(models[0])
                     self.settings.set('cached_agy_models', models)
                     self.settings.save()
+                    self.conn_feedback_var.set(f"✔ Loaded {len(models)} AGY models.")
                     messagebox.showinfo("Success", f"Found {len(models)} AGY models (cached).", parent=self)
                 else:
+                    self.conn_feedback_var.set("⚠ No AGY models returned.")
                     messagebox.showwarning("Warning", "No AGY models found.", parent=self)
             except Exception as e:
+                self.conn_feedback_var.set(f"✖ AGY error: {str(e)}")
                 messagebox.showerror("Error", f"Failed to fetch AGY models: {str(e)}", parent=self)
 
         elif provider == 'anthropic':
@@ -3382,15 +3783,16 @@ class AISettingsDialog(tk.Toplevel):
                 models = client.get_available_models()
                 if models:
                     self.model_combo['values'] = models
-                    # Cache the models to settings
                     self.settings.set('cached_anthropic_models', models)
                     self.settings.save()
+                    self.conn_feedback_var.set(f"✔ Loaded {len(models)} Anthropic models.")
                     messagebox.showinfo("Success", f"Found {len(models)} Anthropic models (cached).", parent=self)
                 else:
                     messagebox.showwarning("Warning", "No models found.", parent=self)
             except Exception as e:
+                self.conn_feedback_var.set(f"✖ Failed to fetch Anthropic models: {e}")
                 messagebox.showerror("Error", f"Failed to fetch models: {str(e)}", parent=self)
-        
+
         elif provider == 'gemini':
             api_key = self.gemini_key_var.get()
             if not api_key:
@@ -3401,15 +3803,16 @@ class AISettingsDialog(tk.Toplevel):
                 models = client.get_available_models()
                 if models:
                     self.model_combo['values'] = models
-                    # Cache the models to settings
                     self.settings.set('cached_gemini_models', models)
                     self.settings.save()
+                    self.conn_feedback_var.set(f"✔ Loaded {len(models)} Gemini models.")
                     messagebox.showinfo("Success", f"Found {len(models)} Gemini models (cached).", parent=self)
                 else:
                     messagebox.showwarning("Warning", "No models found.", parent=self)
             except Exception as e:
+                self.conn_feedback_var.set(f"✖ Failed to fetch Gemini models: {e}")
                 messagebox.showerror("Error", f"Failed to fetch models: {str(e)}", parent=self)
-        
+
         elif provider == 'deepseek':
             api_key = self.deepseek_key_var.get()
             if not api_key:
@@ -3420,15 +3823,16 @@ class AISettingsDialog(tk.Toplevel):
                 models = client.get_available_models()
                 if models:
                     self.model_combo['values'] = models
-                    # Cache the models to settings
                     self.settings.set('cached_deepseek_models', models)
                     self.settings.save()
+                    self.conn_feedback_var.set(f"✔ Loaded {len(models)} DeepSeek models.")
                     messagebox.showinfo("Success", f"Found {len(models)} DeepSeek models (cached).", parent=self)
                 else:
                     messagebox.showwarning("Warning", "No models found.", parent=self)
             except Exception as e:
+                self.conn_feedback_var.set(f"✖ Failed to fetch DeepSeek models: {e}")
                 messagebox.showerror("Error", f"Failed to fetch models: {str(e)}", parent=self)
-        
+
         elif provider == 'ollama':
             ollama_url = self.ollama_url_var.get()
             try:
@@ -3436,26 +3840,26 @@ class AISettingsDialog(tk.Toplevel):
                 models = client.get_available_models()
                 if models:
                     self.model_combo['values'] = models
-                    # Cache the models to settings
                     self.settings.set('cached_ollama_models', models)
                     self.settings.save()
+                    self.conn_feedback_var.set(f"✔ Loaded {len(models)} Ollama models.")
                     messagebox.showinfo("Success", f"Found {len(models)} Ollama models (cached).", parent=self)
                 else:
                     messagebox.showwarning("Warning", "No models found. Run 'ollama pull <model>' to download models.", parent=self)
             except Exception as e:
+                self.conn_feedback_var.set(f"✖ Ollama connection error: {e}")
                 messagebox.showerror("Error", f"Failed to fetch models: {str(e)}", parent=self)
-    
+
     def _test_connection(self, provider: str = None):
         """Test API connection for specified provider and cache models on success"""
         if provider is None:
             provider = self.provider_var.get()
-        
+
         client = None
         if provider in ('agy', 'antigravity'):
             cli_cmd = self.agy_path_var.get().strip()
             effort = self.agy_effort_var.get().strip() or 'low'
             model = self.model_var.get().strip() or AISettings.AGY_MODELS[0]
-            # Discover and validate available AGY models first
             try:
                 discovered = list_antigravity_models(cli_cmd, raise_on_error=True)
                 if discovered:
@@ -3468,6 +3872,7 @@ class AISettingsDialog(tk.Toplevel):
                     self.settings.agy_model = model
                     self.settings.save()
             except Exception as e:
+                self.conn_feedback_var.set(f"✖ AGY check failed: {e}")
                 messagebox.showerror("Error", f"AGY CLI model check failed: {e}", parent=self)
                 return
             client = AgyClient(model=model, effort=effort, cli_command=cli_cmd)
@@ -3504,6 +3909,7 @@ class AISettingsDialog(tk.Toplevel):
                 return
             client = CliClient(cmd)
             success, message = client.test_connection()
+            self.conn_feedback_var.set(f"✔ {message}" if success else f"✖ {message}")
             if success:
                 messagebox.showinfo("Success", message, parent=self)
             else:
@@ -3512,33 +3918,35 @@ class AISettingsDialog(tk.Toplevel):
         else:
             messagebox.showwarning("Warning", "Unknown provider.", parent=self)
             return
-        
+
         if success:
-            # Also fetch and cache models on successful connection
             try:
                 models = client.get_available_models()
                 if models:
                     self.model_combo['values'] = models
-                    # Cache models based on provider
                     if provider in ('agy', 'antigravity'):
                         self.settings.set('cached_agy_models', models)
                     elif provider == 'anthropic':
                         self.settings.set('cached_anthropic_models', models)
                     elif provider == 'gemini':
                         self.settings.set('cached_gemini_models', models)
+                    elif provider == 'deepseek':
+                        self.settings.set('cached_deepseek_models', models)
                     elif provider == 'ollama':
                         self.settings.set('cached_ollama_models', models)
                     self.settings.save()
                     message += f"\nLoaded {len(models)} models."
             except Exception as e:
                 message += f"\n(Could not fetch models: {e})"
-            
+
+            self.conn_feedback_var.set(f"✔ {message.splitlines()[0]}")
             messagebox.showinfo("Success", message, parent=self)
         else:
+            self.conn_feedback_var.set(f"✖ {message}")
             messagebox.showerror("Error", message, parent=self)
-    
+
     def _save_settings(self):
-        """Save settings and close dialog"""
+        """Save settings, harnesses, and actions, then close dialog."""
         self.settings.provider = self.provider_var.get()
         self.settings.api_key = self.api_key_var.get()
         self.settings.gemini_api_key = self.gemini_key_var.get()
@@ -3550,7 +3958,6 @@ class AISettingsDialog(tk.Toplevel):
         if self.provider_var.get() in ('agy', 'antigravity'):
             self.settings.agy_model = self.model_var.get().strip()
 
-        # Don't save '(managed by CLI)' placeholder as the model
         saved_model = self.model_var.get()
         if saved_model != '(managed by CLI)':
             self.settings.model = saved_model
@@ -3559,9 +3966,12 @@ class AISettingsDialog(tk.Toplevel):
         self.settings.top_p = self.top_p_var.get()
         self.settings.top_k = self.top_k_var.get()
         self.settings.image_max_size = (self.img_size_var.get(), self.img_size_var.get())
-        self.settings.system_prompt = self.system_prompt_text.get(1.0, tk.END).strip()
-        
-        # Save context menu actions
+
+        prompt_val = self.system_prompt_text.get(1.0, tk.END).strip()
+        self.settings.prompt_harnesses = self._harnesses
+        self.settings.active_harness = self._active_harness
+        self.settings.system_prompt = prompt_val
+
         actions = []
         for w in self.ctx_action_widgets:
             actions.append({
@@ -3570,7 +3980,7 @@ class AISettingsDialog(tk.Toplevel):
                 'enabled': w['enabled_var'].get(),
             })
         self.settings.context_menu_actions = actions
-        
+
         if self.settings.save():
             self.result = True
             if self.on_save:
@@ -3952,6 +4362,25 @@ class ChatSidebar(tk.Frame):
         self.include_history_cb = check("Include Chat History", self.include_history_var,
                                         "Include prior messages from this chat session so the AI maintains multi-turn conversation context.")
         self.include_history_cb.pack(side=tk.LEFT)
+
+        harness_row = self._reg(tk.Frame(self), bg='panel')
+        harness_row.pack(fill=tk.X, padx=8, pady=(2, 2))
+        self._reg(tk.Label(harness_row, text="Harness:", font=(SANS_FONT, 8)),
+                  bg='panel', fg='muted').pack(side=tk.LEFT, padx=(2, 4))
+        self.harness_quick_var = tk.StringVar(value=self.settings.active_harness)
+        self.harness_quick_cb = ttk.Combobox(
+            harness_row, textvariable=self.harness_quick_var, width=22,
+            state='readonly', values=self.settings.get_harness_names()
+        )
+        self.harness_quick_cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.harness_quick_cb.bind('<<ComboboxSelected>>', self._on_quick_harness_select)
+        ToolTip(self.harness_quick_cb, "Switch saved system instruction harness quickly without opening Config.")
+
+        harness_mgr_btn = self._flat_button(
+            harness_row, "⚙", lambda: self._open_settings(initial_tab=2), width=3, font_size=8
+        )
+        harness_mgr_btn.pack(side=tk.LEFT, padx=(4, 0))
+        ToolTip(harness_mgr_btn, "Open Harnesses & Actions tab in Config to save, rename, or edit system instructions.")
 
         limit_row = self._reg(tk.Frame(self), bg='panel')
         limit_row.pack(fill=tk.X, padx=8, pady=(0, 2))
@@ -5008,9 +5437,15 @@ class ChatSidebar(tk.Frame):
             self._messages = []
             self._render_all()
 
-    def _open_settings(self):
+    def _open_settings(self, initial_tab: int = 0):
         """Open settings dialog"""
-        AISettingsDialog(self.winfo_toplevel(), self.settings, on_save=self._on_settings_saved)
+        AISettingsDialog(self.winfo_toplevel(), self.settings, on_save=self._on_settings_saved, initial_tab=initial_tab)
+
+    def _on_quick_harness_select(self, event=None):
+        """Activate selected reusable instruction harness directly from the chat sidebar."""
+        name = self.harness_quick_var.get()
+        if self.settings.select_harness(name) is not None:
+            self._flash_status(f"Harness active: {name}")
 
     def _on_settings_saved(self):
         """Called when settings are saved"""
@@ -5019,6 +5454,9 @@ class ChatSidebar(tk.Frame):
         if self._editing:
             self._update_edit_banner()
         self.history_limit_var.set(self._limit_to_text(self.settings.history_limit))
+        if hasattr(self, 'harness_quick_cb'):
+            self.harness_quick_cb['values'] = self.settings.get_harness_names()
+            self.harness_quick_var.set(self.settings.active_harness)
         self.status_label.config(text="Settings saved")
 
     def set_document_id(self, doc_id: Optional[str]):
@@ -5038,6 +5476,9 @@ class ChatSidebar(tk.Frame):
         self._init_llm_client()
         self._update_badge()
         self.history_limit_var.set(self._limit_to_text(self.settings.history_limit))
+        if hasattr(self, 'harness_quick_cb'):
+            self.harness_quick_cb['values'] = self.settings.get_harness_names()
+            self.harness_quick_var.set(self.settings.active_harness)
 
     # === Transfer to Chat / Selection Methods ===
 

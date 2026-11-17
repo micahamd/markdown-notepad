@@ -8212,18 +8212,27 @@ class ThemeDialog(tk.Toplevel):
         self.transient(parent)
         
         self._setup_ui()
-        _fit_and_center_dialog(self, parent, 560, 740)
+        _fit_and_center_dialog(self, parent, 860, 720)
         
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Escape>", lambda e: self.destroy())
     
     def _setup_ui(self):
-        """Setup the dialog UI"""
+        """Setup two-column Theme dialog with MS Word 2003-style live template preview."""
         main_frame = ttk.Frame(self, padding=15)
         main_frame.pack(fill=tk.BOTH, expand=True)
+
+        content_row = ttk.Frame(main_frame)
+        content_row.pack(fill=tk.BOTH, expand=True)
+
+        controls_col = ttk.Frame(content_row)
+        controls_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
+
+        preview_col = ttk.Frame(content_row)
+        preview_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False)
         
         # Presets section
-        preset_frame = ttk.LabelFrame(main_frame, text="Presets", padding=10)
+        preset_frame = ttk.LabelFrame(controls_col, text="Presets", padding=10)
         preset_frame.pack(fill=tk.X, pady=(0, 10))
         
         preset_btn_frame = ttk.Frame(preset_frame)
@@ -8237,7 +8246,7 @@ class ThemeDialog(tk.Toplevel):
             btn.grid(row=i//3, column=i%3, padx=3, pady=3, sticky="ew")
         
         # Source Editor section
-        source_frame = ttk.LabelFrame(main_frame, text="Source Editor", padding=10)
+        source_frame = ttk.LabelFrame(controls_col, text="Source Editor", padding=10)
         source_frame.pack(fill=tk.X, pady=5)
         
         # Background color
@@ -8264,8 +8273,8 @@ class ThemeDialog(tk.Toplevel):
         font_frame = ttk.Frame(source_frame)
         font_frame.pack(fill=tk.X, pady=2)
         ttk.Label(font_frame, text="Font:", width=12).pack(side=tk.LEFT)
-        self.source_font_var = tk.StringVar(value=self.theme['source_font'])
-        self.source_font_combo = ttk.Combobox(font_frame, textvariable=self.source_font_var, width=15,
+        self.source_font_var = tk.StringVar(value=self.theme.get('source_font') or MONO_FONT or 'Consolas')
+        self.source_font_combo = ttk.Combobox(font_frame, textvariable=self.source_font_var, width=16,
                                   values=['Consolas', 'Courier New', 'Cascadia Code', 'Fira Code', 
                                          'Source Code Pro', 'Monaco', 'Menlo'])
         self.source_font_combo.pack(side=tk.LEFT, padx=2)
@@ -8277,7 +8286,7 @@ class ThemeDialog(tk.Toplevel):
         size_spin.pack(side=tk.LEFT, padx=2)
         
         # Visual Mode section
-        visual_frame = ttk.LabelFrame(main_frame, text="Visual Mode", padding=10)
+        visual_frame = ttk.LabelFrame(controls_col, text="Visual Mode", padding=10)
         visual_frame.pack(fill=tk.X, pady=5)
         
         # Background color
@@ -8304,8 +8313,8 @@ class ThemeDialog(tk.Toplevel):
         vfont_frame = ttk.Frame(visual_frame)
         vfont_frame.pack(fill=tk.X, pady=2)
         ttk.Label(vfont_frame, text="Font:", width=12).pack(side=tk.LEFT)
-        self.visual_font_var = tk.StringVar(value=self.theme['visual_font'])
-        self.visual_font_combo = ttk.Combobox(vfont_frame, textvariable=self.visual_font_var, width=15,
+        self.visual_font_var = tk.StringVar(value=self.theme.get('visual_font') or VISUAL_FONT or 'Segoe UI')
+        self.visual_font_combo = ttk.Combobox(vfont_frame, textvariable=self.visual_font_var, width=16,
                                    values=['Segoe UI', 'Arial', 'Calibri', 'Georgia', 'Times New Roman',
                                           'Verdana', 'Trebuchet MS'])
         self.visual_font_combo.pack(side=tk.LEFT, padx=2)
@@ -8317,7 +8326,7 @@ class ThemeDialog(tk.Toplevel):
         vsize_spin.pack(side=tk.LEFT, padx=2)
         
         # Desk (background behind the page)
-        desk_frame = ttk.LabelFrame(main_frame, text="Page Layout & Blockquote", padding=10)
+        desk_frame = ttk.LabelFrame(controls_col, text="Page Layout & Blockquote", padding=10)
         desk_frame.pack(fill=tk.X, pady=5)
         
         dbg_frame = ttk.Frame(desk_frame)
@@ -8333,30 +8342,223 @@ class ThemeDialog(tk.Toplevel):
         bq_btn_row.pack(fill=tk.X, pady=(6, 0))
         ttk.Button(
             bq_btn_row,
-            text="❝ Customize Blockquote Style (Font, Color, Padding, Justification)...",
+            text="❝ Customize Blockquote Style...",
             command=lambda: BlockquoteStyleDialog(self, self.theme, self._on_blockquote_updated)
         ).pack(side=tk.LEFT)
         
         # Font Detection Section
-        detect_frame = ttk.Frame(main_frame)
-        detect_frame.pack(fill=tk.X, pady=(10, 0))
+        detect_frame = ttk.Frame(controls_col)
+        detect_frame.pack(fill=tk.X, pady=(8, 0))
         detect_btn = ttk.Button(detect_frame, text="🔍 Detect System Fonts", 
                                 command=self._detect_fonts)
         detect_btn.pack(anchor=tk.CENTER)
         ttk.Label(detect_frame, text="Populates font lists with all available system fonts",
                  font=(SANS_FONT, 8), foreground="#666666").pack(anchor=tk.CENTER, pady=(2, 0))
+
+        # Right Pane: MS Word 2003-style Live Document Template Preview
+        preview_frame = ttk.LabelFrame(preview_col, text="Document Template Preview", padding=10)
+        preview_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.preview_canvas = tk.Canvas(
+            preview_frame, width=340, height=490,
+            relief=tk.SUNKEN, bd=2, highlightthickness=0, bg="#ffffff"
+        )
+        self.preview_canvas.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            preview_frame,
+            text="Live preview of Ribbon, Desk, Visual Document Page, Blockquote, Source Code Inset, and Status Bar.",
+            font=(SANS_FONT, 8), foreground="#666666", wraplength=330, justify=tk.LEFT
+        ).pack(fill=tk.X, pady=(6, 0))
+
+        # Wire live updates on variable changes
+        for var in (
+            self.source_bg_var, self.source_fg_var, self.source_font_var, self.source_size_var,
+            self.visual_bg_var, self.visual_fg_var, self.visual_font_var, self.visual_size_var,
+            self.desk_bg_var,
+        ):
+            var.trace_add("write", self._update_template_preview)
+
+        self._update_template_preview()
         
         # Buttons
         btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, pady=(15, 0))
+        btn_frame.pack(fill=tk.X, pady=(12, 0))
         
         ttk.Button(btn_frame, text="Apply", command=self._apply, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Reset to Default", command=self._reset).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=self.destroy, width=10).pack(side=tk.RIGHT, padx=5)
 
+    @staticmethod
+    def _safe_hex(color_val: str, fallback: str) -> str:
+        val = (color_val or "").strip()
+        if re.match(r'^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$', val):
+            return val
+        return fallback
+
+    @staticmethod
+    def _safe_int(var, fallback: int, lo: int = 8, hi: int = 24) -> int:
+        try:
+            v = int(var.get())
+            return max(lo, min(hi, v))
+        except Exception:
+            return fallback
+
+    @staticmethod
+    def _is_dark_hex(hex_color: str) -> bool:
+        try:
+            h = hex_color.lstrip('#')
+            if len(h) == 3:
+                h = ''.join(ch * 2 for ch in h)
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            return (0.299 * r + 0.587 * g + 0.114 * b) < 128
+        except Exception:
+            return False
+
+    def _update_template_preview(self, *args):
+        """Render MS Word 2003-style live mini document & source template preview."""
+        if not hasattr(self, "preview_canvas"):
+            return
+        c = self.preview_canvas
+        c.delete("all")
+
+        default = MarkdownNotepad.DEFAULT_THEME
+        s_bg = self._safe_hex(self.source_bg_var.get(), default['source_bg'])
+        s_fg = self._safe_hex(self.source_fg_var.get(), default['source_fg'])
+        v_bg = self._safe_hex(self.visual_bg_var.get(), default['visual_bg'])
+        v_fg = self._safe_hex(self.visual_fg_var.get(), default['visual_fg'])
+        d_bg = self._safe_hex(self.desk_bg_var.get(), default.get('desk_bg', '#dcd6e8'))
+
+        # Keep swatch indicators synchronized cleanly when typing hex codes
+        swatch_map = (
+            (self.source_bg_preview, s_bg),
+            (self.source_fg_preview, s_fg),
+            (self.visual_bg_preview, v_bg),
+            (self.visual_fg_preview, v_fg),
+            (self.desk_bg_preview, d_bg),
+        )
+        for sw, hex_col in swatch_map:
+            try:
+                sw.config(bg=hex_col)
+            except tk.TclError:
+                pass
+
+        s_font = (self.source_font_var.get() or MONO_FONT or 'Consolas').strip()
+        v_font = (self.visual_font_var.get() or VISUAL_FONT or 'Segoe UI').strip()
+        s_size_raw = self._safe_int(self.source_size_var, 11)
+        v_size_raw = self._safe_int(self.visual_size_var, 11)
+
+        # Scaled font sizes suited for the 340x490 mini template canvas
+        v_scaled = max(7, min(13, int(round(v_size_raw * 0.78))))
+        v_h1_scaled = max(10, min(17, v_scaled + 3))
+        s_scaled = max(7, min(12, int(round(s_size_raw * 0.75))))
+
+        rib_bg = self._safe_hex(self.theme.get('ribbon_bg', default['ribbon_bg']), '#f3effa')
+        stat_bg = self._safe_hex(self.theme.get('status_bg', default['status_bg']), '#3b1d6e')
+        stat_fg = self._safe_hex(self.theme.get('status_fg', default['status_fg']), '#f5f3ff')
+        accent = self._safe_hex(self.theme.get('accent_purple', default['accent_purple']), '#5b21b6')
+        rib_fg = "#f3e8ff" if self._is_dark_hex(rib_bg) else "#1e1b4b"
+        rib_btn_bg = "#3b235a" if self._is_dark_hex(rib_bg) else "#ffffff"
+        rib_border = "#6b21a8" if self._is_dark_hex(rib_bg) else "#d8b4fe"
+
+        # 1. Mini Word Ribbon Bar (y=0..32)
+        c.create_rectangle(0, 0, 340, 32, fill=rib_bg, outline="", tags="preview_ribbon")
+        c.create_line(0, 32, 340, 32, fill=accent, width=2, tags="preview_ribbon")
+        px = 10
+        for pill_lbl in ("New", "Save", "B", "I", "Theme"):
+            pw = max(22, len(pill_lbl) * 6 + 10)
+            c.create_rectangle(px, 6, px + pw, 25, fill=rib_btn_bg, outline=rib_border, width=1, tags="preview_ribbon")
+            c.create_text(
+                px + pw // 2, 16, text=pill_lbl,
+                font=("Segoe UI", 7, "bold" if pill_lbl == "B" else "normal"),
+                fill=rib_fg, tags="preview_ribbon"
+            )
+            px += pw + 6
+
+        # 2. Desk Surface (y=33..462)
+        c.create_rectangle(0, 33, 340, 462, fill=d_bg, outline="", tags="preview_desk")
+
+        # 3. Visual Document Page with Drop Shadow (x=20..320, y=46..328)
+        c.create_rectangle(24, 50, 324, 332, fill="#555555", outline="", tags="preview_page")
+        c.create_rectangle(20, 46, 320, 328, fill=v_bg, outline="#888888", width=1, tags="preview_page")
+
+        # Classic MS Word 2003 Margin Crop Marks (18px inner margins -> 38..302, 64..310)
+        ml, mr, mt, mb = 38, 302, 64, 310
+        crop_col = "#94a3b8"
+        c.create_line(ml - 7, mt, ml, mt, ml, mt - 7, fill=crop_col, width=1, tags="preview_page")
+        c.create_line(mr + 7, mt, mr, mt, mr, mt - 7, fill=crop_col, width=1, tags="preview_page")
+        c.create_line(ml - 7, mb, ml, mb, ml, mb + 7, fill=crop_col, width=1, tags="preview_page")
+        c.create_line(mr + 7, mb, mr, mb, mr, mb + 7, fill=crop_col, width=1, tags="preview_page")
+
+        # Document H1 Title + Horizontal Rule
+        h1_col = accent if not self._is_dark_hex(v_bg) else v_fg
+        c.create_text(
+            ml + 4, mt + 6, text="Document Template",
+            font=(v_font, v_h1_scaled, "bold"), fill=h1_col, anchor="nw", tags="preview_page"
+        )
+        c.create_line(ml + 4, mt + 28, mr - 4, mt + 28, fill=accent, width=1, tags="preview_page")
+
+        # Body Prose Paragraph
+        body_text = (
+            "The quick brown fox jumps over the lazy dog. "
+            "Preview how headings, prose typography, and margins appear on the printed page."
+        )
+        c.create_text(
+            ml + 4, mt + 36, text=body_text,
+            font=(v_font, v_scaled), fill=v_fg, width=254, anchor="nw", tags="preview_page"
+        )
+
+        # Blockquote Sample Box inside Page
+        bq_bg = self._safe_hex(self.theme.get('blockquote_bg', ''), "#2d1d42" if self._is_dark_hex(v_bg) else "#f5f3ff")
+        bq_fg = self._safe_hex(self.theme.get('blockquote_fg', ''), v_fg)
+        bq_bar = self._safe_hex(self.theme.get('blockquote_bar_fg', ''), accent)
+        bq_font = (self.theme.get('blockquote_font') or v_font).strip()
+        bq_raw_sz = int(self.theme.get('blockquote_size') or 0)
+        bq_scaled = max(7, min(13, int(round((bq_raw_sz if bq_raw_sz > 0 else v_size_raw) * 0.78))))
+        bq_style = self.theme.get('blockquote_style') or 'italic'
+        bq_justify = self.theme.get('blockquote_justify') or 'left'
+        bq_y0, bq_y1 = mt + 106, mt + 150
+        c.create_rectangle(ml + 6, bq_y0, mr - 6, bq_y1, fill=bq_bg, outline="", tags="preview_page")
+        c.create_line(ml + 8, bq_y0, ml + 8, bq_y1, fill=bq_bar, width=4, tags="preview_page")
+        bq_tx = ml + 18 if bq_justify == 'left' else ((ml + mr) // 2 if bq_justify == 'center' else mr - 14)
+        bq_anc = 'w' if bq_justify == 'left' else ('center' if bq_justify == 'center' else 'e')
+        c.create_text(
+            bq_tx, (bq_y0 + bq_y1) // 2,
+            text="\"Blockquote style & indentation preview.\"",
+            font=(bq_font, bq_scaled, bq_style), fill=bq_fg, anchor=bq_anc, width=224, tags="preview_page"
+        )
+
+        # Sample Bulleted List Rows inside Page
+        c.create_text(
+            ml + 10, bq_y1 + 12,
+            text="• Primary section outline item\n• Secondary formatted note sample",
+            font=(v_font, max(7, v_scaled - 1)), fill=v_fg, anchor="nw", tags="preview_page"
+        )
+
+        # 4. Source Editor Template Card (x=20..320, y=340..450)
+        c.create_rectangle(24, 344, 324, 454, fill="#555555", outline="", tags="preview_source")
+        c.create_rectangle(20, 340, 320, 450, fill=s_bg, outline="#888888", width=1, tags="preview_source")
+        c.create_rectangle(20, 340, 175, 358, fill=accent, outline="", tags="preview_source")
+        c.create_text(
+            28, 349, text="Source View (Markdown)",
+            font=("Segoe UI", 7, "bold"), fill="#ffffff", anchor="w", tags="preview_source"
+        )
+        c.create_text(
+            32, 368,
+            text="# Heading 1\n**Bold text** and `inline_code`\n> Markdown source preview",
+            font=(s_font, s_scaled), fill=s_fg, anchor="nw", tags="preview_source"
+        )
+
+        # 5. Mini Status Bar (y=462..490)
+        c.create_rectangle(0, 462, 340, 490, fill=stat_bg, outline="", tags="preview_status")
+        c.create_text(
+            12, 476, text="Page 1  |  142 words  |  Visual View",
+            font=("Segoe UI", 8), fill=stat_fg, anchor="w", tags="preview_status"
+        )
+
     def _on_blockquote_updated(self, updated_theme):
         """Merge blockquote updates from BlockquoteStyleDialog into ThemeDialog's working theme."""
         self.theme.update(updated_theme)
+        self._update_template_preview()
         self.on_apply(self.theme)
     
     def _detect_fonts(self):
@@ -8406,11 +8608,16 @@ class ThemeDialog(tk.Toplevel):
         if color[1]:
             var.set(color[1])
             preview.config(bg=color[1])
+            self._update_template_preview()
     
     def _apply_preset(self, preset_name):
-        """Apply a preset theme"""
+        """Apply a preset theme including chrome keys and update preview."""
         preset = self.PRESETS[preset_name]
-        
+        default = MarkdownNotepad.DEFAULT_THEME
+
+        for chrome_key in ('ribbon_bg', 'status_bg', 'status_fg', 'accent_purple'):
+            self.theme[chrome_key] = preset.get(chrome_key, default[chrome_key])
+
         self.source_bg_var.set(preset['source_bg'])
         self.source_bg_preview.config(bg=preset['source_bg'])
         self.source_fg_var.set(preset['source_fg'])
@@ -8422,6 +8629,7 @@ class ThemeDialog(tk.Toplevel):
         if 'desk_bg' in preset:
             self.desk_bg_var.set(preset['desk_bg'])
             self.desk_bg_preview.config(bg=preset['desk_bg'])
+        self._update_template_preview()
     
     def _apply(self):
         """Apply the current settings (merged into the existing theme so other keys survive)"""
@@ -8430,11 +8638,11 @@ class ThemeDialog(tk.Toplevel):
             'source_bg': self.source_bg_var.get(),
             'source_fg': self.source_fg_var.get(),
             'source_font': self.source_font_var.get() or MONO_FONT,
-            'source_font_size': self.source_size_var.get(),
+            'source_font_size': self._safe_int(self.source_size_var, 11),
             'visual_bg': self.visual_bg_var.get(),
             'visual_fg': self.visual_fg_var.get(),
             'visual_font': self.visual_font_var.get() or VISUAL_FONT,
-            'visual_font_size': self.visual_size_var.get(),
+            'visual_font_size': self._safe_int(self.visual_size_var, 11),
             'desk_bg': self.desk_bg_var.get(),
         }
         self.on_apply(self.theme)
@@ -8443,7 +8651,10 @@ class ThemeDialog(tk.Toplevel):
     def _reset(self):
         """Reset to default theme"""
         default = MarkdownNotepad.DEFAULT_THEME
-        
+
+        for chrome_key in ('ribbon_bg', 'status_bg', 'status_fg', 'accent_purple'):
+            self.theme[chrome_key] = default[chrome_key]
+
         self.source_bg_var.set(default['source_bg'])
         self.source_bg_preview.config(bg=default['source_bg'])
         self.source_fg_var.set(default['source_fg'])
@@ -8458,6 +8669,7 @@ class ThemeDialog(tk.Toplevel):
         self.visual_size_var.set(default['visual_font_size'])
         self.desk_bg_var.set(default['desk_bg'])
         self.desk_bg_preview.config(bg=default['desk_bg'])
+        self._update_template_preview()
 
 
 class BlockquoteStyleDialog(tk.Toplevel):
