@@ -1029,6 +1029,8 @@ class SpreadsheetGrid(tk.Canvas):
         # Undo/Redo Stacks
         self._undo_stack: List[Dict[str, Any]] = []
         self._redo_stack: List[Dict[str, Any]] = []
+        self._copied_source_origin: Optional[Tuple[int, int]] = None
+        self._copied_tsv: Optional[str] = None
 
         # Inline Cell Editor Widget (Overlay Entry or Text)
         self.editor_entry: Optional[Union[ttk.Entry, tk.Text]] = None
@@ -1924,6 +1926,26 @@ class SpreadsheetGrid(tk.Canvas):
         self.bind("<Control-semicolon>", lambda e: (self.insert_today_date(), "break")[1])
         self.bind("<Control-b>", lambda e: (self.toggle_bold_selection(), "break")[1])
         self.bind("<Control-B>", lambda e: (self.toggle_bold_selection(), "break")[1])
+
+        # Direct Clipboard, Undo/Redo & Select-All bindings (only when not inline editing)
+        def _grid_chord(action):
+            def _h(e=None):
+                if self.is_editing:
+                    return None
+                action()
+                return "break"
+            return _h
+
+        self.bind("<Control-c>", _grid_chord(self.copy_selection))
+        self.bind("<Control-C>", _grid_chord(self.copy_selection))
+        self.bind("<Control-x>", _grid_chord(self.cut_selection))
+        self.bind("<Control-X>", _grid_chord(self.cut_selection))
+        self.bind("<Control-v>", _grid_chord(self.paste_clipboard))
+        self.bind("<Control-V>", _grid_chord(self.paste_clipboard))
+        self.bind("<Control-z>", _grid_chord(self.undo))
+        self.bind("<Control-Z>", _grid_chord(self.undo))
+        self.bind("<Control-y>", _grid_chord(self.redo))
+        self.bind("<Control-a>", _grid_chord(self.select_all_cells))
 
         # Home / End / Page Navigation
         self.bind("<Home>", self._on_home_key)
@@ -3406,6 +3428,8 @@ class SpreadsheetGrid(tk.Canvas):
                 row_vals.append(val)
             rows_data.append("\t".join(row_vals))
         tsv_text = "\n".join(rows_data)
+        self._copied_source_origin = (min_r, min_c)
+        self._copied_tsv = tsv_text
         self.clipboard_clear()
         self.clipboard_append(tsv_text)
         return tsv_text
@@ -3416,46 +3440,53 @@ class SpreadsheetGrid(tk.Canvas):
         return tsv
 
     def paste_clipboard(self):
-        """Paste TSV, CSV, or Markdown table from clipboard starting at active cell."""
+        """Paste TSV, Markdown pipe table, CSV, or single-cell text/formulas starting at active cell."""
         try:
             raw_text = self.clipboard_get()
         except tk.TclError:
             return
 
-        if not raw_text.strip():
+        cleaned = raw_text.rstrip("\r\n")
+        if cleaned == "":
             return
 
-        lines = [line for line in raw_text.splitlines() if line.strip()]
+        lines = cleaned.splitlines()
         if not lines:
             return
 
-        # Determine delimiter: Tab, Pipe, or Comma
-        first_line = lines[0]
-        if "\t" in first_line:
-            delimiter = "\t"
+        # Determine unambiguous structure without splitting single-cell text on spaces/commas
+        if "\t" in cleaned:
             parsed_rows = [l.split("\t") for l in lines]
-        elif "|" in first_line:
-            # Markdown table
+        elif lines[0].strip().startswith("|") and all("|" in l for l in lines if l.strip()):
             parsed_rows = []
             for l in lines:
-                parts = [p.strip() for p in l.split("|")[1:-1]]
+                stripped_l = l.strip()
+                if not stripped_l:
+                    continue
+                parts = [p.strip() for p in stripped_l.split("|")[1:-1]]
                 if parts and not all(re.match(r"^:?-+:?$", p) for p in parts):
                     parsed_rows.append(parts)
+        elif (
+            len(lines) >= 2
+            and not any(l.lstrip().startswith("=") for l in lines if l.strip())
+            and all("," in l for l in lines if l.strip())
+        ):
+            parsed_rows = list(csv.reader(io.StringIO(cleaned)))
         else:
-            # Default CSV sniffer
-            try:
-                sniffer = csv.Sniffer()
-                dialect = sniffer.sniff(raw_text[:2048])
-                reader = csv.reader(io.StringIO(raw_text), dialect)
-                parsed_rows = list(reader)
-            except Exception:
-                reader = csv.reader(io.StringIO(raw_text))
-                parsed_rows = list(reader)
+            parsed_rows = [[l] for l in lines]
 
         if not parsed_rows:
             return
 
         start_r, start_c = self.active_cell
+        is_internal_copy = (
+            getattr(self, "_copied_tsv", None) is not None
+            and getattr(self, "_copied_source_origin", None) is not None
+            and cleaned == (self._copied_tsv or "").rstrip("\r\n")
+        )
+        dr_shift = (start_r - self._copied_source_origin[0]) if is_internal_copy else 0
+        dc_shift = (start_c - self._copied_source_origin[1]) if is_internal_copy else 0
+
         old_cells = {}
         new_cells = {}
 
@@ -3463,6 +3494,8 @@ class SpreadsheetGrid(tk.Canvas):
             r = start_r + dr
             for dc, cell_text in enumerate(row_data):
                 c = start_c + dc
+                if is_internal_copy and (dr_shift != 0 or dc_shift != 0) and isinstance(cell_text, str) and cell_text.startswith("="):
+                    cell_text = shift_formula_references(cell_text, dr_shift, dc_shift)
                 old_cells[(r, c)] = self.engine.get_raw(r, c)
                 new_cells[(r, c)] = cell_text
                 self.engine.set_cell(r, c, cell_text)
@@ -3470,7 +3503,9 @@ class SpreadsheetGrid(tk.Canvas):
         self._save_undo_state({"type": "batch_cells", "old_cells": old_cells, "new_cells": new_cells})
         self.engine.recalculate_all()
         self.recompute_bounds()
-        self.sel_end = (start_r + len(parsed_rows) - 1, start_c + max(len(row) for row in parsed_rows) - 1)
+        max_cols = max((len(row) for row in parsed_rows), default=1)
+        self.sel_start = (start_r, start_c)
+        self.sel_end = (start_r + len(parsed_rows) - 1, start_c + max(1, max_cols) - 1)
         self.redraw()
         self._notify_select()
         if self.on_modified_cb:
@@ -4010,6 +4045,8 @@ class SpreadsheetTab(ttk.Frame):
 
     def to_markdown_document(self) -> str:
         """Render spreadsheet as a clean markdown document suitable for PDF/DOCX/HTML export."""
+        if getattr(self.grid_widget, "is_editing", False):
+            self.grid_widget.commit_inline_edit()
         populated = list(self.engine.raw_cells.keys())
         name = self.get_display_name()
         if not populated:
@@ -4390,6 +4427,8 @@ class SpreadsheetTab(ttk.Frame):
 
     def get_content(self) -> str:
         """Serialize sheet state to JSON string for session caching."""
+        if getattr(self.grid_widget, "is_editing", False):
+            self.grid_widget.commit_inline_edit()
         data = {
             "type": "spreadsheet",
             "cells": {f"{r},{c}": val for (r, c), val in self.engine.raw_cells.items()},
@@ -4975,6 +5014,8 @@ def open_spreadsheet_file(filepath: str, tab: SpreadsheetTab) -> bool:
 
 def save_spreadsheet_file(tab: SpreadsheetTab, filepath: str) -> bool:
     """Save SpreadsheetTab contents to .csv, .tsv, .xlsx, or .mdsheet."""
+    if getattr(tab.grid_widget, "is_editing", False):
+        tab.grid_widget.commit_inline_edit()
     ext = os.path.splitext(filepath)[1].lower()
 
     if ext == ".xlsx" and OPENPYXL_AVAILABLE:

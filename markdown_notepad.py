@@ -12,6 +12,7 @@ Features:
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, font, simpledialog, colorchooser
 from tkinter import font as tkfont
+import bisect
 import re
 import os
 import io
@@ -1774,11 +1775,13 @@ class VisualTableWidget(tk.Frame):
             return v
 
         self.cell_entries = []
+        self._cell_vars = []
 
         # Header row
         header_row_entries = []
         for col_idx, h in enumerate(self.headers):
             h_var = tk.StringVar(value=_clean_for_display(h))
+            self._cell_vars.append((0, col_idx, h_var))
             entry = tk.Entry(
                 self.table_body, textvariable=h_var, font=head_font,
                 bg=self.header_bg, fg=self.header_fg, relief=tk.FLAT, bd=0,
@@ -1800,6 +1803,7 @@ class VisualTableWidget(tk.Frame):
             row_entries = []
             for col_idx, cell in enumerate(row):
                 cell_var = tk.StringVar(value=_clean_for_display(cell))
+                self._cell_vars.append((row_idx + 1, col_idx, cell_var))
                 entry = tk.Entry(
                     self.table_body, textvariable=cell_var, font=cell_font,
                     bg=c_bg, fg=self.cell_fg, relief=tk.FLAT, bd=0,
@@ -1860,6 +1864,23 @@ class VisualTableWidget(tk.Frame):
             if self.on_change_callback:
                 self.on_change_callback(old_str, new_str)
 
+    def _flush_all_cells(self):
+        """Synchronize any in-progress cell entry edits into headers/data_rows and canonical markdown."""
+        changed = False
+        for r, c, var in getattr(self, '_cell_vars', []):
+            clean_val = var.get().strip().replace('|', r'\|')
+            if r == 0:
+                if c < len(self.headers) and self.headers[c] != clean_val:
+                    self.headers[c] = clean_val
+                    changed = True
+            else:
+                d_idx = r - 1
+                if 0 <= d_idx < len(self.data_rows) and c < len(self.data_rows[d_idx]) and self.data_rows[d_idx][c] != clean_val:
+                    self.data_rows[d_idx][c] = clean_val
+                    changed = True
+        if changed:
+            self._sync()
+
     def _on_cell_commit(self, r, c, val):
         clean_val = val.strip().replace('|', r'\|')
         if r == 0:
@@ -1873,6 +1894,7 @@ class VisualTableWidget(tk.Frame):
                 self._sync()
 
     def insert_row(self, insert_idx):
+        self._flush_all_cells()
         new_row = ['' for _ in self.headers]
         self.data_rows.insert(max(0, min(len(self.data_rows), insert_idx)), new_row)
         self._sync()
@@ -1882,12 +1904,14 @@ class VisualTableWidget(tk.Frame):
             self.cell_entries[target_r][0].focus_set()
 
     def delete_row(self, row_idx):
+        self._flush_all_cells()
         if 0 <= row_idx < len(self.data_rows):
             del self.data_rows[row_idx]
             self._sync()
             self._build_table_ui()
 
     def insert_column(self, col_idx):
+        self._flush_all_cells()
         self.headers.insert(col_idx, f"Header {len(self.headers) + 1}")
         self.col_alignments.insert(col_idx, 'left')
         for r in self.data_rows:
@@ -1896,6 +1920,7 @@ class VisualTableWidget(tk.Frame):
         self._build_table_ui()
 
     def delete_column(self, col_idx):
+        self._flush_all_cells()
         if len(self.headers) > 1 and 0 <= col_idx < len(self.headers):
             del self.headers[col_idx]
             del self.col_alignments[col_idx]
@@ -1907,6 +1932,7 @@ class VisualTableWidget(tk.Frame):
 
     def cycle_all_alignment(self):
         """Cycle column alignments across left, center, and right."""
+        self._flush_all_cells()
         curr = self.col_alignments[0] if self.col_alignments else 'left'
         nxt = 'center' if curr == 'left' else ('right' if curr == 'center' else 'left')
         self.col_alignments = [nxt] * len(self.headers)
@@ -1914,12 +1940,14 @@ class VisualTableWidget(tk.Frame):
         self._build_table_ui()
 
     def set_column_alignment(self, col_idx, align):
+        self._flush_all_cells()
         if 0 <= col_idx < len(self.col_alignments):
             self.col_alignments[col_idx] = align
             self._sync()
             self._build_table_ui()
 
     def copy_table_tsv(self):
+        self._flush_all_cells()
         rows = [self.headers] + self.data_rows
         tsv = "\n".join(["\t".join(r) for r in rows])
         self.clipboard_clear()
@@ -3367,7 +3395,7 @@ class DocumentTab(ttk.Frame):
         """Handle cell edits, structural changes, or figure edits from embedded widgets."""
         self._updating_from_widget = True
         try:
-            pos = self.source_editor.search(old_text, "1.0", tk.END)
+            pos = self.source_editor.search(old_text, "1.0", tk.END, elide=True)
             if pos:
                 end_pos = f"{pos} + {len(old_text)}c"
                 self.source_editor.delete(pos, end_pos)
@@ -3537,7 +3565,7 @@ class DocumentTab(ttk.Frame):
             old_text = old_or_new
             curr = self.source_editor.get("1.0", "end-1c")
             if old_text in curr:
-                pos = self.source_editor.search(old_text, "1.0", tk.END)
+                pos = self.source_editor.search(old_text, "1.0", tk.END, elide=True)
                 if pos:
                     end_pos = f"{pos} + {len(old_text)}c"
                     self.source_editor.delete(pos, end_pos)
@@ -3566,17 +3594,23 @@ class DocumentTab(ttk.Frame):
         return "Untitled"
 
     def get_content(self):
-        """Get canonical document content from source editor"""
+        """Get canonical document content from source editor after flushing any active table edits."""
+        for win in list(getattr(self, '_embedded_windows', [])):
+            if hasattr(win, '_flush_all_cells'):
+                try:
+                    win._flush_all_cells()
+                except Exception:
+                    pass
         return self.source_editor.get("1.0", "end-1c").replace("\ufffc", "").rstrip()
 
     def set_content(self, content):
         """Set document content and refresh visual viewer if active"""
+        self.clear_embedded_widgets()
         self.source_editor.delete(1.0, tk.END)
         self.source_editor.insert(1.0, content)
         self.source_editor.edit_modified(False)
         self.is_modified = False
-        if self.current_mode == "visual":
-            self._apply_syntax_highlighting()
+        self._apply_syntax_highlighting()
         self.visual_viewer.set_content(content)
 
     def apply_theme(self, theme):
@@ -3937,7 +3971,7 @@ class DocumentTab(ttk.Frame):
         try:
             preview_ch = editor.get(found_idx, f"{found_idx}+2c")
             if preview_ch and preview_ch[0] not in ('[', '#'):
-                searched = editor.search(r'\[@|\[\^|\[|#', f"{target_line}.0", f"{target_line}.end", regexp=True)
+                searched = editor.search(r'\[@|\[\^|\[|#', f"{target_line}.0", f"{target_line}.end", regexp=True, elide=True)
                 if searched:
                     found_idx = searched
         except tk.TclError:
@@ -4960,11 +4994,23 @@ class DockedFindReplaceBar(ttk.Frame):
         self._ensure_highlight_tags(w)
         content = w.get("1.0", "end-1c")
 
+        # Map character offsets to line.column so embedded widgets never shift search ranges
+        lines = content.split('\n')
+        line_starts = []
+        offset = 0
+        for ln in lines:
+            line_starts.append(offset)
+            offset += len(ln) + 1
+
         for m in compiled.finditer(content):
             if m.start() == m.end():
                 continue
-            s_idx = f"1.0 + {m.start()} chars"
-            e_idx = f"1.0 + {m.end()} chars"
+            s_line_idx = bisect.bisect_right(line_starts, m.start()) - 1
+            e_line_idx = bisect.bisect_right(line_starts, max(m.start(), m.end() - 1)) - 1
+            s_col = m.start() - line_starts[s_line_idx]
+            e_col = m.end() - line_starts[e_line_idx]
+            s_idx = f"{s_line_idx + 1}.{s_col}"
+            e_idx = f"{e_line_idx + 1}.{e_col}"
             self._matches.append((s_idx, e_idx))
             w.tag_add("find_match", s_idx, e_idx)
 
@@ -5866,6 +5912,8 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-z>", self._doc_shortcut(self.undo))
         self.bind("<Control-y>", self._doc_shortcut(self.redo))
         self.bind("<Control-a>", self._doc_shortcut(self.select_all))
+        self.bind("<Control-c>", self._spreadsheet_shortcut(self.copy))
+        self.bind("<Control-x>", self._spreadsheet_shortcut(self.cut))
         self.bind("<Control-v>", self._doc_shortcut(self.paste))
         self.bind("<Control-V>", self._doc_shortcut(self.paste))
         self.bind("<Control-f>", lambda e: self.find_text())
@@ -5961,9 +6009,11 @@ class MarkdownNotepad(tk.Tk):
         return None
 
     def _jump_to_line(self, lineno: int):
-        if not self.current_tab:
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
             return
-        editor = self.current_tab.source_editor
+        editor = getattr(self.current_tab, 'source_editor', None)
+        if not editor:
+            return
         try:
             editor.see(f'{lineno}.0')
             editor.mark_set(tk.INSERT, f'{lineno}.0')
@@ -6012,7 +6062,8 @@ class MarkdownNotepad(tk.Tk):
                         tab = SpreadsheetTab(
                             self.notebook,
                             theme=self.theme,
-                            on_modified_callback=lambda: self._on_tab_modified()
+                            on_modified_callback=lambda: self._on_tab_modified(),
+                            on_selection_change=self._schedule_position_update
                         )
                         tab.file_path = tab_state.file_path
                         tab.set_content(tab_state.content)
@@ -6195,10 +6246,40 @@ class MarkdownNotepad(tk.Tk):
             w = getattr(w, 'master', None)
         return False
 
+    def _focused_aux_widget(self):
+        """Return the focused auxiliary input widget if focus is outside the main document editor or grid."""
+        try:
+            w = self.focus_get()
+        except (KeyError, tk.TclError):
+            return None
+        if w is None:
+            return None
+        doc_editor = getattr(self.current_tab, 'source_editor', None) if self.current_tab else None
+        grid_widget = getattr(self.current_tab, 'grid_widget', None) if self.current_tab else None
+        if w is doc_editor or w is grid_widget:
+            return None
+        if isinstance(w, (tk.Entry, ttk.Entry, tk.Text, ttk.Combobox, ttk.Spinbox)):
+            return w
+        return None
+
+    def _focus_in_auxiliary_input(self):
+        """True when keyboard focus is inside chat sidebar or any secondary Entry/Text input widget."""
+        return self._focus_in_chat() or (self._focused_aux_widget() is not None)
+
     def _doc_shortcut(self, func):
-        """Wrap a document-level shortcut so it is ignored while the chat has focus."""
+        """Wrap a document-level shortcut so it is ignored while chat or auxiliary inputs hold focus."""
         def handler(event=None):
-            if self._focus_in_chat():
+            if self._focus_in_auxiliary_input():
+                return None
+            return func()
+        return handler
+
+    def _spreadsheet_shortcut(self, func):
+        """Route root shortcut only when current tab is a spreadsheet and auxiliary inputs do not hold focus."""
+        def handler(event=None):
+            if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') != 'spreadsheet':
+                return None
+            if self._focus_in_auxiliary_input():
                 return None
             return func()
         return handler
@@ -6461,10 +6542,12 @@ class MarkdownNotepad(tk.Tk):
 
     def _apply_diff(self, replacement_text, start_index, end_index, original_text, apply_mode="replace"):
         """Apply a diff replacement or insertion to the current document."""
-        if not self.current_tab:
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
             return
         
         editor = self.current_tab.source_editor
+        if self.current_tab.current_mode == "visual":
+            self.current_tab.clear_embedded_widgets()
         
         if apply_mode == "cursor":
             insert_pos = editor.index(tk.INSERT)
@@ -6860,6 +6943,17 @@ class MarkdownNotepad(tk.Tk):
         # Right-click context menu on editor
         tab.source_editor.bind("<Button-3>", self._show_editor_context_menu)
         tab.visual_viewer.text_widget.bind("<Button-3>", self._show_editor_context_menu)
+
+        # Handle clipboard, undo/redo, and select-all at widget level with "break" so
+        # built-in Text class defaults and root bindings never double-fire (e.g. double paste 'XX').
+        tab.source_editor.bind("<<Paste>>", lambda e: self.paste())
+        tab.source_editor.bind("<Control-v>", lambda e: self.paste())
+        tab.source_editor.bind("<Control-V>", lambda e: self.paste())
+        tab.source_editor.bind("<<Undo>>", lambda e: self.undo())
+        tab.source_editor.bind("<Control-z>", lambda e: self.undo())
+        tab.source_editor.bind("<<Redo>>", lambda e: self.redo())
+        tab.source_editor.bind("<Control-y>", lambda e: self.redo())
+        tab.source_editor.bind("<Control-a>", lambda e: self.select_all())
 
         # Formatting keyboard shortcuts (direct on source editor with propagation break)
         for seq, pfx, sfx in (
@@ -7271,7 +7365,7 @@ class MarkdownNotepad(tk.Tk):
     
     def _show_source_mode(self):
         """Switch current tab to raw Markdown source editing view"""
-        if not self.current_tab:
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
             return
 
         self.current_tab.switch_mode("source", self.theme)
@@ -7287,7 +7381,7 @@ class MarkdownNotepad(tk.Tk):
 
     def _show_visual_mode(self):
         """Switch current tab to formatted visual presentation view"""
-        if not self.current_tab:
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
             return
 
         self.current_tab.switch_mode("visual", self.theme)
@@ -7779,44 +7873,99 @@ class MarkdownNotepad(tk.Tk):
     
     def undo(self):
         """Undo last action"""
+        aux = self._focused_aux_widget()
+        if aux is not None:
+            try:
+                if hasattr(aux, 'edit_undo'):
+                    aux.edit_undo()
+                else:
+                    aux.event_generate("<<Undo>>")
+            except tk.TclError:
+                pass
+            return "break"
         if self.current_tab:
             if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
                 self.current_tab.grid_widget.undo()
             elif hasattr(self.current_tab, 'source_editor'):
                 try:
                     self.current_tab.source_editor.edit_undo()
+                    self.current_tab.is_modified = True
+                    self._update_tab_title(self.current_tab)
+                    self._schedule_syntax_highlight()
+                    self._refresh_active_visual_view()
+                    self._schedule_outline_update()
                 except tk.TclError:
                     pass
+        return "break"
     
     def redo(self):
         """Redo last undone action"""
+        aux = self._focused_aux_widget()
+        if aux is not None:
+            try:
+                if hasattr(aux, 'edit_redo'):
+                    aux.edit_redo()
+                else:
+                    aux.event_generate("<<Redo>>")
+            except tk.TclError:
+                pass
+            return "break"
         if self.current_tab:
             if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
                 self.current_tab.grid_widget.redo()
             elif hasattr(self.current_tab, 'source_editor'):
                 try:
                     self.current_tab.source_editor.edit_redo()
+                    self.current_tab.is_modified = True
+                    self._update_tab_title(self.current_tab)
+                    self._schedule_syntax_highlight()
+                    self._refresh_active_visual_view()
+                    self._schedule_outline_update()
                 except tk.TclError:
                     pass
+        return "break"
     
     def cut(self):
-        """Cut selected text"""
+        """Cut selected text or cells"""
+        aux = self._focused_aux_widget()
+        if aux is not None:
+            try:
+                aux.event_generate("<<Cut>>")
+            except tk.TclError:
+                pass
+            return "break"
         if self.current_tab:
             if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
                 self.current_tab.cut()
             elif hasattr(self.current_tab, 'source_editor'):
                 self.current_tab.source_editor.event_generate("<<Cut>>")
+        return "break"
     
     def copy(self):
-        """Copy selected text"""
+        """Copy selected text or cells"""
+        aux = self._focused_aux_widget()
+        if aux is not None:
+            try:
+                aux.event_generate("<<Copy>>")
+            except tk.TclError:
+                pass
+            return "break"
         if self.current_tab:
             if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
                 self.current_tab.grid_widget.copy_selection()
             elif hasattr(self.current_tab, 'source_editor'):
                 self.current_tab.source_editor.event_generate("<<Copy>>")
+        return "break"
     
     def paste(self):
         """Paste from clipboard with smart detection of tables and images"""
+        aux = self._focused_aux_widget()
+        if aux is not None:
+            try:
+                aux.event_generate("<<Paste>>")
+            except tk.TclError:
+                pass
+            return "break"
         if self.current_tab:
             if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
                 self.current_tab.grid_widget.paste_clipboard()
@@ -7927,16 +8076,25 @@ class MarkdownNotepad(tk.Tk):
             except Exception as e:
                 print(f"Error grabbing clipboard image: {e}")
 
-        editor.event_generate("<<Paste>>")
         return "break"
     
     def select_all(self):
         """Select all text or all populated spreadsheet cells"""
+        aux = self._focused_aux_widget()
+        if aux is not None:
+            try:
+                if isinstance(aux, tk.Text):
+                    aux.tag_add(tk.SEL, "1.0", "end-1c")
+                elif hasattr(aux, 'selection_range'):
+                    aux.selection_range(0, tk.END)
+            except Exception:
+                pass
+            return "break"
         if self.current_tab:
             if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
                 self.current_tab.select_all()
             elif hasattr(self.current_tab, 'source_editor'):
-                self.current_tab.source_editor.tag_add(tk.SEL, "1.0", tk.END)
+                self.current_tab.source_editor.tag_add(tk.SEL, "1.0", "end-1c")
         return "break"
 
     def clean_current_document(self):
@@ -8140,7 +8298,7 @@ class MarkdownNotepad(tk.Tk):
     
     def _insert_line_prefix(self, prefix):
         """Insert prefix at the beginning of the current line (with toggle/replace support)"""
-        if not self.current_tab:
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
             return "break"
         
         editor = self.current_tab.source_editor
@@ -8175,7 +8333,7 @@ class MarkdownNotepad(tk.Tk):
     
     def _insert_text(self, text):
         """Insert text at cursor position"""
-        if not self.current_tab:
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
             return "break"
         self.current_tab.source_editor.insert(tk.INSERT, text)
         self.current_tab.is_modified = True
@@ -10430,6 +10588,9 @@ class SnapshotDialog(tk.Toplevel):
         """Open DiffPanel comparing current document (Original) with the selected snapshot (Suggested)."""
         idx = self._get_selected_index()
         if idx is None or not DIFF_PANEL_AVAILABLE:
+            return
+        if getattr(self.tab, 'tab_type', 'document') == 'spreadsheet':
+            messagebox.showinfo("Comparison Unavailable", "Side-by-side text diff is available for Markdown documents.", parent=self)
             return
         snap = self.tab.snapshots[idx]
         snap_name = snap.get('name', f"Checkpoint #{idx + 1}")
