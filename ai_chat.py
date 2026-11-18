@@ -8,6 +8,7 @@ Currently implements Anthropic Claude, Google Gemini, DeepSeek, and Ollama.
 import json
 import os
 import re
+import shlex
 import base64
 import hashlib
 import sys
@@ -18,6 +19,7 @@ import queue
 import time
 import difflib
 import webbrowser
+from urllib.parse import urlparse
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -100,6 +102,188 @@ def select_best_font(preferred_fonts, fallback="TkDefaultFont"):
             return available[idx]
     
     return fallback
+
+
+# =============================================================================
+# Security Utilities: Safe URL Handling, Shell-Free CLI & DPAPI Secret Storage
+# =============================================================================
+
+_SHELL_META_RE = re.compile(r'[&|;<>`$\r\n]')
+_SECRET_KEYS = ('api_key', 'gemini_api_key', 'deepseek_api_key')
+_DPAPI_PREFIX = 'dpapi:'
+
+
+def _safe_open_url(url: str) -> bool:
+    """Open *url* in the default browser only if it uses a safe http, https, or mailto scheme."""
+    if not url or not isinstance(url, str):
+        return False
+    u = url.strip()
+    try:
+        parsed = urlparse(u)
+    except Exception:
+        return False
+    scheme = (parsed.scheme or '').lower()
+    if scheme in ('http', 'https') and parsed.netloc:
+        try:
+            webbrowser.open(u)
+            return True
+        except Exception:
+            return False
+    if scheme == 'mailto' and (parsed.path or parsed.netloc):
+        try:
+            webbrowser.open(u)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _restrict_file_permissions(path: Path, is_dir: bool = False) -> None:
+    """Best-effort restriction of local credential/history/session files to owner access."""
+    try:
+        if path and Path(path).exists():
+            os.chmod(path, 0o700 if is_dir else 0o600)
+    except Exception:
+        pass
+
+
+def _dpapi_protect(plaintext: str) -> str:
+    """Protect a secret string using Windows DPAPI (CryptProtectData), returning base64 with prefix."""
+    if not plaintext:
+        return ''
+    if plaintext.startswith(_DPAPI_PREFIX):
+        return plaintext
+    if sys.platform != 'win32':
+        return plaintext
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _DATA_BLOB(ctypes.Structure):
+            _fields_ = [
+                ('cbData', wintypes.DWORD),
+                ('pbData', ctypes.POINTER(ctypes.c_ubyte)),
+            ]
+
+        crypt32 = ctypes.WinDLL('crypt32', use_last_error=True)
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+        crypt32.CryptProtectData.argtypes = [
+            ctypes.POINTER(_DATA_BLOB), wintypes.LPCWSTR, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_DATA_BLOB)
+        ]
+        crypt32.CryptProtectData.restype = wintypes.BOOL
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+
+        raw = plaintext.encode('utf-8')
+        buf = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
+        blob_in = _DATA_BLOB(len(raw), buf)
+        blob_out = _DATA_BLOB()
+        CRYPTPROTECT_UI_FORBIDDEN = 0x01
+        if not crypt32.CryptProtectData(
+            ctypes.byref(blob_in), 'MarkItDownNotepadSecret', None, None, None,
+            CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out)
+        ):
+            return plaintext
+        try:
+            encrypted = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            return _DPAPI_PREFIX + base64.b64encode(encrypted).decode('ascii')
+        finally:
+            if blob_out.pbData:
+                kernel32.LocalFree(blob_out.pbData)
+    except Exception:
+        return plaintext
+
+
+def _dpapi_unprotect(stored: str) -> str:
+    """Decrypt a DPAPI-protected secret string; passes through legacy plaintext unchanged."""
+    if not stored or not isinstance(stored, str):
+        return ''
+    if not stored.startswith(_DPAPI_PREFIX):
+        return stored
+    if sys.platform != 'win32':
+        return ''
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _DATA_BLOB(ctypes.Structure):
+            _fields_ = [
+                ('cbData', wintypes.DWORD),
+                ('pbData', ctypes.POINTER(ctypes.c_ubyte)),
+            ]
+
+        crypt32 = ctypes.WinDLL('crypt32', use_last_error=True)
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+        crypt32.CryptUnprotectData.argtypes = [
+            ctypes.POINTER(_DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_DATA_BLOB)
+        ]
+        crypt32.CryptUnprotectData.restype = wintypes.BOOL
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+
+        enc = base64.b64decode(stored[len(_DPAPI_PREFIX):].encode('ascii'))
+        if not enc:
+            return ''
+        buf = (ctypes.c_ubyte * len(enc)).from_buffer_copy(enc)
+        blob_in = _DATA_BLOB(len(enc), buf)
+        blob_out = _DATA_BLOB()
+        CRYPTPROTECT_UI_FORBIDDEN = 0x01
+        if not crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None,
+            CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out)
+        ):
+            return ''
+        try:
+            plain_bytes = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+            return plain_bytes.decode('utf-8')
+        finally:
+            if blob_out.pbData:
+                kernel32.LocalFree(blob_out.pbData)
+    except Exception:
+        return ''
+
+
+def _tokenize_and_validate_cli_command(command: str) -> List[str]:
+    """Safely tokenize a CLI command string, rejecting shell metacharacters and resolving the executable."""
+    if not command or not isinstance(command, str):
+        raise ValueError("Empty CLI command.")
+    raw = command.strip()
+    if not raw:
+        raise ValueError("Empty CLI command.")
+    if _SHELL_META_RE.search(raw):
+        raise ValueError("Unsafe shell metacharacters detected in CLI command.")
+    tokens = shlex.split(raw, posix=(sys.platform != 'win32'))
+    if sys.platform == 'win32':
+        tokens = [
+            t[1:-1] if len(t) >= 2 and t.startswith('"') and t.endswith('"') else t
+            for t in tokens
+        ]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        raise ValueError("Empty CLI command.")
+    exe = tokens[0]
+    resolved = shutil.which(exe)
+    if resolved:
+        tokens[0] = resolved
+    elif os.path.isfile(exe):
+        tokens[0] = os.path.abspath(exe)
+    else:
+        raise FileNotFoundError(f'Executable "{exe}" was not found.')
+    return tokens
+
+
+def _build_safe_popen_args(tokens: List[str]) -> List[str]:
+    """Build safe argument list for subprocess.run/Popen with shell=False (handles .cmd/.bat on Windows)."""
+    if sys.platform == 'win32' and tokens and tokens[0].lower().endswith(('.cmd', '.bat')):
+        cmd_exe = shutil.which("cmd.exe") or os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe"
+        )
+        return [cmd_exe, "/d", "/c"] + tokens
+    return list(tokens)
 
 # Define cross-platform font preferences
 SANS_SERIF_FONTS = ["Segoe UI", "SF Pro Display", "Ubuntu", "DejaVu Sans", "Arial", "Helvetica"]
@@ -370,6 +554,11 @@ class AISettings:
                 with open(self.CONFIG_FILE, 'r', encoding='utf-8') as f:
                     saved = json.load(f)
                     self.settings.update(saved)
+                # Decrypt any DPAPI-protected API keys into in-memory settings
+                for secret_key in _SECRET_KEYS:
+                    val = self.settings.get(secret_key, '')
+                    if val:
+                        self.settings[secret_key] = _dpapi_unprotect(str(val))
                 # Ensure prompt harnesses are valid and non-empty
                 harnesses = self.settings.get('prompt_harnesses')
                 if not isinstance(harnesses, list) or not harnesses:
@@ -399,10 +588,16 @@ class AISettings:
         return False
     
     def save(self) -> bool:
-        """Save settings to config file"""
+        """Save settings to config file with DPAPI-encrypted API secrets and restricted permissions."""
         try:
+            to_save = dict(self.settings)
+            for secret_key in _SECRET_KEYS:
+                val = to_save.get(secret_key, '')
+                if val:
+                    to_save[secret_key] = _dpapi_protect(str(val))
             with open(self.CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.settings, f, indent=2)
+                json.dump(to_save, f, indent=2)
+            _restrict_file_permissions(Path(self.CONFIG_FILE), is_dir=False)
             return True
         except Exception as e:
             print(f"Error saving AI settings: {e}")
@@ -741,8 +936,9 @@ class ChatHistoryManager:
     HISTORY_DIR = Path.home() / '.markitdown_chat_history'
     
     def __init__(self):
-        # Ensure history directory exists
+        # Ensure history directory exists with restricted permissions
         self.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        _restrict_file_permissions(self.HISTORY_DIR, is_dir=True)
     
     def _get_document_hash(self, document_path: Optional[str], content: str = "") -> str:
         """Generate unique hash for a document"""
@@ -784,6 +980,7 @@ class ChatHistoryManager:
             }
             with open(history_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
+            _restrict_file_permissions(history_file, is_dir=False)
         except Exception as e:
             print(f"Error saving chat history: {e}")
     
@@ -1989,6 +2186,8 @@ if sys.platform == 'win32':
 
         def __init__(self, command: str, cols: int = 220, rows: int = 50):
             import os as _os
+            import subprocess as _sp
+            tokens = _tokenize_and_validate_cli_command(command)
             k32 = ctypes.WinDLL('kernel32', use_last_error=True)
 
             # ── Structures ────────────────────────────────────────────────
@@ -2080,9 +2279,8 @@ if sys.platform == 'win32':
             env_block = '\x00'.join(f'{k}={v}' for k, v in env_dict.items()) + '\x00\x00'
             env_wchar = ctypes.create_unicode_buffer(env_block)
 
-            # Wrap in cmd.exe /c so that PATH resolution works for bare
-            # commands like 'copilot' (CreateProcessW doesn't search PATH).
-            cmd_line = f'cmd.exe /c {command}'
+            # Build properly escaped command line from validated tokens (never unvalidated string interpolation)
+            cmd_line = _sp.list2cmdline(_build_safe_popen_args(tokens))
 
             pi = _PROCESS_INFORMATION()
             ok = k32.CreateProcessW(
@@ -2191,10 +2389,17 @@ def find_antigravity_cli_command() -> str:
 def launch_cli_auth_window():
     """Launch an independent terminal console window running agy signin."""
     try:
-        cmd_executable = shutil.which("cmd.exe") or "cmd.exe"
-        cli_bin = find_antigravity_cli_command() or "agy"
-        auth_cmd = f'start "Antigravity CLI Signin" {cmd_executable} /k "{cli_bin} signin"'
-        subprocess.Popen(auth_cmd, shell=True)
+        cli_bin = find_antigravity_cli_command() or shutil.which("agy") or ""
+        tokens = _tokenize_and_validate_cli_command(cli_bin)
+        if sys.platform == 'win32':
+            cmd_executable = shutil.which("cmd.exe") or "cmd.exe"
+            subprocess.Popen(
+                [cmd_executable, "/k", tokens[0], "signin"],
+                shell=False,
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            )
+        else:
+            subprocess.Popen([tokens[0], "signin"], shell=False)
         return True, "Launched CLI authentication window. Follow prompts in external console."
     except Exception as e:
         return False, f"Failed to launch terminal window: {e}"
@@ -2250,7 +2455,6 @@ def call_antigravity_cli(system_prompt: str, user_message: str, model_name: str 
     prompt_input = f"{system_prompt.strip()}\n\n{user_message.strip()}".strip() if system_prompt and system_prompt.strip() else user_message.strip()
     cmd = [
         executable,
-        '--dangerously-skip-permissions',
         '--output-format', 'json'
     ]
 
@@ -2318,7 +2522,6 @@ def call_antigravity_cli(system_prompt: str, user_message: str, model_name: str 
                     break
             retry_cmd = [
                 executable,
-                '--dangerously-skip-permissions',
                 '--output-format', 'json',
                 '--model', fallback_model,
                 '-p', prompt_input,
@@ -2541,22 +2744,24 @@ class CliClient(LLMClient):
         return []  # model managed by the CLI session
 
     def test_connection(self) -> tuple:
-        """Check that the CLI command is reachable via the system shell.
-
-        Uses shell=True so PATH resolution matches what an interactive terminal
-        sees — this handles .cmd/.bat wrappers on Windows and shell-PATH
-        extensions that wouldn't be visible to a bare subprocess.run([...]) call.
-        """
+        """Check that the CLI command is safe and reachable without invoking a shell."""
         import subprocess as _sp
-        if not self.command:
-            return False, "No CLI command configured."
-        exe = self.command.split()[0]
-        # Shell "not found" fingerprints (case-insensitive check)
+        try:
+            tokens = _tokenize_and_validate_cli_command(self.command)
+        except Exception as exc:
+            return False, str(exc)
+
+        exe = os.path.basename(tokens[0])
         _NOT_FOUND = ('not recognized', 'not found', 'no such file',
                       'command not found', 'cannot find', 'is not recognized')
-        for probe in (f'{exe} --version', f'{exe} --help'):
+        run_kwargs = {'capture_output': True, 'text': True, 'timeout': 8, 'shell': False}
+        if sys.platform == 'win32':
+            run_kwargs['creationflags'] = getattr(_sp, 'CREATE_NO_WINDOW', 0)
+
+        for flag in ('--version', '--help'):
             try:
-                r = _sp.run(probe, shell=True, capture_output=True, text=True, timeout=8)
+                cmd_args = _build_safe_popen_args([tokens[0], flag])
+                r = _sp.run(cmd_args, **run_kwargs)
                 output = (r.stdout or r.stderr or '').strip()
                 low = output.lower()
                 is_not_found = any(p in low for p in _NOT_FOUND)
@@ -2584,6 +2789,8 @@ class CliClient(LLMClient):
     def _start_session(self):
         # Fresh queue for new session
         self._out_queue = queue.Queue()
+        tokens = _tokenize_and_validate_cli_command(self.command)
+        popen_args = _build_safe_popen_args(tokens)
         if sys.platform == 'win32':
             # Use ConPTY so the child process sees isatty(stdout) == True,
             # which keeps interactive TUI tools (e.g. 'gh copilot chat')
@@ -2595,7 +2802,7 @@ class CliClient(LLMClient):
                 print(f'[DEBUG] ConPTY unavailable ({_e}), falling back to Popen')
                 import subprocess as _sp
                 self._process = _sp.Popen(
-                    self.command, shell=True,
+                    popen_args, shell=False,
                     stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.STDOUT,
                     text=True, bufsize=1,
                 )
@@ -2607,7 +2814,7 @@ class CliClient(LLMClient):
             import io as _io
             master_fd, slave_fd = _pty.openpty()
             proc = _sp.Popen(
-                self.command, shell=True,
+                popen_args, shell=False,
                 stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
                 close_fds=True,
                 preexec_fn=_os.setsid,
@@ -4877,7 +5084,7 @@ class ChatSidebar(tk.Frame):
         self._link_counter += 1
         tag = f'lnk{self._link_counter}'
         w.insert(tk.END, label, base + ('md_link', tag))
-        w.tag_bind(tag, '<Button-1>', lambda e, u=url: webbrowser.open(u))
+        w.tag_bind(tag, '<Button-1>', lambda e, u=url: _safe_open_url(u))
         w.tag_bind(tag, '<Enter>', lambda e: w.configure(cursor='hand2'))
         w.tag_bind(tag, '<Leave>', lambda e: w.configure(cursor='arrow'))
 

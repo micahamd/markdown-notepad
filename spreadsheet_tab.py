@@ -282,6 +282,10 @@ class FormulaEngine:
     ERROR_CIRC = "#CIRC!"
     ERROR_GENERIC = "#ERROR!"
 
+    MAX_AST_NODES = 500
+    MAX_EXPONENT = 1000
+    MAX_RANGE_CELLS = 50000
+
     def __init__(self):
         self.raw_cells: Dict[Tuple[int, int], str] = {}
         self.computed_values: Dict[Tuple[int, int], Any] = {}
@@ -437,6 +441,8 @@ class FormulaEngine:
         try:
             b = float(self._to_numbers(base)[0])
             e = float(self._to_numbers(exp)[0])
+            if abs(e) > self.MAX_EXPONENT or (abs(b) > 1e50 and abs(e) > 10):
+                return self.ERROR_VALUE
             return b ** e
         except Exception:
             return self.ERROR_VALUE
@@ -800,6 +806,9 @@ class FormulaEngine:
         except SyntaxError:
             return self.ERROR_VALUE
 
+        if sum(1 for _ in ast.walk(tree)) > self.MAX_AST_NODES:
+            return self.ERROR_VALUE
+
         return self._eval_ast_node(tree.body, cur_r, cur_c)
 
     def _eval_ast_node(self, node: ast.AST, cur_r: int, cur_c: int) -> Any:
@@ -855,6 +864,8 @@ class FormulaEngine:
                     return self.ERROR_DIV_ZERO
                 return l_num / r_num
             elif isinstance(node.op, ast.Pow):
+                if abs(r_num) > self.MAX_EXPONENT or (abs(l_num) > 1e50 and abs(r_num) > 10):
+                    return self.ERROR_VALUE
                 return l_num ** r_num
             elif isinstance(node.op, ast.Mod):
                 if r_num == 0:
@@ -922,6 +933,8 @@ class FormulaEngine:
                         return self.ERROR_REF
                     min_r, max_r = min(p1[0], p2[0]), max(p1[0], p2[0])
                     min_c, max_c = min(p1[1], p2[1]), max(p1[1], p2[1])
+                    if (max_r - min_r + 1) * (max_c - min_c + 1) > self.MAX_RANGE_CELLS:
+                        return self.ERROR_REF
                     flat_vals = []
                     matrix = []
                     for r in range(min_r, max_r + 1):
@@ -935,6 +948,19 @@ class FormulaEngine:
 
                 # Evaluate Arguments
                 eval_args = [self._eval_ast_node(arg, cur_r, cur_c) for arg in node.args]
+
+                if func_name != "IFERROR":
+                    _ERR_SET = (
+                        self.ERROR_DIV_ZERO,
+                        self.ERROR_VALUE,
+                        self.ERROR_NAME,
+                        self.ERROR_REF,
+                        self.ERROR_CIRC,
+                        self.ERROR_GENERIC,
+                    )
+                    for arg_val in eval_args:
+                        if isinstance(arg_val, str) and arg_val in _ERR_SET:
+                            return arg_val
 
                 if func_name in self.functions:
                     try:

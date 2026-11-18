@@ -6,11 +6,13 @@ Uses 'markdown' for HTML generation, 'weasyprint' for PDF rendering,
 and 'python-docx' for Word document creation.
 """
 
+import html as _html
 import os
 import re
 import base64
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse, unquote
 from typing import Optional, Dict, Tuple, List, Any, Callable, Set, Union
 
 # Try to import markdown
@@ -26,9 +28,11 @@ except ImportError:
 
 # Try to import weasyprint for PDF
 try:
+    import weasyprint
     from weasyprint import HTML as WeasyprintHTML
     WEASYPRINT_AVAILABLE = True
 except ImportError:
+    weasyprint = None
     WEASYPRINT_AVAILABLE = False
 
 # Try to import python-docx for DOCX
@@ -276,37 +280,40 @@ def _preprocess_anchors_for_html(text: str) -> str:
     text = re.sub(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', sub_anchor, text, flags=re.IGNORECASE)
 
     def sub_ref(m):
-        lbl = m.group(1).strip()
-        aid = _clean_bookmark_name(lbl)
-        return f'<a href="#{aid}" class="internal-link">[@{lbl}]</a>'
+        raw_lbl = m.group(1).strip()
+        aid = _clean_bookmark_name(raw_lbl)
+        safe_lbl = _html.escape(raw_lbl, quote=True)
+        return f'<a href="#{aid}" class="internal-link">[@{safe_lbl}]</a>'
     text = re.sub(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', sub_ref, text, flags=re.IGNORECASE)
 
     # Display math $$...$$
     text = re.sub(
         r'\$\$([\s\S]+?)\$\$',
-        lambda m: f'<div class="math-block">{_export_latex_to_unicode(m.group(1))}</div>',
+        lambda m: f'<div class="math-block">{_html.escape(_export_latex_to_unicode(m.group(1)), quote=True)}</div>',
         text
     )
     # Inline math $...$
     text = re.sub(
         r'(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)',
-        lambda m: f'<span class="math-inline">{_export_latex_to_unicode(m.group(1))}</span>',
+        lambda m: f'<span class="math-inline">{_html.escape(_export_latex_to_unicode(m.group(1)), quote=True)}</span>',
         text
     )
     # Footnote definitions [^id]: text
     def sub_fn_def(m):
-        fid = _clean_bookmark_name('fn_' + m.group(1).strip())
-        ref_id = _clean_bookmark_name('fnref_' + m.group(1).strip())
-        label = m.group(1).strip()
-        body = m.group(2).strip()
+        raw_lbl = m.group(1).strip()
+        fid = _clean_bookmark_name('fn_' + raw_lbl)
+        ref_id = _clean_bookmark_name('fnref_' + raw_lbl)
+        label = _html.escape(raw_lbl, quote=True)
+        body = _html.escape(m.group(2).strip(), quote=True)
         return f'<div id="{fid}" class="footnote-def"><strong>[{label}]</strong> {body} <a href="#{ref_id}">↩</a></div>'
     text = re.sub(r'^\[\^([^\]]+)\]:\s*(.+)$', sub_fn_def, text, flags=re.MULTILINE)
 
     # Inline footnote refs [^id]
     def sub_fn_ref(m):
-        label = m.group(1).strip()
-        fid = _clean_bookmark_name('fn_' + label)
-        ref_id = _clean_bookmark_name('fnref_' + label)
+        raw_lbl = m.group(1).strip()
+        label = _html.escape(raw_lbl, quote=True)
+        fid = _clean_bookmark_name('fn_' + raw_lbl)
+        ref_id = _clean_bookmark_name('fnref_' + raw_lbl)
         return f'<sup id="{ref_id}" class="footnote-ref"><a href="#{fid}">[{label}]</a></sup>'
     text = re.sub(r'\[\^([^\]\n]+)\](?!:)', sub_fn_ref, text)
     return text
@@ -409,22 +416,58 @@ def _markdown_to_html(md_content: str, theme: Optional[Dict] = None,
     return html
 
 
+_SAFE_EXPORT_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg'}
+
+
+def _is_safe_export_asset_path(candidate_path: str, base_dir: str) -> bool:
+    """Verify *candidate_path* resolves inside *base_dir* and points to an existing allowed image file."""
+    if not candidate_path or not base_dir:
+        return False
+    try:
+        real_base = os.path.realpath(base_dir)
+        real_cand = os.path.realpath(candidate_path)
+        if os.path.commonpath([real_base, real_cand]) != real_base:
+            return False
+        if not os.path.isfile(real_cand):
+            return False
+        return os.path.splitext(real_cand)[1].lower() in _SAFE_EXPORT_IMAGE_EXTS
+    except Exception:
+        return False
+
+
 def _resolve_image_paths(html: str, base_path: str) -> str:
-    """Resolve relative image paths in HTML to absolute file:// URIs"""
-    import re
-    
+    """Resolve safe relative image paths in HTML to absolute file:// URIs confined to *base_path*."""
     def replace_src(match):
         src = match.group(1)
-        # Skip data URIs and absolute URLs
         if src.startswith(('data:', 'http://', 'https://', 'file://')):
             return match.group(0)
-        # Resolve relative path
         abs_path = os.path.abspath(os.path.join(base_path, src))
-        if os.path.exists(abs_path):
-            return f'src="file://{abs_path}"'
+        if _is_safe_export_asset_path(abs_path, base_path):
+            return f'src="{Path(abs_path).as_uri()}"'
         return match.group(0)
-    
+
     return re.sub(r'src="([^"]*)"', replace_src, html)
+
+
+def _make_safe_weasyprint_fetcher(base_path: Optional[str]):
+    """Build a restricted URL fetcher for WeasyPrint that blocks network SSRF and out-of-bounds file:// reads."""
+    allowed_root = base_path or os.getcwd()
+
+    def _safe_url_fetcher(url: str):
+        if not url or not isinstance(url, str):
+            raise ValueError("Blocked empty URL in PDF export")
+        if url.startswith('data:image/'):
+            return weasyprint.default_url_fetcher(url)
+        if url.startswith('file://'):
+            parsed = urlparse(url)
+            raw_path = unquote(parsed.path or '')
+            if os.name == 'nt' and raw_path.startswith('/') and len(raw_path) > 2 and raw_path[2] == ':':
+                raw_path = raw_path[1:]
+            if _is_safe_export_asset_path(raw_path, allowed_root):
+                return weasyprint.default_url_fetcher(url)
+        raise ValueError(f"Blocked unsafe or external URL fetch in PDF export: {url}")
+
+    return _safe_url_fetcher
 
 
 # =============================================================================
@@ -458,7 +501,11 @@ def export_to_pdf(md_content: str, output_path: str,
     
     html = _markdown_to_html(md_content, theme, page_settings, base_path)
     
-    WeasyprintHTML(string=html, base_url=base_path or '.').write_pdf(output_path)
+    WeasyprintHTML(
+        string=html,
+        base_url=base_path or '.',
+        url_fetcher=_make_safe_weasyprint_fetcher(base_path),
+    ).write_pdf(output_path)
     return True
 
 

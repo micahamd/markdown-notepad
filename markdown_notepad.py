@@ -3190,12 +3190,18 @@ class MarkdownVisualWidget(tk.Frame):
             pass
 
     def _open_external_link(self, url: str):
-        """Open an external web URL or mailto link."""
-        if url.startswith(('http://', 'https://', 'mailto:')):
-            try:
-                webbrowser.open(url)
-            except Exception:
-                pass
+        """Open an external web URL or mailto link if validated by urlparse."""
+        from urllib.parse import urlparse
+        if not url or not isinstance(url, str):
+            return
+        u = url.strip()
+        try:
+            parsed = urlparse(u)
+            scheme = (parsed.scheme or '').lower()
+            if (scheme in ('http', 'https') and parsed.netloc) or (scheme == 'mailto' and (parsed.path or parsed.netloc)):
+                webbrowser.open(u)
+        except Exception:
+            pass
 
     def _copy_anchor_ref(self, label: str):
         """Copy the reference shorthand [@label] to clipboard on anchor badge click."""
@@ -4022,11 +4028,8 @@ class DocumentTab(ttk.Frame):
                     u = m.group(2).strip()
                     if u.startswith(('#', '@')):
                         target_ref = u.lstrip('#@').strip()
-                    elif u.startswith(('http://', 'https://', 'mailto:')):
-                        try:
-                            webbrowser.open(u)
-                        except Exception:
-                            pass
+                    elif u.lower().startswith(('http://', 'https://', 'mailto:')):
+                        self.visual_viewer._open_external_link(u)
                         return "break"
                     break
 

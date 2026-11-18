@@ -182,6 +182,10 @@ class SessionManager:
         try:
             with open(self.SESSION_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.state.to_dict(), f, indent=2)
+            try:
+                os.chmod(self.SESSION_FILE, 0o600)
+            except Exception:
+                pass
             return True
         except Exception as e:
             print(f"Error saving session: {e}")

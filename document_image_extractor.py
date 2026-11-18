@@ -40,6 +40,54 @@ class DocumentImageExtractor:
     """
 
     IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg'}
+    MAX_SINGLE_IMAGE_BYTES = 50 * 1024 * 1024   # 50 MB per embedded image
+    MAX_ARCHIVE_TOTAL_BYTES = 250 * 1024 * 1024  # 250 MB per archive
+
+    @classmethod
+    def _safe_extract_member(
+        cls,
+        zf: zipfile.ZipFile,
+        member_name: str,
+        target_path: str,
+        output_dir: str,
+        total_extracted: int,
+    ) -> Optional[int]:
+        """Extract a single archive member with Zip-bomb size caps and path traversal guards."""
+        real_out = os.path.realpath(output_dir)
+        real_target = os.path.realpath(target_path)
+        if os.path.commonpath([real_out, real_target]) != real_out:
+            return None
+
+        info = zf.getinfo(member_name)
+        if info.file_size > cls.MAX_SINGLE_IMAGE_BYTES or (total_extracted + info.file_size) > cls.MAX_ARCHIVE_TOTAL_BYTES:
+            return None
+
+        written = 0
+        chunk_size = 65536
+        aborted = False
+        try:
+            with zf.open(member_name) as src, open(target_path, 'wb') as dst:
+                while True:
+                    chunk = src.read(chunk_size)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > cls.MAX_SINGLE_IMAGE_BYTES or (total_extracted + written) > cls.MAX_ARCHIVE_TOTAL_BYTES:
+                        aborted = True
+                        break
+                    dst.write(chunk)
+        except Exception:
+            aborted = True
+
+        if aborted:
+            try:
+                if os.path.exists(target_path):
+                    os.remove(target_path)
+            except Exception:
+                pass
+            return None
+
+        return total_extracted + written
 
     @classmethod
     def can_extract(cls, filepath: str) -> bool:
@@ -158,6 +206,7 @@ class DocumentImageExtractor:
         os.makedirs(output_dir, exist_ok=True)
         extracted_images: Dict[str, str] = {}
         path_mapping: Dict[str, str] = {}
+        total_extracted = 0
 
         try:
             with zipfile.ZipFile(epub_path, 'r') as zf:
@@ -178,9 +227,13 @@ class DocumentImageExtractor:
 
                         saved_filename = os.path.basename(target_path)
 
-                        # Extract image file
-                        with zf.open(member_name) as src, open(target_path, 'wb') as dst:
-                            dst.write(src.read())
+                        # Extract image file safely (guarded against zip bombs & traversal)
+                        new_total = cls._safe_extract_member(
+                            zf, member_name, target_path, output_dir, total_extracted
+                        )
+                        if new_total is None:
+                            continue
+                        total_extracted = new_total
 
                         extracted_images[saved_filename] = target_path
 
@@ -226,6 +279,7 @@ class DocumentImageExtractor:
         os.makedirs(output_dir, exist_ok=True)
         extracted_images: Dict[str, str] = {}
         path_mapping: Dict[str, str] = {}
+        total_extracted = 0
 
         try:
             with zipfile.ZipFile(office_path, 'r') as zf:
@@ -235,6 +289,8 @@ class DocumentImageExtractor:
                         ext = Path(member_name).suffix.lower()
                         if ext in cls.IMAGE_EXTENSIONS:
                             filename = os.path.basename(member_name)
+                            if not filename:
+                                continue
                             target_path = os.path.join(output_dir, filename)
 
                             counter = 1
@@ -245,8 +301,12 @@ class DocumentImageExtractor:
 
                             saved_filename = os.path.basename(target_path)
 
-                            with zf.open(member_name) as src, open(target_path, 'wb') as dst:
-                                dst.write(src.read())
+                            new_total = cls._safe_extract_member(
+                                zf, member_name, target_path, output_dir, total_extracted
+                            )
+                            if new_total is None:
+                                continue
+                            total_extracted = new_total
 
                             extracted_images[saved_filename] = target_path
                             path_mapping[member_name] = saved_filename
