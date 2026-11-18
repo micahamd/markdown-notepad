@@ -4680,6 +4680,17 @@ class ChatSidebar(tk.Frame):
         for widget in (self.chat_display, self.edit_text, self.input_text):
             widget.bind('<Control-MouseWheel>', self._on_ctrl_wheel)
 
+        # Clipboard copy & right-click context menus in chat display and input/edit boxes
+        self.chat_display.bind('<Button-1>', lambda e: self.chat_display.focus_set(), add='+')
+        self.chat_display.bind('<Control-c>', self._on_chat_display_copy)
+        self.chat_display.bind('<Control-C>', self._on_chat_display_copy)
+        self.chat_display.bind('<<Copy>>', self._on_chat_display_copy)
+        self.chat_display.bind('<Control-a>', self._on_chat_display_select_all)
+        self.chat_display.bind('<Control-A>', self._on_chat_display_select_all)
+        self.chat_display.bind('<Button-3>', self._show_chat_display_context_menu)
+        self.input_text.bind('<Button-3>', lambda e, w=self.input_text: self._show_text_widget_context_menu(w, e))
+        self.edit_text.bind('<Button-3>', lambda e, w=self.edit_text: self._show_text_widget_context_menu(w, e))
+
     # ---------------------------------------------------------------- theming
 
     def apply_theme(self, theme: Optional[Dict[str, Any]]):
@@ -4857,6 +4868,249 @@ class ChatSidebar(tk.Frame):
             self.clipboard_append(self._messages[idx].content)
             self._flash_status("Copied!")
 
+    def _on_chat_display_copy(self, event=None):
+        """Copy highlighted text in read-only chat_display to clipboard."""
+        w = self.chat_display
+        if w.tag_ranges(tk.SEL):
+            sel_text = w.get(tk.SEL_FIRST, tk.SEL_LAST)
+            self.clipboard_clear()
+            self.clipboard_append(sel_text)
+            self._flash_status("Copied selection to clipboard")
+            return 'break'
+        return None
+
+    def _on_chat_display_select_all(self, event=None):
+        """Select all visible text in chat_display."""
+        w = self.chat_display
+        w.tag_add(tk.SEL, '1.0', 'end-1c')
+        return 'break'
+
+    def _get_message_index_at_pos(self, text_index: str) -> Optional[int]:
+        """Return message model index covering text_index in chat_display, or None."""
+        w = self.chat_display
+        for probe in (text_index, f"{text_index} linestart"):
+            try:
+                tags = w.tag_names(probe)
+            except tk.TclError:
+                continue
+            for t in tags:
+                m = re.match(r'^msg_card_(\d+)$', t)
+                if m:
+                    idx = int(m.group(1))
+                    if 0 <= idx < len(self._messages):
+                        return idx
+        return None
+
+    def _extract_code_block_at_index(self, text_index: str) -> Optional[str]:
+        """Extract contiguous md_code_block or md_code_inline text at text_index, if any."""
+        w = self.chat_display
+        try:
+            tags = w.tag_names(text_index)
+        except tk.TclError:
+            return None
+        for tag_name in ('md_code_inline', 'md_code_block'):
+            if tag_name in tags:
+                rng = w.tag_prevrange(tag_name, f"{text_index}+1c")
+                if rng and w.compare(rng[0], '<=', text_index) and w.compare(text_index, '<=', rng[1]):
+                    txt = w.get(rng[0], rng[1]).strip('\n')
+                    if txt.strip():
+                        return txt
+        return None
+
+    def _extract_formula_at_index(self, text_index: str) -> Optional[str]:
+        """Extract an Excel/spreadsheet formula (=...) on the line at text_index, if any."""
+        w = self.chat_display
+        try:
+            line = w.get(f"{text_index} linestart", f"{text_index} lineend").strip()
+        except tk.TclError:
+            return None
+        if not line:
+            return None
+        # Match explicit formula expression such as =SUM(A1:A10) or cell patch like B1: =A1*2
+        m_cell = re.match(
+            r'^\s*(?:[-*\u2022]\s+)?(?:SET\s+)?(?:[A-Za-z]{1,3}[0-9]+(?::[A-Za-z]{1,3}[0-9]+)?\s*[:=]\s*)(=.+)$',
+            line, re.IGNORECASE
+        )
+        if m_cell:
+            cand = m_cell.group(1).strip().strip('`')
+            if len(cand) >= 2:
+                return cand
+        m_eq = re.search(r'(?<![\w=])(=[A-Za-z_][A-Za-z0-9_]*\([^\n]*\)|=[$A-Za-z]{1,3}[0-9]+[^\s,;\n`]*)', line)
+        if m_eq:
+            return m_eq.group(1).strip().strip('`')
+        if line.startswith('=') and len(line) >= 2 and not line.startswith('==='):
+            return line.strip('`').strip()
+        return None
+
+    def _show_chat_display_context_menu(self, event):
+        """Display right-click Copy, Formula/Code Copy, Redo, Delete, and Select All menu."""
+        w = self.chat_display
+        w.focus_set()
+        click_idx = w.index(f"@{event.x},{event.y}")
+        has_sel = bool(w.tag_ranges(tk.SEL))
+        msg_idx = self._get_message_index_at_pos(click_idx)
+        formula_txt = self._extract_formula_at_index(click_idx)
+        code_txt = self._extract_code_block_at_index(click_idx)
+
+        def _copy_text(txt: str, label: str):
+            self.clipboard_clear()
+            self.clipboard_append(txt)
+            self._flash_status(label)
+
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label="Copy (Ctrl+C)",
+            state=tk.NORMAL if has_sel else tk.DISABLED,
+            command=self._on_chat_display_copy
+        )
+        if formula_txt:
+            preview = formula_txt if len(formula_txt) <= 28 else formula_txt[:25] + "..."
+            menu.add_command(
+                label=f"Copy Formula ({preview})",
+                command=lambda t=formula_txt: _copy_text(t, "Copied formula to clipboard")
+            )
+        if code_txt and code_txt.strip() != (formula_txt or "").strip():
+            lbl = "Copy Inline Code" if 'md_code_inline' in w.tag_names(click_idx) else "Copy Code Block"
+            menu.add_command(
+                label=lbl,
+                command=lambda t=code_txt: _copy_text(t, "Copied code to clipboard")
+            )
+        menu.add_command(
+            label="Copy Entire Message",
+            state=tk.NORMAL if msg_idx is not None else tk.DISABLED,
+            command=lambda i=msg_idx: self._copy_message(i) if i is not None else None
+        )
+        menu.add_separator()
+        can_mutate = (msg_idx is not None) and (not self.is_generating) and (self._messages[msg_idx].role != 'system')
+        menu.add_command(
+            label="Redo / Regenerate From Here",
+            state=tk.NORMAL if can_mutate else tk.DISABLED,
+            command=lambda i=msg_idx: self._redo_from_message(i) if i is not None else None
+        )
+        menu.add_command(
+            label="Delete This Message",
+            state=tk.NORMAL if can_mutate else tk.DISABLED,
+            command=lambda i=msg_idx: self._delete_message(i) if i is not None else None
+        )
+        menu.add_separator()
+        menu.add_command(label="Select All", command=self._on_chat_display_select_all)
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _show_text_widget_context_menu(self, widget: tk.Text, event):
+        """Right-click Cut / Copy / Paste / Select All menu for editable chat Text widgets."""
+        has_sel = bool(widget.tag_ranges(tk.SEL))
+        is_normal = (str(widget.cget('state')) == tk.NORMAL)
+        has_clip = False
+        try:
+            has_clip = bool(self.clipboard_get())
+        except tk.TclError:
+            has_clip = False
+
+        def _cut():
+            if has_sel and is_normal:
+                txt = widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+                self.clipboard_clear()
+                self.clipboard_append(txt)
+                widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                if widget is self.input_text:
+                    self._update_hint()
+
+        def _copy():
+            if has_sel:
+                txt = widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+                self.clipboard_clear()
+                self.clipboard_append(txt)
+
+        def _paste():
+            if not is_normal:
+                return
+            try:
+                clip = self.clipboard_get()
+            except tk.TclError:
+                return
+            if widget.tag_ranges(tk.SEL):
+                widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+            widget.insert(tk.INSERT, clip)
+            if widget is self.input_text:
+                self._update_hint()
+
+        def _select_all():
+            widget.tag_add(tk.SEL, '1.0', 'end-1c')
+            widget.mark_set(tk.INSERT, 'end-1c')
+
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Cut", state=tk.NORMAL if (has_sel and is_normal) else tk.DISABLED, command=_cut)
+        menu.add_command(label="Copy", state=tk.NORMAL if has_sel else tk.DISABLED, command=_copy)
+        menu.add_command(label="Paste", state=tk.NORMAL if (has_clip and is_normal) else tk.DISABLED, command=_paste)
+        menu.add_separator()
+        menu.add_command(label="Select All", command=_select_all)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _delete_message(self, idx: int):
+        """Delete an individual message from chat history and refresh view."""
+        if idx is None or idx < 0 or idx >= len(self._messages):
+            return
+        if self.is_generating:
+            self._flash_status("Wait for generation to finish (or press Stop) before deleting")
+            return
+        if self._editing:
+            self._exit_edit_mode(save=False)
+        removed = self._messages.pop(idx)
+        if self.current_document_id:
+            self.history_manager.save_history(self._messages, self.current_document_id)
+        self._render_all()
+        self._flash_status(f"Deleted {self.ROLE_LABELS.get(removed.role, removed.role)} message")
+
+    def _redo_from_message(self, idx: int):
+        """Truncate history at the targeted turn and re-run/regenerate response from that point."""
+        if idx is None or idx < 0 or idx >= len(self._messages):
+            return
+        if self.is_generating:
+            self._flash_status("Wait for generation to finish (or press Stop) before redoing")
+            return
+        if self._editing:
+            self._exit_edit_mode(save=False)
+
+        target_role = self._messages[idx].role
+        user_idx: Optional[int] = None
+        if target_role == 'user':
+            user_idx = idx
+        else:
+            for k in range(idx - 1, -1, -1):
+                if self._messages[k].role == 'user':
+                    user_idx = k
+                    break
+
+        if user_idx is None:
+            # No preceding user turn to replay; truncate from idx onward
+            self._messages = self._messages[:idx]
+            if self.current_document_id:
+                self.history_manager.save_history(self._messages, self.current_document_id)
+            self._render_all()
+            self._flash_status("Removed message(s) from chat history")
+            return
+
+        prompt_to_rerun = self._messages[user_idx].content
+        self._messages = self._messages[:user_idx]
+        if self.current_document_id:
+            self.history_manager.save_history(self._messages, self.current_document_id)
+        self._render_all()
+
+        if prompt_to_rerun and prompt_to_rerun.strip():
+            self.input_text.delete('1.0', tk.END)
+            self.input_text.insert('1.0', prompt_to_rerun)
+            self._update_hint()
+            self._send_message()
+        else:
+            self._flash_status("Rolled back to selected turn")
+
     def _clear_display(self):
         """Clear the chat display (does not touch stored history)."""
         with self._writable() as w:
@@ -4892,13 +5146,15 @@ class ChatSidebar(tk.Frame):
             return ''
 
     def _draw_header(self, role: str, ts: str, idx: Optional[int]):
-        """Solid role band: label, time and a Copy button; carries 'msg_start' for streaming."""
+        """Solid role band: label, time and action buttons; carries '_last_card_start' mark."""
         P = self._pal
         bg_key = {'user': 'hdr_user_bg', 'assistant': 'hdr_ai_bg'}.get(role, 'hdr_sys_bg')
         with self._writable() as w:
             if w.compare('end-1c', '>', '1.0'):
                 w.insert(tk.END, '\n', ('gap',))
             start = w.index('end-1c')
+            w.mark_set('_last_card_start', start)
+            w.mark_gravity('_last_card_start', tk.LEFT)
             w.insert(tk.END, f"{self.ROLE_LABELS.get(role, role)}")
             label_end = w.index('end-1c')
             tstr = self._format_time(ts)
@@ -4923,6 +5179,26 @@ class ChatSidebar(tk.Frame):
                         command=lambda i=idx: self._review_and_apply_message(i)
                     )
                     w.window_create(tk.END, window=rev_btn)
+                w.insert(tk.END, " ")
+                redo_btn = tk.Button(
+                    w, text="\u21bb Redo", relief=tk.FLAT, bd=0, cursor='hand2', takefocus=0,
+                    font=(SANS_FONT, max(7, self._fs - 2)), padx=4, pady=0,
+                    bg=P[bg_key], fg=P['muted'], activebackground=P[bg_key],
+                    activeforeground=P['accent'],
+                    command=lambda i=idx: self._redo_from_message(i)
+                )
+                w.window_create(tk.END, window=redo_btn)
+                ToolTip(redo_btn, "Re-run conversation from this turn onward")
+                w.insert(tk.END, " ")
+                del_btn = tk.Button(
+                    w, text="\u2715", relief=tk.FLAT, bd=0, cursor='hand2', takefocus=0,
+                    font=(SANS_FONT, max(7, self._fs - 2)), padx=4, pady=0,
+                    bg=P[bg_key], fg=P['muted'], activebackground=P[bg_key],
+                    activeforeground=P['err'],
+                    command=lambda i=idx: self._delete_message(i)
+                )
+                w.window_create(tk.END, window=del_btn)
+                ToolTip(del_btn, "Delete this message from chat history")
             w.insert(tk.END, '\n')
             end = w.index('end-1c')
             w.tag_add(f'hdr_{role}', start, end)
@@ -4936,6 +5212,10 @@ class ChatSidebar(tk.Frame):
                 w.insert(tk.END, text + '\n', ('body', tag))
         else:
             self._render_markdown(text, buffer_tables=True)
+        if idx is not None:
+            with self._writable() as w:
+                s_idx = w.index('_last_card_start') if '_last_card_start' in w.mark_names() else '1.0'
+                w.tag_add(f'msg_card_{idx}', s_idx, w.index('end-1c'))
 
     def _add_chat_message(self, role: str, content: str, streaming: bool = False):
         """Display a transient note (e.g. errors). Not stored in history."""
@@ -5422,6 +5702,10 @@ class ChatSidebar(tk.Frame):
                     self._flush_table(self._stream_state)
         if msg is not None and text.strip():
             msg.content = text
+            if self._gen_visible and msg in self._messages:
+                msg_idx = self._messages.index(msg)
+                with self._writable():
+                    w.tag_add(f'msg_card_{msg_idx}', 'msg_start', 'end-1c')
             if self._gen_doc_id:
                 self.history_manager.add_message(msg, self._gen_doc_id)
         self._stream_msg = None
