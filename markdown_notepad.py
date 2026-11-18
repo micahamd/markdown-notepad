@@ -2129,10 +2129,12 @@ class MarkdownVisualWidget(tk.Frame):
         self._hr_color = "#cbd5e1"
         self.on_zoom_wheel = None
         self._anchor_marks = {}
+        self._anchor_occurrence_marks = {}
         self._heading_marks = {}
         self._footnotes = {}
         self._footnote_def_marks = {}
         self._footnote_ref_marks = {}
+        self._footnote_occurrence_marks = {}
         self._fn_tooltip = None
         self._nav_history = []
         self._link_counter = 0
@@ -2307,10 +2309,12 @@ class MarkdownVisualWidget(tk.Frame):
         self.embedded_images.clear()
         self.image_handler.clear_caches()
         self._anchor_marks.clear()
+        self._anchor_occurrence_marks.clear()
         self._heading_marks.clear()
         self._footnotes.clear()
         self._footnote_def_marks.clear()
         self._footnote_ref_marks.clear()
+        self._footnote_occurrence_marks.clear()
         self._link_counter = 0
 
         # Pre-scan footnote definitions so hover tooltips work regardless of position
@@ -2396,15 +2400,22 @@ class MarkdownVisualWidget(tk.Frame):
                 tw.insert(tk.END, rendered_math, base_tags + ('math_inline',) if base_tags else 'math_inline')
             elif m.group('footnote_ref') is not None:
                 fn_id = m.group('footnote_ref').strip()
+                fn_key = fn_id.lower()
                 self._link_counter += 1
                 ref_mark = f"fnref_{self._link_counter}"
                 tw.mark_set(ref_mark, "end-1c")
                 tw.mark_gravity(ref_mark, tk.LEFT)
                 if fn_id not in self._footnote_ref_marks:
                     self._footnote_ref_marks[fn_id] = ref_mark
+                fn_occs = self._footnote_occurrence_marks.setdefault(fn_key, [])
+                fn_occ_mark = f"fnocc_{self._link_counter}"
+                tw.mark_set(fn_occ_mark, "end-1c")
+                tw.mark_gravity(fn_occ_mark, tk.LEFT)
+                fn_occs.append(fn_occ_mark)
                 fn_tag = f"fn_ref_tag_{self._link_counter}"
                 tw.insert(tk.END, f"[{fn_id}]", base_tags + ('footnote_ref', fn_tag) if base_tags else ('footnote_ref', fn_tag))
-                tw.tag_bind(fn_tag, "<Button-1>", lambda e, fid=fn_id: self._jump_to_footnote_def(fid))
+                for seq in ("<Button-1>", "<Control-Button-1>", "<Shift-Button-1>", "<Control-Shift-Button-1>"):
+                    tw.tag_bind(fn_tag, seq, lambda e, fid=fn_id, om=fn_occ_mark: self._cycle_footnote_occurrence(fid, om, reverse=bool(e.state & 0x0001)))
                 tw.tag_bind(fn_tag, "<Enter>", lambda e, fid=fn_id: self._show_footnote_tooltip(e, fid))
                 tw.tag_bind(fn_tag, "<Leave>", lambda e: self._hide_footnote_tooltip())
             elif m.group('anchor_name') is not None:
@@ -2415,18 +2426,32 @@ class MarkdownVisualWidget(tk.Frame):
                 tw.mark_set(mark_name, "end-1c")
                 tw.mark_gravity(mark_name, tk.LEFT)
                 self._anchor_marks[key] = mark_name
+                occ_list = self._anchor_occurrence_marks.setdefault(key, [])
+                occ_mark = f"occ_{self._link_counter}"
+                tw.mark_set(occ_mark, "end-1c")
+                tw.mark_gravity(occ_mark, tk.LEFT)
+                occ_list.append(occ_mark)
                 anc_tag = f"anc_badge_{self._link_counter}"
                 tw.insert(tk.END, f"⚓ {raw_anchor}", base_tags + ('anchor_badge', anc_tag) if base_tags else ('anchor_badge', anc_tag))
-                tw.tag_bind(anc_tag, "<Button-1>", lambda e, r=raw_anchor: self._copy_anchor_ref(r))
+                for seq in ("<Button-1>", "<Control-Button-1>", "<Shift-Button-1>", "<Control-Shift-Button-1>"):
+                    tw.tag_bind(anc_tag, seq, lambda e, k=key, r=raw_anchor, om=occ_mark: self._cycle_anchor_occurrence(k, r, om, reverse=bool(e.state & 0x0001)))
+                tw.tag_bind(anc_tag, "<Button-3>", lambda e, r=raw_anchor: self._copy_anchor_ref(r))
                 tw.tag_bind(anc_tag, "<Enter>", lambda e: tw.config(cursor="hand2"))
                 tw.tag_bind(anc_tag, "<Leave>", lambda e: tw.config(cursor=""))
             elif m.group('ref_name') is not None:
                 raw_ref = m.group('ref_name').strip()
                 key = _normalize_anchor_key(raw_ref)
                 self._link_counter += 1
+                occ_list = self._anchor_occurrence_marks.setdefault(key, [])
+                occ_mark = f"occ_{self._link_counter}"
+                tw.mark_set(occ_mark, "end-1c")
+                tw.mark_gravity(occ_mark, tk.LEFT)
+                occ_list.append(occ_mark)
                 tag_id = f"link_ref_{self._link_counter}"
                 tw.insert(tk.END, f"[@{raw_ref}]", base_tags + ('link', tag_id) if base_tags else ('link', tag_id))
-                tw.tag_bind(tag_id, "<Button-1>", lambda e, k=key, r=raw_ref: self._jump_to_anchor(k, r))
+                for seq in ("<Button-1>", "<Control-Button-1>", "<Shift-Button-1>", "<Control-Shift-Button-1>"):
+                    tw.tag_bind(tag_id, seq, lambda e, k=key, r=raw_ref, om=occ_mark: self._cycle_anchor_occurrence(k, r, om, reverse=bool(e.state & 0x0001)))
+                tw.tag_bind(tag_id, "<Button-3>", lambda e, r=raw_ref: self._copy_anchor_ref(r))
                 tw.tag_bind(tag_id, "<Enter>", lambda e: tw.config(cursor="hand2"))
                 tw.tag_bind(tag_id, "<Leave>", lambda e: tw.config(cursor=""))
             elif m.group('link_label') is not None:
@@ -2434,11 +2459,19 @@ class MarkdownVisualWidget(tk.Frame):
                 url = (m.group('link_url') or '').strip()
                 self._link_counter += 1
                 tag_id = f"link_url_{self._link_counter}"
-                tw.insert(tk.END, label, base_tags + ('link', tag_id) if base_tags else ('link', tag_id))
                 if url.startswith(('#', '@')):
-                    target_key = _normalize_anchor_key(url.lstrip('#@'))
-                    tw.tag_bind(tag_id, "<Button-1>", lambda e, k=target_key, r=label: self._jump_to_anchor(k, r))
+                    raw_target = url.lstrip('#@').strip()
+                    target_key = _normalize_anchor_key(raw_target)
+                    occ_list = self._anchor_occurrence_marks.setdefault(target_key, [])
+                    occ_mark = f"occ_{self._link_counter}"
+                    tw.mark_set(occ_mark, "end-1c")
+                    tw.mark_gravity(occ_mark, tk.LEFT)
+                    occ_list.append(occ_mark)
+                    tw.insert(tk.END, label, base_tags + ('link', tag_id) if base_tags else ('link', tag_id))
+                    for seq in ("<Button-1>", "<Control-Button-1>", "<Shift-Button-1>", "<Control-Shift-Button-1>"):
+                        tw.tag_bind(tag_id, seq, lambda e, k=target_key, r=raw_target, om=occ_mark: self._cycle_anchor_occurrence(k, r, om, reverse=bool(e.state & 0x0001)))
                 else:
+                    tw.insert(tk.END, label, base_tags + ('link', tag_id) if base_tags else ('link', tag_id))
                     tw.tag_bind(tag_id, "<Button-1>", lambda e, u=url: self._open_external_link(u))
                 tw.tag_bind(tag_id, "<Enter>", lambda e: tw.config(cursor="hand2"))
                 tw.tag_bind(tag_id, "<Leave>", lambda e: tw.config(cursor=""))
@@ -2451,9 +2484,11 @@ class MarkdownVisualWidget(tk.Frame):
         """Render markdown content efficiently into the single text widget"""
         if not is_chunk:
             self._anchor_marks.clear()
+            self._anchor_occurrence_marks.clear()
             self._heading_marks.clear()
             self._footnote_def_marks.clear()
             self._footnote_ref_marks.clear()
+            self._footnote_occurrence_marks.clear()
             self._link_counter = 0
         # Build a map of image positions
         image_positions = {img['start']: img for img in images}
@@ -2550,6 +2585,7 @@ class MarkdownVisualWidget(tk.Frame):
             fn_def_match = re.match(r'^\[\^([^\]]+)\]:\s*(.+)$', line.strip())
             if fn_def_match:
                 fn_id = fn_def_match.group(1).strip()
+                fn_key = fn_id.lower()
                 fn_body = fn_def_match.group(2).strip()
                 self._footnotes[fn_id] = fn_body
                 self._link_counter += 1
@@ -2557,11 +2593,17 @@ class MarkdownVisualWidget(tk.Frame):
                 self.text_widget.mark_set(def_mark, "end-1c")
                 self.text_widget.mark_gravity(def_mark, tk.LEFT)
                 self._footnote_def_marks[fn_id] = def_mark
+                fn_occs = self._footnote_occurrence_marks.setdefault(fn_key, [])
+                fn_occ_mark = f"fnocc_{self._link_counter}"
+                self.text_widget.mark_set(fn_occ_mark, "end-1c")
+                self.text_widget.mark_gravity(fn_occ_mark, tk.LEFT)
+                fn_occs.append(fn_occ_mark)
                 back_tag = f"fn_back_{self._link_counter}"
                 self.text_widget.insert(tk.END, f"[{fn_id}] ", ('footnote_def', 'footnote_badge', back_tag))
                 self._insert_inline(fn_body, ('footnote_def',))
                 self.text_widget.insert(tk.END, " ↩\n", ('footnote_def', 'link', back_tag))
-                self.text_widget.tag_bind(back_tag, "<Button-1>", lambda e, fid=fn_id: self._jump_to_footnote_ref(fid))
+                for seq in ("<Button-1>", "<Control-Button-1>", "<Shift-Button-1>", "<Control-Shift-Button-1>"):
+                    self.text_widget.tag_bind(back_tag, seq, lambda e, fid=fn_id, om=fn_occ_mark: self._cycle_footnote_occurrence(fid, om, reverse=bool(e.state & 0x0001)))
                 self.text_widget.tag_bind(back_tag, "<Enter>", lambda e: self.text_widget.config(cursor="hand2"))
                 self.text_widget.tag_bind(back_tag, "<Leave>", lambda e: self.text_widget.config(cursor=""))
                 continue
@@ -2915,7 +2957,7 @@ class MarkdownVisualWidget(tk.Frame):
         self._schedule_rerender()
 
     def _register_heading(self, text: str):
-        """Register a heading as an internal jump mark."""
+        """Register a heading as an internal jump mark and cyclic occurrence."""
         clean = text.strip()
         key = _normalize_anchor_key(clean)
         if key:
@@ -2923,6 +2965,74 @@ class MarkdownVisualWidget(tk.Frame):
             self.text_widget.mark_set(mark_name, "end-1c")
             self.text_widget.mark_gravity(mark_name, tk.LEFT)
             self._heading_marks[key] = mark_name
+            occ_list = self._anchor_occurrence_marks.setdefault(key, [])
+            occ_mark = f"occ_h_{len(self._heading_marks)}_{len(occ_list)}"
+            self.text_widget.mark_set(occ_mark, "end-1c")
+            self.text_widget.mark_gravity(occ_mark, tk.LEFT)
+            occ_list.append(occ_mark)
+
+    def _cycle_anchor_occurrence(self, key: str, raw_label: str = "", from_mark: str = "", reverse: bool = False):
+        """Cycle forward or backward through all visual occurrences of a reference/anchor."""
+        tw = self.text_widget
+        marks = self._anchor_occurrence_marks.get(key, [])
+        if len(marks) > 1 and from_mark in marks:
+            try:
+                curr_idx = tw.index("@0,0")
+                if not self._nav_history or self._nav_history[-1] != curr_idx:
+                    self._nav_history.append(curr_idx)
+                    if len(self._nav_history) > 50:
+                        self._nav_history.pop(0)
+            except Exception:
+                pass
+            idx = marks.index(from_mark)
+            next_idx = (idx - 1) % len(marks) if reverse else (idx + 1) % len(marks)
+            target_mark = marks[next_idx]
+            if target_mark in tw.mark_names():
+                tw.see(target_mark)
+                self._flash_target(target_mark)
+                notepad = self._get_notepad()
+                if notepad and hasattr(notepad, '_set_status'):
+                    disp = raw_label or key
+                    notepad._set_status(
+                        f"[@{disp}] — occurrence {next_idx + 1} of {len(marks)}  (Click: next | Shift+Click: prev | Alt+Left: return)"
+                    )
+                return
+        elif len(marks) == 1 and from_mark in marks:
+            self._flash_target(from_mark)
+            notepad = self._get_notepad()
+            if notepad and hasattr(notepad, '_set_status'):
+                disp = raw_label or key
+                notepad._set_status(f"[@{disp}] — only 1 occurrence in document")
+            return
+        self._jump_to_anchor(key, raw_label)
+
+    def _cycle_footnote_occurrence(self, fn_id: str, from_mark: str = "", reverse: bool = False):
+        """Cycle forward or backward through all footnote citations and definition in visual mode."""
+        self._hide_footnote_tooltip()
+        tw = self.text_widget
+        marks = self._footnote_occurrence_marks.get(fn_id.lower(), [])
+        if len(marks) > 1 and from_mark in marks:
+            try:
+                curr_idx = tw.index("@0,0")
+                if not self._nav_history or self._nav_history[-1] != curr_idx:
+                    self._nav_history.append(curr_idx)
+                    if len(self._nav_history) > 50:
+                        self._nav_history.pop(0)
+            except Exception:
+                pass
+            idx = marks.index(from_mark)
+            next_idx = (idx - 1) % len(marks) if reverse else (idx + 1) % len(marks)
+            target_mark = marks[next_idx]
+            if target_mark in tw.mark_names():
+                tw.see(target_mark)
+                self._flash_target(target_mark)
+                notepad = self._get_notepad()
+                if notepad and hasattr(notepad, '_set_status'):
+                    notepad._set_status(
+                        f"Footnote [^{fn_id}] — occurrence {next_idx + 1} of {len(marks)}  (Click: next | Shift+Click: prev | Alt+Left: return)"
+                    )
+                return
+        self._jump_to_footnote_def(fn_id)
 
     def _jump_to_anchor(self, key: str, label: str = ""):
         """Jump smoothly to an anchor or heading target mark."""
@@ -2932,6 +3042,8 @@ class MarkdownVisualWidget(tk.Frame):
             target_mark = self._anchor_marks[key]
         elif key in self._heading_marks:
             target_mark = self._heading_marks[key]
+        elif self._anchor_occurrence_marks.get(key):
+            target_mark = self._anchor_occurrence_marks[key][0]
         else:
             # Fallback: check without non-alphanumeric chars
             slug = re.sub(r'[^a-z0-9]', '', key)
@@ -2959,11 +3071,11 @@ class MarkdownVisualWidget(tk.Frame):
             self._flash_target(target_mark)
             notepad = self._get_notepad()
             if notepad and hasattr(notepad, '_set_status'):
-                notepad._set_status(f"Jumped to [@anchor: {label}]  (Alt+Left to return)")
+                notepad._set_status(f"Jumped to [@{label}]  (Alt+Left to return)")
         else:
             notepad = self._get_notepad()
             if notepad and hasattr(notepad, '_set_status'):
-                notepad._set_status(f"Anchor '[@anchor: {label}]' not found in document")
+                notepad._set_status(f"Reference '[@{label}]' not found in document")
 
     def _show_footnote_tooltip(self, event, fn_id: str):
         """Display a hover tooltip previewing the footnote definition text."""
@@ -3113,6 +3225,8 @@ class DocumentTab(ttk.Frame):
         self._embedded_windows = []
         self._updating_from_widget = False
         self._last_active_line = None
+        self._target_counts = {}
+        self._nav_history = []
         
         desk_bg = theme.get('desk_bg', '#d9dce1')
         
@@ -3161,6 +3275,7 @@ class DocumentTab(ttk.Frame):
         self._ac_items = []
         self.source_editor.bind("<<Modified>>", self._on_text_modified)
         self.source_editor.bind("<Control-Button-1>", self._on_source_ctrl_click)
+        self.source_editor.bind("<Control-Shift-Button-1>", self._on_source_ctrl_click)
         self.source_editor.bind("<KeyRelease>", self._on_autocomplete_key_release, add='+')
         self.source_editor.bind("<KeyRelease>", self._update_active_line_elision, add='+')
         self.source_editor.bind("<ButtonRelease-1>", self._update_active_line_elision, add='+')
@@ -3562,7 +3677,7 @@ class DocumentTab(ttk.Frame):
                              spacing1=4, spacing3=4)
         editor.tag_configure('syn_link', foreground=link_fg, underline=True)
         anc_fg = '#c084fc' if dark else '#7c3aed'
-        editor.tag_configure('syn_anchor', foreground=anc_fg, font=(b_font, px(sz), 'bold'))
+        editor.tag_configure('syn_anchor', foreground=anc_fg, font=(b_font, px(sz), 'bold'), underline=True)
         editor.tag_configure('syn_footnote', foreground='#38bdf8' if dark else '#0284c7', font=(b_font, px(sz), 'bold'))
         math_font = "Cambria Math" if os.name == "nt" else font_family
         editor.tag_configure('syn_math', foreground='#5eead4' if dark else '#0f766e', background=code_bg, font=(math_font, px(sz), 'italic'))
@@ -3688,8 +3803,160 @@ class DocumentTab(ttk.Frame):
                 pass
             self._render_embedded_blocks()
 
+    def _find_all_ref_occurrences(self, content: str, ref_norm: str) -> list:
+        """Find all unified cross-reference, anchor, internal link, and heading occurrences for *ref_norm* in document order.
+
+        Returns a list of tuples: (lineno, col_start, col_end, display_label, kind)
+        where *lineno* is 1-based and *col_start* / *col_end* are 0-based line column offsets.
+        """
+        if not ref_norm:
+            return []
+        occurrences = []
+        in_code = False
+        tag_pat = re.compile(r'\[@(?:(?:anchor|def):\s*)?([^\]\n]+)\]', re.IGNORECASE)
+        link_pat = re.compile(r'(?<!!)\[([^\]]+)\]\(([@#][^)\s]+)\)')
+        head_pat = re.compile(r'^(#{1,6})\s+(.+)$')
+
+        for lineno, line in enumerate(content.split('\n'), start=1):
+            if line.strip().startswith('```'):
+                in_code = not in_code
+                continue
+            if in_code:
+                continue
+
+            line_hits = []
+            # 1. Unified [@label] and legacy [@anchor: label] / [@def: label]
+            for m in tag_pat.finditer(line):
+                raw_lbl = m.group(1).strip()
+                if _normalize_anchor_key(raw_lbl) == ref_norm:
+                    line_hits.append((lineno, m.start(), m.end(), raw_lbl, 'tag'))
+
+            # 2. Markdown internal links [text](#label) or [text](@label)
+            for m in link_pat.finditer(line):
+                raw_lbl = m.group(2).lstrip('#@').strip()
+                if _normalize_anchor_key(raw_lbl) == ref_norm:
+                    # Avoid double-counting if span overlaps a tag hit
+                    if not any(s <= m.start() < e or m.start() <= s < m.end() for _, s, e, _, _ in line_hits):
+                        line_hits.append((lineno, m.start(), m.end(), raw_lbl, 'link'))
+
+            # 3. Markdown headings (# Heading)
+            hm = head_pat.match(line.strip())
+            if hm and not line_hits:
+                raw_lbl = hm.group(2).strip()
+                if _normalize_anchor_key(raw_lbl) == ref_norm:
+                    h_pos = line.find('#')
+                    line_hits.append((lineno, max(0, h_pos), len(line), raw_lbl, 'heading'))
+
+            line_hits.sort(key=lambda item: item[1])
+            occurrences.extend(line_hits)
+
+        return occurrences
+
+    def _find_all_footnote_occurrences(self, content: str, fn_norm: str) -> list:
+        """Find all footnote definitions [^id]: and inline citations [^id] for *fn_norm* in document order."""
+        if not fn_norm:
+            return []
+        occurrences = []
+        in_code = False
+        fn_pat = re.compile(r'\[\^([^\]\n]+)\](:)?')
+
+        for lineno, line in enumerate(content.split('\n'), start=1):
+            if line.strip().startswith('```'):
+                in_code = not in_code
+                continue
+            if in_code:
+                continue
+
+            line_hits = []
+            for m in fn_pat.finditer(line):
+                fid = m.group(1).strip()
+                if fid.lower() == fn_norm:
+                    is_def = bool(m.group(2)) and line.lstrip().startswith('[^')
+                    line_hits.append((lineno, m.start(), m.end(), fid, 'def' if is_def else 'ref'))
+            occurrences.extend(line_hits)
+
+        return occurrences
+
+    def _flash_source_line(self, idx_str: str):
+        """Flash the line containing *idx_str* in source_editor."""
+        editor = self.source_editor
+        line_start = editor.index(f"{idx_str} linestart")
+        line_end = editor.index(f"{idx_str} lineend+1c")
+        editor.tag_remove('syn_flash', '1.0', tk.END)
+        editor.tag_add('syn_flash', line_start, line_end)
+        self.after(900, lambda: editor.tag_remove('syn_flash', '1.0', tk.END))
+
+    def _jump_to_source_occurrence(self, occurrences: list, cur_line: int, cur_col: int, reverse: bool, label: str, is_footnote: bool = False):
+        """Cycle to the next (or previous if *reverse*) occurrence and update status."""
+        editor = self.source_editor
+        if not occurrences:
+            return None
+
+        # Locate the occurrence currently under/nearest the click
+        cur_i = 0
+        exact_hit = None
+        for idx, (lineno, col_s, col_e, _, _) in enumerate(occurrences):
+            if lineno == cur_line and col_s <= cur_col <= col_e:
+                exact_hit = idx
+                break
+        if exact_hit is not None:
+            cur_i = exact_hit
+        else:
+            cur_i = min(
+                range(len(occurrences)),
+                key=lambda i: (abs(occurrences[i][0] - cur_line), abs(occurrences[i][1] - cur_col))
+            )
+
+        prefix = f"Footnote [^{label}]" if is_footnote else f"[@{label}]"
+        top = self.winfo_toplevel()
+
+        if len(occurrences) == 1:
+            only_line, only_col, _, _, _ = occurrences[0]
+            only_idx = f"{only_line}.{only_col}"
+            self._flash_source_line(only_idx)
+            if hasattr(top, '_set_status'):
+                hint = "" if is_footnote else f" Add another [@{label}] to cycle."
+                top._set_status(f"{prefix} — only 1 occurrence in document (Line {only_line}).{hint}")
+            return "break"
+
+        # Record pre-jump cursor position for Alt+Left back navigation
+        try:
+            curr_ins = editor.index(tk.INSERT)
+            if not self._nav_history or self._nav_history[-1] != curr_ins:
+                self._nav_history.append(curr_ins)
+                if len(self._nav_history) > 50:
+                    self._nav_history.pop(0)
+        except Exception:
+            pass
+
+        next_i = (cur_i - 1) % len(occurrences) if reverse else (cur_i + 1) % len(occurrences)
+        target_line, target_col, _, _, _ = occurrences[next_i]
+        found_idx = f"{target_line}.{target_col}"
+
+        # Guard against rare column shift on lines containing an embedded widget
+        try:
+            preview_ch = editor.get(found_idx, f"{found_idx}+2c")
+            if preview_ch and preview_ch[0] not in ('[', '#'):
+                searched = editor.search(r'\[@|\[\^|\[|#', f"{target_line}.0", f"{target_line}.end", regexp=True)
+                if searched:
+                    found_idx = searched
+        except tk.TclError:
+            pass
+
+        editor.mark_set(tk.INSERT, found_idx)
+        editor.see(found_idx)
+        editor.focus_set()
+        self._flash_source_line(found_idx)
+
+        if hasattr(top, '_set_status'):
+            top._set_status(
+                f"{prefix} — occurrence {next_i + 1} of {len(occurrences)} (Line {target_line})  "
+                f"[Ctrl+Click: next | Ctrl+Shift+Click: prev]"
+            )
+        return "break"
+
     def _on_source_ctrl_click(self, event):
-        """Handle Ctrl+Click on links, anchor references, or footnotes in source mode to jump to target."""
+        """Handle Ctrl+Click (and Ctrl+Shift+Click) to cycle through all occurrences of a ref, anchor, heading, or footnote."""
         editor = self.source_editor
         click_idx = editor.index(f"@{event.x},{event.y}")
         try:
@@ -3697,38 +3964,26 @@ class DocumentTab(ttk.Frame):
         except (ValueError, TypeError):
             return None
         line = editor.get(f"{line_num}.0", f"{line_num}.end")
+        reverse = bool(getattr(event, 'state', 0) & 0x0001)
+        content = editor.get("1.0", "end-1c")
 
-        # Check [^footnote]
-        for m in re.finditer(r'\[\^([^\]\n]+)\]', line):
+        # Case A: Footnote [^id] or [^id]:
+        for m in re.finditer(r'\[\^([^\]\n]+)\]:?', line):
             if m.start() <= col_num <= m.end():
                 fn_id = m.group(1).strip()
-                content = editor.get("1.0", tk.END)
-                is_def_line = bool(re.match(r'^\[\^' + re.escape(fn_id) + r'\]:', line.strip()))
-                if is_def_line:
-                    pat = re.compile(r'\[\^' + re.escape(fn_id) + r'\](?!:)')
-                else:
-                    pat = re.compile(r'^\[\^' + re.escape(fn_id) + r'\]:', re.MULTILINE)
-                fm = pat.search(content)
-                if fm:
-                    found_idx = f"1.0 + {fm.start()} chars"
-                    editor.mark_set(tk.INSERT, found_idx)
-                    editor.see(found_idx)
-                    ls = editor.index(f"{found_idx} linestart")
-                    le = editor.index(f"{found_idx} lineend+1c")
-                    editor.tag_add('syn_flash', ls, le)
-                    self.after(1200, lambda: editor.tag_remove('syn_flash', '1.0', tk.END))
-                    return "break"
+                occurrences = self._find_all_footnote_occurrences(content, fn_id.lower())
+                if occurrences:
+                    return self._jump_to_source_occurrence(occurrences, line_num, col_num, reverse, fn_id, is_footnote=True)
 
+        # Case B: Unified [@label], legacy [@anchor: label] / [@def: label], internal links, or Headings
         target_ref = None
-        # Check [@point]
-        for m in re.finditer(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', line):
+        for m in re.finditer(r'\[@(?:(?:anchor|def):\s*)?([^\]\n]+)\]', line, re.IGNORECASE):
             if m.start() <= col_num <= m.end():
                 target_ref = m.group(1).strip()
                 break
 
-        # Check [label](url or #anchor)
         if not target_ref:
-            for m in re.finditer(r'\[([^\]]+)\]\(([^)]+)\)', line):
+            for m in re.finditer(r'(?<!!)\[([^\]]+)\]\(([^)\s]+)\)', line):
                 if m.start() <= col_num <= m.end():
                     u = m.group(2).strip()
                     if u.startswith(('#', '@')):
@@ -3741,39 +3996,21 @@ class DocumentTab(ttk.Frame):
                         return "break"
                     break
 
+        if not target_ref:
+            hm = re.match(r'^(#{1,6})\s+(.+)$', line.strip())
+            if hm:
+                cand = hm.group(2).strip()
+                if len(self._find_all_ref_occurrences(content, _normalize_anchor_key(cand))) >= 2:
+                    target_ref = cand
+
         if target_ref:
             ref_norm = _normalize_anchor_key(target_ref)
-            content = editor.get("1.0", tk.END)
-            anchor_pat = re.compile(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', re.IGNORECASE)
-            found_idx = None
-            for am in anchor_pat.finditer(content):
-                if _normalize_anchor_key(am.group(1)) == ref_norm:
-                    found_idx = f"1.0 + {am.start()} chars"
-                    break
-
-            # Fallback to heading if not found as explicit anchor
-            if not found_idx:
-                heading_pat = re.compile(r'^#{1,6}\s+(.+)$', re.MULTILINE)
-                for hm in heading_pat.finditer(content):
-                    if _normalize_anchor_key(hm.group(1)) == ref_norm:
-                        found_idx = f"1.0 + {hm.start()} chars"
-                        break
-
-            if found_idx:
-                editor.mark_set(tk.INSERT, found_idx)
-                editor.see(found_idx)
-                line_start = editor.index(f"{found_idx} linestart")
-                line_end = editor.index(f"{found_idx} lineend+1c")
-                editor.tag_add('syn_flash', line_start, line_end)
-                self.after(1200, lambda: editor.tag_remove('syn_flash', '1.0', tk.END))
-                top = self.winfo_toplevel()
-                if hasattr(top, '_set_status'):
-                    top._set_status(f"Jumped to anchor '[@anchor: {target_ref}]'")
-                return "break"
-            else:
-                top = self.winfo_toplevel()
-                if hasattr(top, '_set_status'):
-                    top._set_status(f"Anchor '[@anchor: {target_ref}]' not found in document")
+            occurrences = self._find_all_ref_occurrences(content, ref_norm)
+            if occurrences:
+                return self._jump_to_source_occurrence(occurrences, line_num, col_num, reverse, target_ref, is_footnote=False)
+            top = self.winfo_toplevel()
+            if hasattr(top, '_set_status'):
+                top._set_status(f"Reference '[@{target_ref}]' not found in document")
         return None
 
     def center_cursor_vertically(self):
@@ -3829,22 +4066,51 @@ class DocumentTab(ttk.Frame):
             self._close_autocomplete()
 
     def _collect_document_targets(self):
-        """Collect all defined [@anchor: ...] targets and # headings in the document."""
-        content = self.source_editor.get("1.0", tk.END)
-        targets = []
-        seen = set()
+        """Collect all unified [@...] tags, legacy [@anchor: ...] tags, and # headings in the document with occurrence counts."""
+        content = self.source_editor.get("1.0", "end-1c")
+        self._target_counts = {}
+        first_names = {}
+        order = []
 
-        # 1. Explicit anchors
-        for m in re.finditer(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', content, re.IGNORECASE):
-            name = m.group(1).strip()
-            norm = _normalize_anchor_key(name)
-            if name and norm not in seen:
-                seen.add(norm)
-                targets.append((f"\u2693 {name}  (Anchor)", name))
+        try:
+            cur_line, cur_col = map(int, self.source_editor.index(tk.INSERT).split('.'))
+        except Exception:
+            cur_line, cur_col = -1, -1
+
+        tag_pat = re.compile(r'\[@(?:(?:anchor|def):\s*)?([^\]\n]+)\]', re.IGNORECASE)
+        in_code = False
+        lines = content.split('\n')
+
+        # 1. Unified [@label] & legacy [@anchor: label] tags outside code blocks
+        for lineno, line in enumerate(lines, start=1):
+            if line.strip().startswith('```'):
+                in_code = not in_code
+                continue
+            if in_code:
+                continue
+            for m in tag_pat.finditer(line):
+                # Skip a token actively being edited at cursor
+                if lineno == cur_line and m.start() <= cur_col <= m.end():
+                    continue
+                name = m.group(1).strip()
+                norm = _normalize_anchor_key(name)
+                if name and norm:
+                    if norm not in first_names:
+                        first_names[norm] = name
+                        order.append(norm)
+                    self._target_counts[norm] = self._target_counts.get(norm, 0) + 1
+
+        targets = []
+        for norm in order:
+            name = first_names[norm]
+            cnt = self._target_counts.get(norm, 1)
+            occ_str = f"  ({cnt}x)"
+            targets.append((f"\u2693 {name}{occ_str}", name))
 
         # 2. Document headings (outside code blocks)
         in_code = False
-        for line in content.split('\n'):
+        seen_norms = set(first_names.keys())
+        for line in lines:
             if line.strip().startswith('```'):
                 in_code = not in_code
                 continue
@@ -3854,8 +4120,8 @@ class DocumentTab(ttk.Frame):
             if hm:
                 h_text = hm.group(2).strip()
                 norm = _normalize_anchor_key(h_text)
-                if h_text and norm not in seen:
-                    seen.add(norm)
+                if h_text and norm not in seen_norms:
+                    seen_norms.add(norm)
                     lvl = len(hm.group(1))
                     targets.append((f"H{lvl}: {h_text}  (Heading)", h_text))
 
@@ -3875,9 +4141,9 @@ class DocumentTab(ttk.Frame):
         all_targets = self._collect_document_targets()
         filtered = [item for item in all_targets if not query or query in item[1].lower()]
 
-        # Always offer an option to define a new anchor at cursor
+        # Always offer an option to insert a new unified reference/anchor tag at cursor
         new_label = m.group(1).strip() or "point"
-        filtered.append((f"\u2795 Define new [@anchor: {new_label}]", f"__NEW__:{new_label}"))
+        filtered.append((f"\u2795 Insert new reference [@{new_label}]", f"__NEW__:{new_label}"))
 
         self._ac_items = filtered
 
@@ -4019,7 +4285,7 @@ class DocumentTab(ttk.Frame):
 
         if value.startswith("__NEW__:"):
             new_name = value.split(":", 1)[1]
-            replacement = f"[@anchor: {new_name}]"
+            replacement = f"[@{new_name}]"
         else:
             replacement = f"[@{value}]"
 
@@ -4369,6 +4635,23 @@ class OutlinePanel(ttk.Frame):
         table_cols_count = 0
 
         lines = self._last_content.split('\n')
+        # Pre-count unified & legacy cross-reference/anchor tags outside code blocks
+        anc_totals: Dict[str, int] = {}
+        anc_seen_counts: Dict[str, int] = {}
+        _in_code_pre = False
+        _tag_pat_pre = re.compile(r'\[@(?:(?:anchor|def):\s*)?([^\]\n]+)\]', re.IGNORECASE)
+        for _ln in lines:
+            if _ln.strip().startswith('```'):
+                _in_code_pre = not _in_code_pre
+                continue
+            if _in_code_pre:
+                continue
+            for _m in _tag_pat_pre.finditer(_ln):
+                _nm = _m.group(1).strip()
+                if _nm:
+                    _nk = _normalize_anchor_key(_nm)
+                    anc_totals[_nk] = anc_totals.get(_nk, 0) + 1
+
         for lineno, line in enumerate(lines, 1):
             stripped = line.strip()
             if stripped.startswith('```'):
@@ -4404,13 +4687,19 @@ class OutlinePanel(ttk.Frame):
                 text = m_h.group(2).strip()
                 items.append((lineno, 'headings', f'h{lvl}', lvl, f"{'#' * lvl} {text}"))
 
-            # Anchors & References
-            for m_anc in re.finditer(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', line, re.IGNORECASE):
-                anc = m_anc.group(1).strip()
-                items.append((lineno, 'anchors', 'anchor', 0, f"⚓ {anc}  [L{lineno}]"))
-            for m_ref in re.finditer(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', line, re.IGNORECASE):
-                ref = m_ref.group(1).strip()
-                items.append((lineno, 'anchors', 'ref', 0, f"↗ [@{ref}]  [L{lineno}]"))
+            # Anchors & References (unified ring)
+            for m_tag in re.finditer(r'\[@(?:(anchor|def):\s*)?([^\]\n]+)\]', line, re.IGNORECASE):
+                is_legacy_def = bool(m_tag.group(1))
+                name = m_tag.group(2).strip()
+                if not name:
+                    continue
+                norm = _normalize_anchor_key(name)
+                anc_seen_counts[norm] = anc_seen_counts.get(norm, 0) + 1
+                occ_idx = anc_seen_counts[norm]
+                total_cnt = anc_totals.get(norm, 1)
+                count_badge = f" ({occ_idx}/{total_cnt})" if total_cnt > 1 else ""
+                tag_style = 'anchor' if (is_legacy_def or occ_idx == 1) else 'ref'
+                items.append((lineno, 'anchors', tag_style, 0, f"⚓ [@{name}]{count_badge}  [L{lineno}]"))
 
             # Images & Display Math
             for m_img in re.finditer(r'!\[([^\]]*)\]\(([^)]+)\)', line):
@@ -5301,8 +5590,7 @@ class MarkdownNotepad(tk.Tk):
         format_menu.add_command(label="Horizontal Rule", command=lambda: self._insert_text("\n---\n"))
         format_menu.add_separator()
         format_menu.add_command(label="Link", command=lambda: self._insert_format("[", "](url)"), accelerator="Ctrl+K")
-        format_menu.add_command(label="Anchor (Bookmark)", command=lambda: self._insert_format("[@anchor: ", "]"), accelerator="Ctrl+Shift+M")
-        format_menu.add_command(label="Anchor Reference", command=lambda: self._insert_format("[@", "]"))
+        format_menu.add_command(label="Insert Reference / Anchor [@...]", command=lambda: self._insert_format("[@", "]"), accelerator="Ctrl+Shift+M")
         format_menu.add_command(label="Insert Footnote", command=self.insert_footnote, accelerator="Ctrl+Shift+F")
         format_menu.add_command(label="Math & Symbols...", command=self.open_math_symbol_picker, accelerator="Ctrl+Shift+Y")
         format_menu.add_separator()
@@ -5447,7 +5735,7 @@ class MarkdownNotepad(tk.Tk):
         ttk.Separator(btm, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
 
         # Cross-References & Media
-        add_format_button("\u2693 Anchor", lambda: self._insert_format("[@anchor: ", "]"), "Insert a named cross-reference target [@anchor: name] (Ctrl+Shift+M) for internal document hyperlinking.")
+        add_format_button("\u2693 Anchor", lambda: self._insert_format("[@", "]"), "Insert a cross-reference / anchor tag [@name] (Ctrl+Shift+M). Ctrl+Click any [@name] tag to cycle through all occurrences in the document.")
         add_format_button("\U0001f517 Link", lambda: self._insert_format("[", "](url)"), "Insert a markdown hyperlink [text](url) (Ctrl+K) around the selected text or at cursor.")
         add_format_button("[^] Note", self.insert_footnote, "Insert a footnote reference marker [^1] and generate a footnote definition stub (Ctrl+Shift+F).")
         add_format_button("\u2211 Math", self.open_math_symbol_picker, "Open the mathematical symbol and Greek alphabet picker (Ctrl+Shift+Y) to insert Unicode math notation.")
@@ -5595,7 +5883,7 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-k>", self._doc_shortcut(lambda: self._insert_format("[", "](url)")))
         self.bind("<Control-K>", self._doc_shortcut(lambda: self._insert_text("\n```\n\n```\n")))
         self.bind("<Control-Q>", self._doc_shortcut(lambda: self._insert_line_prefix("> ")))
-        self.bind("<Control-M>", self._doc_shortcut(lambda: self._insert_format("[@anchor: ", "]")))
+        self.bind("<Control-M>", self._doc_shortcut(lambda: self._insert_format("[@", "]")))
         self.bind("<Control-F>", self._doc_shortcut(self.insert_footnote))
         self.bind("<Control-Y>", self._doc_shortcut(self.open_math_symbol_picker))
         self.bind("<Alt-t>", self._doc_shortcut(self.insert_table))
@@ -5653,9 +5941,23 @@ class MarkdownNotepad(tk.Tk):
             self.current_tab._apply_syntax_highlighting()
 
     def _navigate_back(self):
-        """Navigate back to previous jump location in visual mode."""
-        if self.current_tab:
-            return self.current_tab.visual_viewer.navigate_back()
+        """Navigate back to previous jump location (Alt+Left) in source/visual mode."""
+        tab = self.current_tab
+        if tab:
+            nav_hist = getattr(tab, '_nav_history', None)
+            if nav_hist:
+                prev_idx = nav_hist.pop()
+                try:
+                    editor = tab.source_editor
+                    editor.mark_set(tk.INSERT, prev_idx)
+                    editor.see(prev_idx)
+                    editor.focus_set()
+                    tab._flash_source_line(prev_idx)
+                    self._set_status("Returned to previous location")
+                    return "break"
+                except Exception:
+                    pass
+            return tab.visual_viewer.navigate_back()
         return None
 
     def _jump_to_line(self, lineno: int):
@@ -6571,7 +6873,7 @@ class MarkdownNotepad(tk.Tk):
             ("<Control-Shift-h>", "==", "=="),
             ("<Control-Shift-Key-H>", "==", "=="),
             ("<Control-k>", "[", "](url)"),
-            ("<Control-M>", "[@anchor: ", "]"),
+            ("<Control-M>", "[@", "]"),
         ):
             tab.source_editor.bind(seq, lambda e, p=pfx, s=sfx: self._insert_format(p, s))
     
