@@ -137,6 +137,17 @@ except ImportError as e:
     SPREADSHEET_AVAILABLE = False
     print(f"Warning: spreadsheet_tab module not found ({e}). Spreadsheet tabs disabled.")
 
+# Import local TTS dictation manager
+try:
+    from tts_manager import get_tts_manager, DictationPropertiesDialog, REVERB_TTS_AVAILABLE
+    TTS_AVAILABLE = True
+except ImportError as e:
+    get_tts_manager = None
+    DictationPropertiesDialog = None
+    REVERB_TTS_AVAILABLE = False
+    TTS_AVAILABLE = False
+    print(f"Warning: tts_manager not available ({e}). Dictation features disabled.")
+
 
 def _fit_and_center_dialog(dialog: tk.Toplevel, parent: tk.Misc, min_w: int = 400, min_h: int = 300):
     """Ensure dialog is resizable in both X and Y, auto-fits without clipping, and is centered."""
@@ -5260,6 +5271,7 @@ class MarkdownNotepad(tk.Tk):
         self.source_view_var = tk.BooleanVar(value=False)
         self.mode_var = tk.StringVar(value="visual")
         self._setup_ui()
+        self._init_tts_listeners()
         self._setup_bindings()
         self._restore_session()
         self._update_title()
@@ -5645,7 +5657,20 @@ class MarkdownNotepad(tk.Tk):
         format_menu.add_separator()
         format_menu.add_command(label="Insert Image...", command=self.insert_image, accelerator="Ctrl+Shift+I")
         format_menu.add_command(label="Manage Images...", command=self.manage_images)
-        
+
+        # Dictation menu
+        dictation_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Dictation", menu=dictation_menu)
+        dictation_menu.add_command(
+            label="Read Selection / Document",
+            command=self.toggle_dictation_read,
+            accelerator="Ctrl+Alt+D",
+        )
+        dictation_menu.add_command(label="Read Last AI Reply", command=self.read_last_ai_reply)
+        dictation_menu.add_command(label="Stop Dictation", command=self.stop_dictation)
+        dictation_menu.add_separator()
+        dictation_menu.add_command(label="Dictation Properties...", command=self.open_dictation_properties)
+
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -5715,6 +5740,21 @@ class MarkdownNotepad(tk.Tk):
         self.ai_sidebar_btn = ttk.Button(top, text="\U0001f4ac AI Chat", command=self._toggle_ai_sidebar, style="Toolbar.TButton")
         self.ai_sidebar_btn.pack(side=tk.RIGHT, padx=1)
         ToolTip(self.ai_sidebar_btn, "Toggle the AI assistant sidebar (Ctrl+Shift+A) for drafting, rewriting, grammar correction, and document Q&A.")
+
+        self.dictation_menu_btn = ttk.Menubutton(top, text="\U0001f50a Dictation \u25be", style="Toolbar.TButton")
+        dictation_tb_menu = tk.Menu(self.dictation_menu_btn, tearoff=0)
+        dictation_tb_menu.add_command(label="\u25b6 Read Selection / Document", command=self.toggle_dictation_read, accelerator="Ctrl+Alt+D")
+        dictation_tb_menu.add_command(label="\u25b6 Read Last AI Reply", command=self.read_last_ai_reply)
+        dictation_tb_menu.add_command(label="\u23f9 Stop Dictation", command=self.stop_dictation)
+        dictation_tb_menu.add_separator()
+        dictation_tb_menu.add_command(label="\u2699 Dictation Properties...", command=self.open_dictation_properties)
+        self.dictation_menu_btn.config(menu=dictation_tb_menu)
+        self.dictation_menu_btn.pack(side=tk.RIGHT, padx=1)
+        ToolTip(self.dictation_menu_btn, "Open Dictation menu and Dictation Properties to configure Reverb-TTS speakers, languages, and voice cloning.")
+
+        self.dictation_btn = ttk.Button(top, text="\U0001f50a Read", command=self.toggle_dictation_read, style="Toolbar.TButton")
+        self.dictation_btn.pack(side=tk.RIGHT, padx=1)
+        ToolTip(self.dictation_btn, "Start or stop local Reverb-TTS dictation of selected text or current document (Ctrl+Alt+D).")
 
         fullscreen_btn = ttk.Button(top, text="\u26f6 Full Screen", command=self._toggle_focus_mode, style="Toolbar.TButton")
         fullscreen_btn.pack(side=tk.RIGHT, padx=1)
@@ -5967,6 +6007,10 @@ class MarkdownNotepad(tk.Tk):
 
         # Clean & Reflow shortcut
         self.bind("<Control-R>", lambda e: self.clean_current_document())  # Ctrl+Shift+R
+
+        # Dictation toggle shortcut
+        self.bind("<Control-Alt-d>", lambda e: (self.toggle_dictation_read(), "break")[1])
+        self.bind("<Control-Alt-D>", lambda e: (self.toggle_dictation_read(), "break")[1])
         
         # Focus mode toggle
         self.bind("<F11>", lambda e: self._toggle_focus_mode())
@@ -6465,7 +6509,15 @@ class MarkdownNotepad(tk.Tk):
                         label=f"\U0001f916 {name}",
                         command=lambda w=widget, n=name, p=prompt: self._run_context_action(w, n, p)
                     )
-        
+
+        if TTS_AVAILABLE:
+            menu.add_separator()
+            read_lbl = "\U0001f50a Read Selection Aloud" if has_selection else "\U0001f50a Read Document Aloud"
+            menu.add_command(label=read_lbl, command=self.toggle_dictation_read)
+            if get_tts_manager().is_speaking:
+                menu.add_command(label="\u23f9 Stop Dictation", command=self.stop_dictation)
+            menu.add_command(label="\u2699 Dictation Properties...", command=self.open_dictation_properties)
+
         # Show the menu
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -8505,10 +8557,139 @@ class MarkdownNotepad(tk.Tk):
             return "break"
         self.find_text()
     
+    # === Local TTS Dictation Methods ===
+
+    def _init_tts_listeners(self):
+        """Subscribe UI controls and status bar to background Reverb-TTS state/status events."""
+        if not TTS_AVAILABLE or not get_tts_manager:
+            return
+        mgr = get_tts_manager()
+        self._tts_state_cb = self._on_tts_state_change
+        self._tts_status_cb = self._on_tts_status_change
+        mgr.add_state_listener(self._tts_state_cb)
+        mgr.add_status_listener(self._tts_status_cb)
+
+    def _on_tts_state_change(self, speaking: bool):
+        def _upd():
+            if hasattr(self, "dictation_btn") and self.dictation_btn.winfo_exists():
+                self.dictation_btn.configure(text="\u23f9 Stop" if speaking else "\U0001f50a Read")
+        try:
+            if self.winfo_exists():
+                self.after(0, _upd)
+        except Exception:
+            pass
+
+    def _on_tts_status_change(self, message: str):
+        try:
+            if self.winfo_exists():
+                self.after(0, lambda m=message: self.winfo_exists() and self._set_status(m))
+        except Exception:
+            pass
+
+    def _get_dictation_target_text(self) -> Tuple[str, bool]:
+        """Extract selected text or active tab text and whether Markdown cleaning applies."""
+        if not self.current_tab:
+            return "", True
+        if getattr(self.current_tab, "tab_type", "document") == "spreadsheet":
+            grid = getattr(self.current_tab, "grid_widget", None)
+            if grid is None:
+                return "", False
+            (r1, c1), (r2, c2) = grid.get_selected_range()
+            vals = []
+            for r in range(r1, r2 + 1):
+                row_items = []
+                for c in range(c1, c2 + 1):
+                    v = self.current_tab.engine.get_value(r, c)
+                    if v is not None and str(v).strip():
+                        row_items.append(str(v).strip())
+                if row_items:
+                    vals.append(", ".join(row_items))
+            return ". ".join(vals), False
+
+        ed = getattr(self.current_tab, "source_editor", None)
+        if ed is not None:
+            try:
+                if ed.tag_ranges(tk.SEL):
+                    sel = ed.get(tk.SEL_FIRST, tk.SEL_LAST).strip()
+                    if sel:
+                        return sel, True
+            except tk.TclError:
+                pass
+        return (self.current_tab.get_content() or ""), True
+
+    def open_dictation_properties(self):
+        """Open Dictation Properties configuration dialog."""
+        if not TTS_AVAILABLE or not DictationPropertiesDialog:
+            messagebox.showwarning(
+                "Dictation Unavailable",
+                "Local TTS module could not be loaded.\nEnsure 'reverb-tts', 'sounddevice', and 'soundfile' are installed.",
+                parent=self,
+            )
+            return
+        DictationPropertiesDialog(self, manager=get_tts_manager(), theme=self.theme)
+
+    def toggle_dictation_read(self):
+        """Start dictating selection/document, or stop ongoing dictation."""
+        if not TTS_AVAILABLE or not get_tts_manager:
+            messagebox.showwarning(
+                "Dictation Unavailable",
+                "Local TTS module is unavailable.",
+                parent=self,
+            )
+            return
+        mgr = get_tts_manager()
+        if mgr.is_speaking:
+            mgr.stop()
+            return
+        if not REVERB_TTS_AVAILABLE:
+            messagebox.showwarning(
+                "Reverb-TTS Missing",
+                "The 'reverb-tts' package is not installed.\nInstall it via: pip install reverb-tts",
+                parent=self,
+            )
+            return
+        text, clean_md = self._get_dictation_target_text()
+        if not text.strip():
+            self._set_status("Nothing selected or written to dictate")
+            return
+        mgr.speak(text, clean_markdown=clean_md, tag="editor")
+
+    def read_last_ai_reply(self):
+        """Speak the latest assistant message from the AI chat sidebar."""
+        if not TTS_AVAILABLE or not get_tts_manager:
+            return
+        sb = getattr(self, "ai_sidebar", None)
+        if not sb or not getattr(sb, "_messages", None):
+            self._set_status("No AI response available to dictate")
+            return
+        last_ai = next((m for m in reversed(sb._messages) if m.role == "assistant" and m.content.strip()), None)
+        if last_ai is None:
+            self._set_status("No AI response available to dictate")
+            return
+        mgr = get_tts_manager()
+        if mgr.is_speaking:
+            mgr.stop()
+        mgr.speak(last_ai.content, clean_markdown=True, tag="ai_reply")
+
+    def stop_dictation(self):
+        """Stop any active TTS playback."""
+        if TTS_AVAILABLE and get_tts_manager:
+            get_tts_manager().stop()
+
     # === Application Methods ===
     
     def quit_app(self):
         """Exit the application"""
+        if TTS_AVAILABLE and get_tts_manager:
+            try:
+                mgr = get_tts_manager()
+                if hasattr(self, "_tts_state_cb"):
+                    mgr.remove_state_listener(self._tts_state_cb)
+                if hasattr(self, "_tts_status_cb"):
+                    mgr.remove_status_listener(self._tts_status_cb)
+                mgr.shutdown()
+            except Exception:
+                pass
         # Save session state before checking for unsaved changes
         if getattr(self, 'ai_sidebar', None):
             self.ai_sidebar.commit_edit_mode()

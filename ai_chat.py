@@ -76,6 +76,15 @@ try:
 except ImportError:
     REQUESTS_AVAILABLE = False
 
+# Import local TTS dictation manager
+try:
+    from tts_manager import get_tts_manager, DictationPropertiesDialog
+    TTS_AVAILABLE = True
+except ImportError:
+    get_tts_manager = None
+    DictationPropertiesDialog = None
+    TTS_AVAILABLE = False
+
 
 # =============================================================================
 # Font Detection Utilities
@@ -4995,6 +5004,20 @@ class ChatSidebar(tk.Frame):
         menu.add_separator()
         menu.add_command(label="Select All", command=self._on_chat_display_select_all)
 
+        if TTS_AVAILABLE and get_tts_manager:
+            mgr = get_tts_manager()
+            menu.add_separator()
+            if has_sel:
+                menu.add_command(label="\U0001f50a Read Selection Aloud", command=self._speak_selection)
+            if msg_idx is not None:
+                menu.add_command(
+                    label="\U0001f50a Read Message Aloud",
+                    command=lambda i=msg_idx: self._speak_message(i),
+                )
+            if mgr.is_speaking:
+                menu.add_command(label="\u23f9 Stop Reading", command=mgr.stop)
+            menu.add_command(label="\u2699 Dictation Properties...", command=self._open_dictation_properties)
+
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -5111,6 +5134,41 @@ class ChatSidebar(tk.Frame):
         else:
             self._flash_status("Rolled back to selected turn")
 
+    def _speak_message(self, idx: int):
+        """Read a single chat message aloud using local Reverb-TTS (or stop if currently reading it)."""
+        if not TTS_AVAILABLE or not get_tts_manager:
+            self._flash_status("Local TTS unavailable")
+            return
+        if idx is None or idx < 0 or idx >= len(self._messages):
+            return
+        mgr = get_tts_manager()
+        tag = f"chat_msg_{idx}"
+        if mgr.is_speaking and mgr.current_tag == tag:
+            mgr.stop()
+            return
+        content = self._messages[idx].content
+        if not content or not content.strip():
+            return
+        mgr.speak(content, clean_markdown=True, tag=tag)
+
+    def _speak_selection(self):
+        """Read currently highlighted text inside chat_display aloud."""
+        if not TTS_AVAILABLE or not get_tts_manager:
+            return
+        w = self.chat_display
+        if not w.tag_ranges(tk.SEL):
+            return
+        sel = w.get(tk.SEL_FIRST, tk.SEL_LAST).strip()
+        if sel:
+            get_tts_manager().speak(sel, clean_markdown=False, tag="chat_sel")
+
+    def _open_dictation_properties(self):
+        """Open Dictation Properties dialog from the chat sidebar."""
+        if not TTS_AVAILABLE or not DictationPropertiesDialog:
+            self._flash_status("Local TTS unavailable")
+            return
+        DictationPropertiesDialog(self.winfo_toplevel(), manager=get_tts_manager())
+
     def _clear_display(self):
         """Clear the chat display (does not touch stored history)."""
         with self._writable() as w:
@@ -5169,6 +5227,17 @@ class ChatSidebar(tk.Frame):
                                 activeforeground=P['accent'],
                                 command=lambda i=idx: self._copy_message(i))
                 w.window_create(tk.END, window=btn)
+                if TTS_AVAILABLE and get_tts_manager:
+                    w.insert(tk.END, " ")
+                    spk_btn = tk.Button(
+                        w, text="\U0001f50a", relief=tk.FLAT, bd=0, cursor='hand2', takefocus=0,
+                        font=(SANS_FONT, max(7, self._fs - 2)), padx=3, pady=0,
+                        bg=P[bg_key], fg=P['muted'], activebackground=P[bg_key],
+                        activeforeground=P['accent'],
+                        command=lambda i=idx: self._speak_message(i),
+                    )
+                    w.window_create(tk.END, window=spk_btn)
+                    ToolTip(spk_btn, "Read this message aloud using Reverb-TTS (click again to stop)")
                 if role == 'assistant' and self.apply_edit_callback:
                     w.insert(tk.END, " ")
                     rev_btn = tk.Button(
@@ -5723,6 +5792,16 @@ class ChatSidebar(tk.Frame):
             self.chat_display.see(tk.END)
             if status == "Ready":
                 self._show_apply_button()
+                if TTS_AVAILABLE and get_tts_manager:
+                    mgr = get_tts_manager()
+                    if getattr(mgr.settings, "auto_read_ai_replies", False):
+                        last_ai = next(
+                            ((i, m) for i, m in enumerate(reversed(self._messages)) if m.role == 'assistant' and m.content.strip()),
+                            None,
+                        )
+                        if last_ai is not None:
+                            real_idx = len(self._messages) - 1 - last_ai[0]
+                            mgr.speak(last_ai[1].content, clean_markdown=True, tag=f"chat_msg_{real_idx}")
         self._gen_visible = False
 
     def _on_done(self):
