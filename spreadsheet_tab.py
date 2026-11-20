@@ -3889,6 +3889,8 @@ class SpreadsheetTab(ttk.Frame):
         self.formula_entry.bind("<Alt-Return>", self._on_formula_bar_newline)
         self.formula_entry.bind("<Escape>", self._on_formula_bar_escape)
         self.formula_entry.bind("<KeyRelease>", self._on_formula_bar_key_release)
+        self.formula_entry.bind("<<Paste>>", self._schedule_formula_bar_sync, add="+")
+        self.formula_entry.bind("<<Cut>>", self._schedule_formula_bar_sync, add="+")
         self.formula_entry.bind("<Configure>", lambda e: self._update_formula_bar_height())
         self.formula_entry.bind("<Button-3>", self._show_formula_bar_context_menu)
         self._apply_formula_bar_theme()
@@ -4011,6 +4013,15 @@ class SpreadsheetTab(ttk.Frame):
             else:
                 if self.formula_vscroll.winfo_ismapped():
                     self.formula_vscroll.pack_forget()
+
+    def _schedule_formula_bar_sync(self, _event=None):
+        """Sync formula bar after menu-driven <<Paste>>/<<Cut>> virtual events complete."""
+        def _do_sync():
+            if hasattr(self, "formula_entry") and self.formula_entry.winfo_exists():
+                self.formula_entry.sync_to_var()
+                self._update_formula_bar_height()
+                self._on_formula_bar_typing(None)
+        self.after_idle(_do_sync)
 
     def _on_formula_bar_key_release(self, event):
         self.formula_entry.sync_to_var()

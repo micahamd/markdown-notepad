@@ -5663,7 +5663,7 @@ class MarkdownNotepad(tk.Tk):
         menubar.add_cascade(label="Dictation", menu=dictation_menu)
         dictation_menu.add_command(
             label="Read Selection / Document",
-            command=self.toggle_dictation_read,
+            command=self.start_dictation_read,
             accelerator="Ctrl+Alt+D",
         )
         dictation_menu.add_command(label="Read Last AI Reply", command=self.read_last_ai_reply)
@@ -5743,7 +5743,7 @@ class MarkdownNotepad(tk.Tk):
 
         self.dictation_menu_btn = ttk.Menubutton(top, text="\U0001f50a Dictation \u25be", style="Toolbar.TButton")
         dictation_tb_menu = tk.Menu(self.dictation_menu_btn, tearoff=0)
-        dictation_tb_menu.add_command(label="\u25b6 Read Selection / Document", command=self.toggle_dictation_read, accelerator="Ctrl+Alt+D")
+        dictation_tb_menu.add_command(label="\u25b6 Read Selection / Document", command=self.start_dictation_read, accelerator="Ctrl+Alt+D")
         dictation_tb_menu.add_command(label="\u25b6 Read Last AI Reply", command=self.read_last_ai_reply)
         dictation_tb_menu.add_command(label="\u23f9 Stop Dictation", command=self.stop_dictation)
         dictation_tb_menu.add_separator()
@@ -6513,7 +6513,7 @@ class MarkdownNotepad(tk.Tk):
         if TTS_AVAILABLE:
             menu.add_separator()
             read_lbl = "\U0001f50a Read Selection Aloud" if has_selection else "\U0001f50a Read Document Aloud"
-            menu.add_command(label=read_lbl, command=self.toggle_dictation_read)
+            menu.add_command(label=read_lbl, command=self.start_dictation_read)
             if get_tts_manager().is_speaking:
                 menu.add_command(label="\u23f9 Stop Dictation", command=self.stop_dictation)
             menu.add_command(label="\u2699 Dictation Properties...", command=self.open_dictation_properties)
@@ -8628,6 +8628,28 @@ class MarkdownNotepad(tk.Tk):
             return
         DictationPropertiesDialog(self, manager=get_tts_manager(), theme=self.theme)
 
+    def start_dictation_read(self):
+        """Start dictating current selection or document (restarting any active playback)."""
+        if not TTS_AVAILABLE or not get_tts_manager:
+            messagebox.showwarning(
+                "Dictation Unavailable",
+                "Local TTS module is unavailable.",
+                parent=self,
+            )
+            return
+        if not REVERB_TTS_AVAILABLE:
+            messagebox.showwarning(
+                "Reverb-TTS Missing",
+                "The 'reverb-tts' package is not installed.\nInstall it via: pip install reverb-tts",
+                parent=self,
+            )
+            return
+        text, clean_md = self._get_dictation_target_text()
+        if not text.strip():
+            self._set_status("Nothing selected or written to dictate")
+            return
+        get_tts_manager().speak(text, clean_markdown=clean_md, tag="editor")
+
     def toggle_dictation_read(self):
         """Start dictating selection/document, or stop ongoing dictation."""
         if not TTS_AVAILABLE or not get_tts_manager:
@@ -8641,22 +8663,18 @@ class MarkdownNotepad(tk.Tk):
         if mgr.is_speaking:
             mgr.stop()
             return
+        self.start_dictation_read()
+
+    def read_last_ai_reply(self):
+        """Speak the latest assistant message from the AI chat sidebar."""
+        if not TTS_AVAILABLE or not get_tts_manager:
+            return
         if not REVERB_TTS_AVAILABLE:
             messagebox.showwarning(
                 "Reverb-TTS Missing",
                 "The 'reverb-tts' package is not installed.\nInstall it via: pip install reverb-tts",
                 parent=self,
             )
-            return
-        text, clean_md = self._get_dictation_target_text()
-        if not text.strip():
-            self._set_status("Nothing selected or written to dictate")
-            return
-        mgr.speak(text, clean_markdown=clean_md, tag="editor")
-
-    def read_last_ai_reply(self):
-        """Speak the latest assistant message from the AI chat sidebar."""
-        if not TTS_AVAILABLE or not get_tts_manager:
             return
         sb = getattr(self, "ai_sidebar", None)
         if not sb or not getattr(sb, "_messages", None):
@@ -8680,16 +8698,6 @@ class MarkdownNotepad(tk.Tk):
     
     def quit_app(self):
         """Exit the application"""
-        if TTS_AVAILABLE and get_tts_manager:
-            try:
-                mgr = get_tts_manager()
-                if hasattr(self, "_tts_state_cb"):
-                    mgr.remove_state_listener(self._tts_state_cb)
-                if hasattr(self, "_tts_status_cb"):
-                    mgr.remove_status_listener(self._tts_status_cb)
-                mgr.shutdown()
-            except Exception:
-                pass
         # Save session state before checking for unsaved changes
         if getattr(self, 'ai_sidebar', None):
             self.ai_sidebar.commit_edit_mode()
@@ -8716,6 +8724,17 @@ class MarkdownNotepad(tk.Tk):
         # Stop auto-save timer
         if self._auto_save_job:
             self.after_cancel(self._auto_save_job)
+
+        if TTS_AVAILABLE and get_tts_manager:
+            try:
+                mgr = get_tts_manager()
+                if hasattr(self, "_tts_state_cb"):
+                    mgr.remove_state_listener(self._tts_state_cb)
+                if hasattr(self, "_tts_status_cb"):
+                    mgr.remove_status_listener(self._tts_status_cb)
+                mgr.shutdown()
+            except Exception:
+                pass
         
         self.destroy()
     

@@ -14,6 +14,8 @@ import json
 import time
 import wave
 import queue
+import shutil
+import subprocess
 import importlib.util
 import tempfile
 import threading
@@ -84,10 +86,10 @@ LANGUAGE_SAMPLES: Dict[str, str] = {
     "en": "Hello! This is local dictation powered by Reverb text to speech.",
     "de": "Hallo! Dies ist eine lokale Sprachausgabe mit Reverb Text-to-Speech.",
     "fr": "Bonjour! Ceci est une lecture vocale locale avec Reverb.",
-    "es": "Hola! Esta es una lectura de voz local con Reverb.",
-    "it": "Ciao! Questa e una lettura vocale locale con Reverb.",
-    "pl": "Czesc! To jest lokalne czytanie tekstu z uzyciem Reverb.",
-    "pt": "Ola! Esta e uma leitura de voz local com Reverb.",
+    "es": "¡Hola! Esta es una lectura de voz local con Reverb.",
+    "it": "Ciao! Questa è una lettura vocale locale con Reverb.",
+    "pl": "Cześć! To jest lokalne czytanie tekstu z użyciem Reverb.",
+    "pt": "Olá! Esta é uma leitura de voz local com Reverb.",
 }
 
 DEFAULT_PRESET_VOICES: Tuple[str, ...] = (
@@ -187,6 +189,50 @@ def label_to_language(label: str) -> str:
     return "en"
 
 
+def _is_soundfile_readable(audio_path: str) -> bool:
+    """Return True when soundfile/libsndfile can open and inspect `audio_path` directly."""
+    if not SOUNDFILE_AVAILABLE or sf is None:
+        return False
+    try:
+        info = sf.info(audio_path)
+        return bool(info.frames > 0 and info.samplerate > 0)
+    except Exception:
+        return False
+
+
+def _transcode_to_temp_wav(audio_path: Path) -> Path:
+    """Transcode compressed/container audio (e.g. .m4a) to a mono 24 kHz temporary WAV via ffmpeg."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError(
+            f"Format '{audio_path.suffix}' requires ffmpeg on PATH (or convert to WAV/MP3/FLAC/OGG)."
+        )
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+        tmp_wav = Path(tf.name)
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-i", str(audio_path), "-ac", "1", "-ar", "24000", "-f", "wav", str(tmp_wav)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if proc.returncode != 0 or not tmp_wav.is_file() or tmp_wav.stat().st_size == 0:
+            err_lines = (proc.stderr or b"").decode("utf-8", errors="replace").strip().splitlines()
+            tail = err_lines[-1] if err_lines else f"exit code {proc.returncode}"
+            raise RuntimeError(f"Failed to decode '{audio_path.name}' via ffmpeg: {tail}")
+        _restrict_permissions(tmp_wav, is_dir=False)
+        return tmp_wav
+    except Exception:
+        try:
+            if tmp_wav.exists():
+                tmp_wav.unlink()
+        except Exception:
+            pass
+        raise
+
+
 def get_audio_duration(audio_path: str) -> Optional[float]:
     """Return duration in seconds for an audio file, or None if unavailable."""
     if not audio_path or not os.path.isfile(audio_path):
@@ -205,6 +251,27 @@ def get_audio_duration(audio_path: str) -> Optional[float]:
                 return float(wf.getnframes()) / float(fr)
     except Exception:
         pass
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            proc = subprocess.run(
+                [
+                    ffprobe, "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1", audio_path,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if proc.returncode == 0 and (proc.stdout or "").strip():
+                val = float(proc.stdout.strip())
+                if val > 0:
+                    return val
+        except Exception:
+            pass
     return None
 
 
@@ -406,8 +473,6 @@ class TTSSettings:
         target = Path(settings_file) if settings_file else SETTINGS_FILE
         target.parent.mkdir(parents=True, exist_ok=True)
         _restrict_permissions(target.parent, is_dir=True)
-        VOICES_DIR.mkdir(parents=True, exist_ok=True)
-        _restrict_permissions(VOICES_DIR, is_dir=True)
 
         data = asdict(self)
         tmp_path = target.with_suffix(".json.tmp")
@@ -628,6 +693,7 @@ class ReverbTTSManager:
 
         self._model_lock = threading.Lock()
         self._inference_lock = threading.Lock()
+        self._playback_lock = threading.Lock()
         self._tts: Any = None
         self._loaded_variant: Optional[str] = None
         self._loaded_device: Optional[str] = None
@@ -776,24 +842,39 @@ class ReverbTTSManager:
 
             try:
                 dev_arg = None if desired_device == "auto" else desired_device
-                if self._use_anonymous_hf:
-                    with self._anonymous_hf_hub():
-                        self._tts = tts_cls.from_pretrained(REPO_ID, variant=desired_variant, device=dev_arg, token=False)
-                else:
-                    try:
-                        self._tts = tts_cls.from_pretrained(REPO_ID, variant=desired_variant, device=dev_arg)
-                    except Exception as exc:
-                        err_txt = str(exc).lower()
-                        if any(k in err_txt for k in ("401", "expired", "unauthorized", "token", "repository not found")):
-                            self._use_anonymous_hf = True
-                            with self._anonymous_hf_hub():
-                                self._tts = tts_cls.from_pretrained(REPO_ID, variant=desired_variant, device=dev_arg, token=False)
-                        else:
-                            raise
-                self._loaded_variant = desired_variant
-                self._loaded_device = desired_device
-                self._voice_cache.clear()
-                actual_dev = str(getattr(self._tts, "device", desired_device))
+                with self._inference_lock:
+                    if self._tts is not None:
+                        old_tts = self._tts
+                        self._tts = None
+                        self._loaded_variant = None
+                        self._loaded_device = None
+                        self._voice_cache.clear()
+                        del old_tts
+                        if TORCH_AVAILABLE:
+                            try:
+                                import torch as _torch
+                                if _torch.cuda.is_available():
+                                    _torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                    if self._use_anonymous_hf:
+                        with self._anonymous_hf_hub():
+                            self._tts = tts_cls.from_pretrained(REPO_ID, variant=desired_variant, device=dev_arg, token=False)
+                    else:
+                        try:
+                            self._tts = tts_cls.from_pretrained(REPO_ID, variant=desired_variant, device=dev_arg)
+                        except Exception as exc:
+                            err_txt = str(exc).lower()
+                            if any(k in err_txt for k in ("401", "expired", "unauthorized", "token", "repository not found")):
+                                self._use_anonymous_hf = True
+                                with self._anonymous_hf_hub():
+                                    self._tts = tts_cls.from_pretrained(REPO_ID, variant=desired_variant, device=dev_arg, token=False)
+                            else:
+                                raise
+                    self._loaded_variant = desired_variant
+                    self._loaded_device = desired_device
+                    self._voice_cache.clear()
+                    actual_dev = str(getattr(self._tts, "device", desired_device))
                 ready_msg = f"Reverb-TTS ({desired_variant}) ready on {actual_dev.upper()}"
                 self._emit_status(ready_msg)
                 if status_cb:
@@ -900,8 +981,24 @@ class ReverbTTSManager:
         if status_cb:
             status_cb(msg)
 
-        with self._inference_lock:
-            voice_obj = self._tts.voice(str(src_path), clean_transcript, language=language)
+        temp_wav: Optional[Path] = None
+        needs_transcode = (not _is_soundfile_readable(str(src_path))) or (
+            src_path.suffix.lower() in {".m4a", ".aac", ".wma", ".webm", ".mp4", ".opus"}
+        )
+        encode_path = src_path
+        if needs_transcode:
+            temp_wav = _transcode_to_temp_wav(src_path)
+            encode_path = temp_wav
+
+        try:
+            with self._inference_lock:
+                voice_obj = self._tts.voice(str(encode_path), clean_transcript, language=language)
+        finally:
+            if temp_wav is not None and temp_wav.exists():
+                try:
+                    temp_wav.unlink()
+                except Exception:
+                    pass
 
         self.voices_dir.mkdir(parents=True, exist_ok=True)
         _restrict_permissions(self.voices_dir, is_dir=True)
@@ -1015,54 +1112,58 @@ class ReverbTTSManager:
         if cancel_event.is_set() or audio_arr is None or len(audio_arr) == 0:
             return
 
-        if SOUNDDEVICE_AVAILABLE and sd is not None:
-            try:
-                pcm = np.asarray(audio_arr, dtype=np.float32).reshape(-1, 1)
-                block = max(512, int(sample_rate * 0.08))
-                with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
-                    for offset in range(0, len(pcm), block):
-                        if cancel_event.is_set():
-                            try:
-                                stream.abort()
-                            except Exception:
-                                pass
-                            return
-                        stream.write(pcm[offset : offset + block])
+        with self._playback_lock:
+            if cancel_event.is_set():
                 return
-            except Exception as e:
-                if not WINSOUND_AVAILABLE:
-                    raise RuntimeError(f"Audio playback failed: {e}") from e
 
-        if WINSOUND_AVAILABLE and winsound is not None:
-            tmp_wav: Optional[str] = None
-            try:
-                clipped = np.clip(np.asarray(audio_arr, dtype=np.float32), -1.0, 1.0)
-                pcm16 = (clipped * 32767.0).astype(np.int16)
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-                    tmp_wav = tf.name
-                with wave.open(tmp_wav, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(int(sample_rate))
-                    wf.writeframes(pcm16.tobytes())
+            if SOUNDDEVICE_AVAILABLE and sd is not None:
+                try:
+                    pcm = np.asarray(audio_arr, dtype=np.float32).reshape(-1, 1)
+                    block = max(512, int(sample_rate * 0.08))
+                    with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
+                        for offset in range(0, len(pcm), block):
+                            if cancel_event.is_set():
+                                try:
+                                    stream.abort()
+                                except Exception:
+                                    pass
+                                return
+                            stream.write(pcm[offset : offset + block])
+                    return
+                except Exception as e:
+                    if not WINSOUND_AVAILABLE:
+                        raise RuntimeError(f"Audio playback failed: {e}") from e
 
-                duration_s = len(pcm16) / float(max(1, sample_rate))
-                winsound.PlaySound(tmp_wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
-                deadline = time.monotonic() + duration_s + 0.05
-                while time.monotonic() < deadline:
-                    if cancel_event.is_set():
-                        winsound.PlaySound(None, winsound.SND_PURGE)
-                        return
-                    time.sleep(0.06)
-            finally:
-                if tmp_wav and os.path.exists(tmp_wav):
-                    try:
-                        os.unlink(tmp_wav)
-                    except Exception:
-                        pass
-            return
+            if WINSOUND_AVAILABLE and winsound is not None:
+                tmp_wav: Optional[str] = None
+                try:
+                    clipped = np.clip(np.asarray(audio_arr, dtype=np.float32), -1.0, 1.0)
+                    pcm16 = (clipped * 32767.0).astype(np.int16)
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                        tmp_wav = tf.name
+                    with wave.open(tmp_wav, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(int(sample_rate))
+                        wf.writeframes(pcm16.tobytes())
 
-        raise RuntimeError("No audio playback backend available (install sounddevice).")
+                    duration_s = len(pcm16) / float(max(1, sample_rate))
+                    winsound.PlaySound(tmp_wav, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                    deadline = time.monotonic() + duration_s + 0.05
+                    while time.monotonic() < deadline:
+                        if cancel_event.is_set():
+                            winsound.PlaySound(None, winsound.SND_PURGE)
+                            return
+                        time.sleep(0.06)
+                finally:
+                    if tmp_wav and os.path.exists(tmp_wav):
+                        try:
+                            os.unlink(tmp_wav)
+                        except Exception:
+                            pass
+                return
+
+            raise RuntimeError("No audio playback backend available (install sounddevice).")
 
     def _synthesize_chunk(self, chunk: str, voice_obj: Any, chunk_idx: int) -> Tuple[np.ndarray, int]:
         """Synthesize one text segment using active Reverb-TTS settings."""
@@ -1278,6 +1379,11 @@ class DictationPropertiesDialog(tk.Toplevel):
         self._record_cancel: Optional[threading.Event] = None
         self._recording = False
         self._busy_training = False
+        self._saved_committed = False
+        self.manager.settings.normalize()
+        self._initial_snapshot = {
+            k: v for k, v in asdict(self.manager.settings).items() if k != "custom_voices"
+        }
 
         self.title("Dictation Properties")
         self.geometry("680x650")
@@ -1285,7 +1391,8 @@ class DictationPropertiesDialog(tk.Toplevel):
         self.minsize(620, 580)
         self.transient(parent)
         self.grab_set()
-        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Escape>", lambda e: self._cancel_and_close())
+        self.protocol("WM_DELETE_WINDOW", self._cancel_and_close)
 
         self._build_ui()
         self._load_settings_into_ui()
@@ -1302,6 +1409,18 @@ class DictationPropertiesDialog(tk.Toplevel):
             self.geometry(f"+{x}+{y}")
         except Exception:
             pass
+
+    def _cancel_and_close(self) -> None:
+        """Revert unconfirmed parameter changes while keeping trained/deleted custom voices."""
+        if not getattr(self, "_saved_committed", False):
+            try:
+                for k, v in self._initial_snapshot.items():
+                    setattr(self.manager.settings, k, v)
+                self.manager.settings.normalize()
+                self.manager.settings.save(self.manager.settings_file)
+            except Exception:
+                pass
+        self.destroy()
 
     def destroy(self):
         try:
@@ -1401,7 +1520,7 @@ class DictationPropertiesDialog(tk.Toplevel):
         footer.pack(fill=tk.X)
         ttk.Button(footer, text="Reset Defaults", command=self._reset_defaults).pack(side=tk.LEFT)
         ttk.Button(footer, text="Save & Apply", command=self._save_and_close).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(footer, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(footer, text="Cancel", command=self._cancel_and_close).pack(side=tk.RIGHT)
 
     def _build_speaker_tab(self) -> None:
         t1 = ttk.Frame(self.nb, padding=12)
@@ -1663,6 +1782,9 @@ class DictationPropertiesDialog(tk.Toplevel):
         self.auto_read_var.set(s.auto_read_ai_replies)
 
         self._on_voice_type_changed()
+        speaking = self.manager.is_speaking
+        self.test_btn.configure(state=tk.DISABLED if speaking else tk.NORMAL)
+        self.stop_test_btn.configure(state=tk.NORMAL if speaking else tk.DISABLED)
         self._refresh_header_badge()
 
     def _refresh_custom_voice_widgets(self) -> None:
@@ -1948,6 +2070,7 @@ class DictationPropertiesDialog(tk.Toplevel):
                 self.op_progress.stop()
                 self.op_progress.pack_forget()
                 self.train_btn.configure(state=tk.NORMAL)
+                self._refresh_header_badge()
                 if err_msg:
                     messagebox.showerror("Voice Training Error", err_msg, parent=self)
                 elif record:
@@ -1958,7 +2081,8 @@ class DictationPropertiesDialog(tk.Toplevel):
                     self._on_language_changed()
                     messagebox.showinfo(
                         "Custom Voice Saved",
-                        f"Custom voice '{record['name']}' is now trained, active, and persisted for future sessions.",
+                        f"Custom voice '{record['name']}' has been trained and saved. "
+                        "Click 'Save & Apply' to confirm your active dictation settings.",
                         parent=self,
                     )
             self._safe_after(_done)
@@ -1988,8 +2112,11 @@ class DictationPropertiesDialog(tk.Toplevel):
             return
         lang = rec.get("language", "en")
         self.lang_var.set(language_to_label(lang))
+        self._on_language_changed()
         self.manager.settings.language = lang
-        self.manager.speak_preview(sample_text=LANGUAGE_SAMPLES.get(lang, LANGUAGE_SAMPLES["en"]))
+        self.manager.settings.save(self.manager.settings_file)
+        sample = self.test_text_var.get().strip() or LANGUAGE_SAMPLES.get(lang, LANGUAGE_SAMPLES["en"])
+        self.manager.speak_preview(sample_text=sample)
 
     def _delete_selected_custom_voice(self) -> None:
         sel = self.voices_tree.selection()
@@ -2024,6 +2151,7 @@ class DictationPropertiesDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showwarning("Invalid Parameter", str(e), parent=self)
             return
+        self._saved_committed = True
         self.result = saved
         if self.on_save:
             try:

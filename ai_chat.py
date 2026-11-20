@@ -78,11 +78,12 @@ except ImportError:
 
 # Import local TTS dictation manager
 try:
-    from tts_manager import get_tts_manager, DictationPropertiesDialog
+    from tts_manager import get_tts_manager, DictationPropertiesDialog, REVERB_TTS_AVAILABLE
     TTS_AVAILABLE = True
 except ImportError:
     get_tts_manager = None
     DictationPropertiesDialog = None
+    REVERB_TTS_AVAILABLE = False
     TTS_AVAILABLE = False
 
 
@@ -5139,6 +5140,9 @@ class ChatSidebar(tk.Frame):
         if not TTS_AVAILABLE or not get_tts_manager:
             self._flash_status("Local TTS unavailable")
             return
+        if not REVERB_TTS_AVAILABLE:
+            self._flash_status("Reverb-TTS not installed (pip install reverb-tts)")
+            return
         if idx is None or idx < 0 or idx >= len(self._messages):
             return
         mgr = get_tts_manager()
@@ -5155,6 +5159,9 @@ class ChatSidebar(tk.Frame):
         """Read currently highlighted text inside chat_display aloud."""
         if not TTS_AVAILABLE or not get_tts_manager:
             return
+        if not REVERB_TTS_AVAILABLE:
+            self._flash_status("Reverb-TTS not installed (pip install reverb-tts)")
+            return
         w = self.chat_display
         if not w.tag_ranges(tk.SEL):
             return
@@ -5167,7 +5174,8 @@ class ChatSidebar(tk.Frame):
         if not TTS_AVAILABLE or not DictationPropertiesDialog:
             self._flash_status("Local TTS unavailable")
             return
-        DictationPropertiesDialog(self.winfo_toplevel(), manager=get_tts_manager())
+        top = self.winfo_toplevel()
+        DictationPropertiesDialog(top, manager=get_tts_manager(), theme=getattr(top, "theme", None))
 
     def _clear_display(self):
         """Clear the chat display (does not touch stored history)."""
@@ -5792,7 +5800,7 @@ class ChatSidebar(tk.Frame):
             self.chat_display.see(tk.END)
             if status == "Ready":
                 self._show_apply_button()
-                if TTS_AVAILABLE and get_tts_manager:
+                if TTS_AVAILABLE and REVERB_TTS_AVAILABLE and get_tts_manager:
                     mgr = get_tts_manager()
                     if getattr(mgr.settings, "auto_read_ai_replies", False):
                         last_ai = next(
