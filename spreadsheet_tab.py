@@ -17,19 +17,206 @@ import os
 import re
 from typing import Dict, List, Tuple, Any, Optional, Set, Union, Callable
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, colorchooser
 import tkinter.font as tkfont
 
 try:
     import openpyxl
+    from openpyxl.styles import PatternFill, Font as OpenpyxlFont, Alignment as OpenpyxlAlignment
     OPENPYXL_AVAILABLE = True
 except ImportError:
+    openpyxl = None  # type: ignore
+    PatternFill = OpenpyxlFont = OpenpyxlAlignment = None  # type: ignore
     OPENPYXL_AVAILABLE = False
 
 
 # =============================================================================
-# Range & Matrix Structures
+# Blank Sentinel, Range & Style Structures, Color Palettes
 # =============================================================================
+
+class _BlankCell:
+    """Sentinel representing an empty/unpopulated spreadsheet cell during formula evaluation."""
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __str__(self) -> str:
+        return ""
+
+    def __repr__(self) -> str:
+        return "<BLANK>"
+
+
+_BLANK = _BlankCell()
+
+
+def _normalize_hex_color(val: Optional[str]) -> Optional[str]:
+    """Validate and normalize '#rgb' or '#rrggbb' hex strings to lowercase '#rrggbb'."""
+    if not val or not isinstance(val, str):
+        return None
+    s = val.strip()
+    if not s.startswith("#"):
+        return None
+    body = s[1:]
+    if len(body) == 3 and re.fullmatch(r"[0-9a-fA-F]{3}", body):
+        body = "".join(ch * 2 for ch in body)
+    if len(body) == 6 and re.fullmatch(r"[0-9a-fA-F]{6}", body):
+        return f"#{body.lower()}"
+    return None
+
+
+def _blend_hex_colors(hex_a: str, hex_b: str, weight_a: float = 0.72) -> str:
+    """Blend two '#rrggbb' colors cleanly for semi-transparent selection tint over cell fill."""
+    na = _normalize_hex_color(hex_a) or "#ffffff"
+    nb = _normalize_hex_color(hex_b) or "#ede9fe"
+    try:
+        ra, ga, ba = int(na[1:3], 16), int(na[3:5], 16), int(na[5:7], 16)
+        rb, gb, bb = int(nb[1:3], 16), int(nb[3:5], 16), int(nb[5:7], 16)
+        w = max(0.0, min(1.0, float(weight_a)))
+        r = int(round(ra * w + rb * (1.0 - w)))
+        g = int(round(ga * w + gb * (1.0 - w)))
+        b = int(round(ba * w + bb * (1.0 - w)))
+        return f"#{max(0, min(255, r)):02x}{max(0, min(255, g)):02x}{max(0, min(255, b)):02x}"
+    except Exception:
+        return nb
+
+
+CELL_FILL_PALETTE: List[Tuple[str, str]] = [
+    ("White", "#ffffff"), ("Soft Gray", "#e2e8f0"), ("Warm Cream", "#fef9c3"), ("Soft Yellow", "#fef08a"),
+    ("Amber Tint", "#fde68a"), ("Peach", "#fed7aa"), ("Rose Tint", "#fecdd3"), ("Soft Coral", "#fca5a5"),
+    ("Soft Green", "#bbf7d0"), ("Mint", "#99f6e4"), ("Soft Blue", "#bfdbfe"), ("Lavender", "#ddd6fe"),
+    ("Gold", "#fde047"), ("Orange", "#fdba74"), ("Crimson", "#ef4444"), ("Emerald", "#86efac"),
+    ("Sky Blue", "#93c5fd"), ("Violet", "#c4b5fd"), ("Teal", "#5eead4"), ("Slate", "#cbd5e1"),
+    ("Navy Header", "#1e3a8a"), ("Royal Purple", "#4c1d95"), ("Forest Green", "#14532d"), ("Charcoal", "#334155"),
+]
+
+CELL_FONT_PALETTE: List[Tuple[str, str]] = [
+    ("Black", "#000000"), ("Charcoal", "#334155"), ("Slate Gray", "#64748b"), ("White", "#ffffff"),
+    ("Crimson Red", "#dc2626"), ("Dark Red", "#991b1b"), ("Burnt Orange", "#ea580c"), ("Amber", "#d97706"),
+    ("Forest Green", "#16a34a"), ("Emerald", "#059669"), ("Teal", "#0d9488"), ("Royal Blue", "#2563eb"),
+    ("Navy", "#1e3a8a"), ("Indigo", "#4f46e5"), ("Violet", "#7c3aed"), ("Magenta", "#c026d3"),
+    ("Rose", "#e11d48"), ("Deep Brown", "#78350f"), ("Olive", "#4d7c0f"), ("Cyan", "#0284c7"),
+]
+
+
+class _ColorPalettePopup(tk.Toplevel):
+    """Lightweight Excel-style swatch grid popup for cell Fill/Highlight or Font color."""
+
+    def __init__(
+        self,
+        anchor_widget: tk.Widget,
+        palette: List[Tuple[str, str]],
+        reset_label: str,
+        on_select: Callable[[Optional[str]], None],
+    ):
+        super().__init__(anchor_widget)
+        self.on_select = on_select
+        self.wm_overrideredirect(True)
+        self.configure(bg="#ffffff", relief=tk.SOLID, borderwidth=1)
+
+        container = tk.Frame(self, bg="#ffffff", padx=8, pady=8)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        reset_btn = tk.Button(
+            container,
+            text=reset_label,
+            command=lambda: self._pick(None),
+            relief=tk.FLAT,
+            bg="#f8fafc",
+            fg="#1e293b",
+            activebackground="#ede9fe",
+            font=("Segoe UI", 9),
+            pady=3,
+            cursor="hand2",
+        )
+        reset_btn.pack(fill=tk.X, pady=(0, 6))
+
+        grid_frame = tk.Frame(container, bg="#ffffff")
+        grid_frame.pack()
+        cols = 6 if len(palette) >= 24 else 5
+        for idx, (cname, chex) in enumerate(palette):
+            r, c = divmod(idx, cols)
+            sw = tk.Button(
+                grid_frame,
+                text="",
+                width=2,
+                height=1,
+                bg=chex,
+                activebackground=chex,
+                relief=tk.SOLID,
+                bd=1,
+                cursor="hand2",
+                command=lambda h=chex: self._pick(h),
+            )
+            sw.grid(row=r, column=c, padx=2, pady=2)
+            ToolTip(sw, f"{cname} ({chex})")
+
+        more_btn = tk.Button(
+            container,
+            text="More Colors...",
+            command=self._choose_custom,
+            relief=tk.FLAT,
+            bg="#f3effa",
+            fg="#4c1d95",
+            activebackground="#ede9fe",
+            font=("Segoe UI", 9, "bold"),
+            pady=3,
+            cursor="hand2",
+        )
+        more_btn.pack(fill=tk.X, pady=(6, 0))
+
+        self.update_idletasks()
+        try:
+            ax = anchor_widget.winfo_rootx()
+            ay = anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 2
+            pw, ph = self.winfo_reqwidth(), self.winfo_reqheight()
+            sw_px, sh_px = self.winfo_screenwidth(), self.winfo_screenheight()
+            if ax + pw > sw_px - 8:
+                ax = max(8, sw_px - pw - 8)
+            if ay + ph > sh_px - 8:
+                ay = max(8, anchor_widget.winfo_rooty() - ph - 2)
+            self.wm_geometry(f"+{ax}+{ay}")
+        except Exception:
+            pass
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.focus_set()
+
+    def _on_focus_out(self, _event=None):
+        self.after(60, self._check_focus_close)
+
+    def _check_focus_close(self):
+        try:
+            if not self.winfo_exists():
+                return
+            focused = self.focus_get()
+            if focused is None or focused.winfo_toplevel() is not self:
+                self.destroy()
+        except Exception:
+            try:
+                self.destroy()
+            except Exception:
+                pass
+
+    def _pick(self, hex_color: Optional[str]):
+        try:
+            self.destroy()
+        finally:
+            self.on_select(hex_color)
+
+    def _choose_custom(self):
+        try:
+            self.withdraw()
+            chosen = colorchooser.askcolor(title="Choose Custom Color", parent=self.master)
+        finally:
+            try:
+                self.destroy()
+            except Exception:
+                pass
+        if chosen and chosen[1]:
+            self.on_select(_normalize_hex_color(chosen[1]))
+
 
 class CellRange(list):
     """List subclass preserving 2D matrix structure for VLOOKUP, INDEX, and MATCH."""
@@ -118,13 +305,31 @@ def expand_range(r1: int, c1: int, r2: int, c2: int) -> List[Tuple[int, int]]:
 
 
 def shift_formula_references(formula: str, dr: int, dc: int) -> str:
-    """Shift relative cell coordinates in an Excel formula by (dr, dc), preserving absolute ($) references."""
+    """Shift relative cell/column/row coordinates in an Excel formula by (dr, dc), preserving $ locks."""
     if not formula or not formula.startswith("="):
         return formula
 
     def _repl(m):
-        abs_c, col_str, abs_r, row_str = m.groups()
         try:
+            if m.group(2) is not None:
+                ac1, c1, ac2, c2 = m.group(1), m.group(2), m.group(3), m.group(4)
+                i1 = col_letter_to_index(c1)
+                i2 = col_letter_to_index(c2)
+                ni1 = i1 if ac1 else max(0, i1 + dc)
+                ni2 = i2 if ac2 else max(0, i2 + dc)
+                s1 = f"${col_index_to_letter(ni1)}" if ac1 else col_index_to_letter(ni1)
+                s2 = f"${col_index_to_letter(ni2)}" if ac2 else col_index_to_letter(ni2)
+                return f"{s1}:{s2}"
+            if m.group(6) is not None:
+                ar1, r1, ar2, r2 = m.group(5), m.group(6), m.group(7), m.group(8)
+                row1 = int(r1) - 1
+                row2 = int(r2) - 1
+                nr1 = row1 if ar1 else max(0, row1 + dr)
+                nr2 = row2 if ar2 else max(0, row2 + dr)
+                s1 = f"${nr1 + 1}" if ar1 else str(nr1 + 1)
+                s2 = f"${nr2 + 1}" if ar2 else str(nr2 + 1)
+                return f"{s1}:{s2}"
+            abs_c, col_str, abs_r, row_str = m.group(9), m.group(10), m.group(11), m.group(12)
             c = col_letter_to_index(col_str)
             r = int(row_str) - 1
             new_c = c if abs_c else max(0, c + dc)
@@ -138,7 +343,11 @@ def shift_formula_references(formula: str, dr: int, dc: int) -> str:
     # Process outside string literals
     parts = []
     last_end = 0
-    pattern = re.compile(r'(\$?)([A-Za-z]+)(\$?)([0-9]+)')
+    pattern = re.compile(
+        r'(?<![A-Za-z0-9_])(\$?)([A-Za-z]{1,3}):(\$?)([A-Za-z]{1,3})(?![A-Za-z0-9_])'
+        r'|(?<![A-Za-z0-9_])(\$?)([0-9]+):(\$?)([0-9]+)(?![A-Za-z0-9_])'
+        r'|(\$?)([A-Za-z]{1,3})(\$?)([0-9]+)'
+    )
     for m in re.finditer(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')', formula):
         chunk = formula[last_end:m.start()]
         parts.append(pattern.sub(_repl, chunk))
@@ -149,19 +358,27 @@ def shift_formula_references(formula: str, dr: int, dc: int) -> str:
 
 
 def preprocess_excel_formula(expr: str) -> str:
-    """Transform Excel formula syntax ($A$1, <>, =, ^, ranges) to safe Python-evaluable AST format."""
+    """Transform Excel formula syntax ($A$1, $E:$E, $1:$5, <>, =, ^, ranges) to AST-evaluable Python."""
     cleaned = expr.strip()
     if not cleaned:
         return ""
 
     def _process_chunk(chunk: str) -> str:
-        # 1. Range syntax $A$1:$B$10 -> _RANGE_('A1', 'B10')
-        range_pat = re.compile(r"(\$?[A-Za-z]+\$?[0-9]+):(\$?[A-Za-z]+\$?[0-9]+)")
+        # 1a. Bounded cell ranges $A$1:$B$10 -> _RANGE_('A1', 'B10')
+        range_pat = re.compile(r"(\$?[A-Za-z]{1,3}\$?[0-9]+):(\$?[A-Za-z]{1,3}\$?[0-9]+)")
         def _range_repl(m):
             c1 = m.group(1).replace('$', '')
             c2 = m.group(2).replace('$', '')
             return f"_RANGE_('{c1}', '{c2}')"
         chunk = range_pat.sub(_range_repl, chunk)
+
+        # 1b. Whole-column ranges $E:$E or D:F -> _COLRANGE_('E', 'E')
+        col_range_pat = re.compile(r"(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3}):\$?([A-Za-z]{1,3})(?![A-Za-z0-9_])")
+        chunk = col_range_pat.sub(lambda m: f"_COLRANGE_('{m.group(1)}', '{m.group(2)}')", chunk)
+
+        # 1c. Whole-row ranges $1:$5 or 2:4 -> _ROWRANGE_(1, 5)
+        row_range_pat = re.compile(r"(?<![A-Za-z0-9_])\$?([0-9]+):\$?([0-9]+)(?![A-Za-z0-9_])")
+        chunk = row_range_pat.sub(lambda m: f"_ROWRANGE_({int(m.group(1))}, {int(m.group(2))})", chunk)
 
         # 2. Caret ^ -> **
         chunk = chunk.replace("^", "**")
@@ -280,7 +497,18 @@ class FormulaEngine:
     ERROR_NAME = "#NAME?"
     ERROR_REF = "#REF!"
     ERROR_CIRC = "#CIRC!"
+    ERROR_NA = "#N/A"
     ERROR_GENERIC = "#ERROR!"
+
+    _ALL_ERRORS = (
+        ERROR_DIV_ZERO,
+        ERROR_VALUE,
+        ERROR_NAME,
+        ERROR_REF,
+        ERROR_CIRC,
+        ERROR_NA,
+        ERROR_GENERIC,
+    )
 
     MAX_AST_NODES = 500
     MAX_EXPONENT = 1000
@@ -315,8 +543,16 @@ class FormulaEngine:
             "VAR": self._fn_var,
             "IF": self._fn_if,
             "IFERROR": self._fn_iferror,
+            "IFNA": self._fn_ifna,
+            "ISBLANK": self._fn_isblank,
+            "ISERROR": self._fn_iserror,
+            "ISNA": self._fn_isna,
+            "ISNUMBER": self._fn_isnumber,
+            "ISTEXT": self._fn_istext,
             "SUMIF": self._fn_sumif,
+            "SUMIFS": self._fn_sumifs,
             "COUNTIF": self._fn_countif,
+            "COUNTIFS": self._fn_countifs,
             "AND": self._fn_and,
             "OR": self._fn_or,
             "NOT": self._fn_not,
@@ -328,9 +564,13 @@ class FormulaEngine:
             "TRIM": self._fn_trim,
             "LEFT": self._fn_left,
             "RIGHT": self._fn_right,
+            "MID": self._fn_mid,
+            "FIND": self._fn_find,
+            "SUBSTITUTE": self._fn_substitute,
             "SPARKLINE": self._fn_sparkline,
             "AVERAGEIF": self._fn_averageif,
             "VLOOKUP": self._fn_vlookup,
+            "XLOOKUP": self._fn_xlookup,
             "INDEX": self._fn_index,
             "MATCH": self._fn_match,
         }
@@ -340,11 +580,13 @@ class FormulaEngine:
     # -------------------------------------------------------------------------
 
     def _flatten_values(self, args: Any) -> List[Any]:
-        """Flatten nested iterables (tuples, lists) and strip cell containers."""
+        """Flatten nested iterables (tuples, lists) and unwrap blank cell sentinels."""
         result = []
         if isinstance(args, (list, tuple)):
             for item in args:
                 result.extend(self._flatten_values(item))
+        elif args is _BLANK:
+            result.append("")
         else:
             result.append(args)
         return result
@@ -354,7 +596,7 @@ class FormulaEngine:
         flat = self._flatten_values(args)
         nums = []
         for x in flat:
-            if x is None or x == "":
+            if x is None or x is _BLANK or x == "":
                 continue
             if isinstance(x, (int, float)) and not isinstance(x, bool):
                 nums.append(float(x))
@@ -495,78 +737,203 @@ class FormulaEngine:
         mean = sum(nums) / len(nums)
         return sum((x - mean) ** 2 for x in nums) / (len(nums) - 1)
 
-    def _fn_if(self, cond: Any, t_val: Any, f_val: Any = 0) -> Any:
-        return t_val if bool(cond) else f_val
+    @staticmethod
+    def _is_truthy(val: Any) -> bool:
+        if val is None or val is _BLANK or val == "":
+            return False
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return val != 0
+        if isinstance(val, str):
+            low = val.strip().lower()
+            if low in ("false", "0", ""):
+                return False
+            return True
+        return bool(val)
 
-    def _fn_iferror(self, val: Any, alt_val: Any) -> Any:
+    @staticmethod
+    def _try_parse_number(val: Any) -> Optional[float]:
+        if val is None or val is _BLANK or val == "" or isinstance(val, bool):
+            return None
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, str):
+            s = val.strip().replace("$", "").replace(",", "")
+            if not s:
+                return None
+            try:
+                return float(s)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _excel_wildcard_regex(pattern: str) -> re.Pattern:
+        """Compile an Excel wildcard string (*, ?, ~ escape) into a case-insensitive full-match regex."""
+        out = ["^"]
+        i = 0
+        n = len(pattern)
+        while i < n:
+            ch = pattern[i]
+            if ch == "~" and i + 1 < n:
+                out.append(re.escape(pattern[i + 1]))
+                i += 2
+            elif ch == "*":
+                out.append(".*")
+                i += 1
+            elif ch == "?":
+                out.append(".")
+                i += 1
+            else:
+                out.append(re.escape(ch))
+                i += 1
+        out.append("$")
+        return re.compile("".join(out), re.IGNORECASE | re.DOTALL)
+
+    def _values_equal_excel(self, cell_val: Any, target: Any, allow_wildcards: bool = False) -> bool:
+        """Exact Excel lookup equality: numeric equality, or case-insensitive text (+ optional wildcards); blanks != 0."""
+        cv = "" if cell_val is None or cell_val is _BLANK else cell_val
+        tv = "" if target is None or target is _BLANK else target
+
+        if isinstance(cv, bool) or isinstance(tv, bool):
+            return isinstance(cv, bool) and isinstance(tv, bool) and cv == tv
+
+        t_num = self._try_parse_number(tv)
+        c_num = self._try_parse_number(cv)
+        if t_num is not None and c_num is not None:
+            return c_num == t_num
+        if (t_num is not None) != (c_num is not None):
+            # Numeric 0 must NOT match an empty/blank cell or unrelated string
+            if cv == "" or tv == "":
+                return False
+            return str(cv).strip().lower() == str(tv).strip().lower()
+
+        cs = str(cv).strip()
+        ts = str(tv).strip()
+        if allow_wildcards and ("*" in ts or "?" in ts or "~" in ts):
+            return bool(self._excel_wildcard_regex(ts).match(cs))
+        return cs.lower() == ts.lower()
+
+    def _matches_criteria(self, cv: Any, criteria: Any) -> bool:
+        """Evaluate Excel COUNTIF/SUMIF/AVERAGEIF/COUNTIFS/SUMIFS criterion against cell value."""
+        crit_str = "" if criteria is None or criteria is _BLANK else str(criteria).strip()
+        try:
+            if crit_str.startswith(">="):
+                t_num = self._try_parse_number(crit_str[2:].strip())
+                c_num = self._try_parse_number(cv)
+                if t_num is not None and c_num is not None:
+                    return c_num >= t_num
+                return str(cv).lower() >= crit_str[2:].strip().lower()
+            if crit_str.startswith("<="):
+                t_num = self._try_parse_number(crit_str[2:].strip())
+                c_num = self._try_parse_number(cv)
+                if t_num is not None and c_num is not None:
+                    return c_num <= t_num
+                return str(cv).lower() <= crit_str[2:].strip().lower()
+            if crit_str.startswith("<>"):
+                rhs = crit_str[2:].strip()
+                return not self._values_equal_excel(cv, rhs, allow_wildcards=True)
+            if crit_str.startswith(">"):
+                t_num = self._try_parse_number(crit_str[1:].strip())
+                c_num = self._try_parse_number(cv)
+                if t_num is not None and c_num is not None:
+                    return c_num > t_num
+                return str(cv).lower() > crit_str[1:].strip().lower()
+            if crit_str.startswith("<"):
+                t_num = self._try_parse_number(crit_str[1:].strip())
+                c_num = self._try_parse_number(cv)
+                if t_num is not None and c_num is not None:
+                    return c_num < t_num
+                return str(cv).lower() < crit_str[1:].strip().lower()
+            if crit_str.startswith("="):
+                rhs = crit_str[1:].strip()
+                return self._values_equal_excel(cv, rhs, allow_wildcards=True)
+            return self._values_equal_excel(cv, crit_str if criteria is not None else "", allow_wildcards=True)
+        except Exception:
+            return str(cv).lower() == crit_str.lower()
+
+    def _fn_if(self, cond: Any, t_val: Any = True, f_val: Any = False) -> Any:
+        return t_val if self._is_truthy(cond) else f_val
+
+    def _fn_iferror(self, val: Any, alt_val: Any = "") -> Any:
         if isinstance(val, str) and val.startswith("#"):
             return alt_val
         return val
 
+    def _fn_ifna(self, val: Any, alt_val: Any = "") -> Any:
+        if val == self.ERROR_NA:
+            return alt_val
+        return val
+
+    def _fn_isblank(self, val: Any) -> bool:
+        return val is _BLANK or val == ""
+
+    def _fn_iserror(self, val: Any) -> bool:
+        return isinstance(val, str) and val.startswith("#")
+
+    def _fn_isna(self, val: Any) -> bool:
+        return val == self.ERROR_NA
+
+    def _fn_isnumber(self, val: Any) -> bool:
+        return isinstance(val, (int, float)) and not isinstance(val, bool)
+
+    def _fn_istext(self, val: Any) -> bool:
+        return isinstance(val, str) and not val.startswith("#")
+
     def _fn_sumif(self, criteria_range: Any, criteria: Any, sum_range: Any = None) -> float:
         c_vals = self._flatten_values(criteria_range)
         s_vals = self._flatten_values(sum_range) if sum_range is not None else c_vals
-        crit_str = str(criteria).strip()
         total = 0.0
         for cv, sv in zip(c_vals, s_vals):
-            match = False
-            try:
-                if crit_str.startswith(">="):
-                    match = float(cv) >= float(crit_str[2:])
-                elif crit_str.startswith("<="):
-                    match = float(cv) <= float(crit_str[2:])
-                elif crit_str.startswith(">"):
-                    match = float(cv) > float(crit_str[1:])
-                elif crit_str.startswith("<"):
-                    match = float(cv) < float(crit_str[1:])
-                elif crit_str.startswith("="):
-                    match = str(cv) == crit_str[1:]
-                else:
-                    match = str(cv).lower() == crit_str.lower()
-            except Exception:
-                match = str(cv).lower() == crit_str.lower()
-            if match:
-                try:
-                    total += float(sv)
-                except (ValueError, TypeError):
-                    pass
+            if self._matches_criteria(cv, criteria):
+                num = self._try_parse_number(sv)
+                if num is not None:
+                    total += num
+        return total
+
+    def _fn_sumifs(self, sum_range: Any, *args) -> Union[float, str]:
+        if len(args) < 2 or len(args) % 2 != 0:
+            return self.ERROR_VALUE
+        s_vals = self._flatten_values(sum_range)
+        pairs = []
+        for idx in range(0, len(args), 2):
+            cr = self._flatten_values(args[idx])
+            pairs.append((cr, args[idx + 1]))
+        total = 0.0
+        for i, sv in enumerate(s_vals):
+            if all(i < len(cr) and self._matches_criteria(cr[i], crit) for cr, crit in pairs):
+                num = self._try_parse_number(sv)
+                if num is not None:
+                    total += num
         return total
 
     def _fn_countif(self, criteria_range: Any, criteria: Any) -> int:
         c_vals = self._flatten_values(criteria_range)
-        crit_str = str(criteria).strip()
+        return sum(1 for cv in c_vals if self._matches_criteria(cv, criteria))
+
+    def _fn_countifs(self, *args) -> Union[int, str]:
+        if len(args) < 2 or len(args) % 2 != 0:
+            return self.ERROR_VALUE
+        pairs = [(self._flatten_values(args[i]), args[i + 1]) for i in range(0, len(args), 2)]
+        n = min(len(cr) for cr, _ in pairs)
         count = 0
-        for cv in c_vals:
-            match = False
-            try:
-                if crit_str.startswith(">="):
-                    match = float(cv) >= float(crit_str[2:])
-                elif crit_str.startswith("<="):
-                    match = float(cv) <= float(crit_str[2:])
-                elif crit_str.startswith(">"):
-                    match = float(cv) > float(crit_str[1:])
-                elif crit_str.startswith("<"):
-                    match = float(cv) < float(crit_str[1:])
-                elif crit_str.startswith("="):
-                    match = str(cv) == crit_str[1:]
-                else:
-                    match = str(cv).lower() == crit_str.lower()
-            except Exception:
-                match = str(cv).lower() == crit_str.lower()
-            if match:
+        for i in range(n):
+            if all(self._matches_criteria(cr[i], crit) for cr, crit in pairs):
                 count += 1
         return count
 
     def _fn_and(self, *args) -> bool:
         flat = self._flatten_values(args)
-        return all(bool(x) for x in flat)
+        vals = [x for x in flat if x != "" and not (isinstance(x, str) and x.lower() not in ("true", "false"))]
+        return bool(vals) and all(self._is_truthy(x) for x in flat if x != "")
 
     def _fn_or(self, *args) -> bool:
         flat = self._flatten_values(args)
-        return any(bool(x) for x in flat)
+        return any(self._is_truthy(x) for x in flat if x != "")
 
     def _fn_not(self, val: Any) -> bool:
-        return not bool(val)
+        return not self._is_truthy(val)
 
     def _fn_concat(self, *args) -> str:
         flat = self._flatten_values(args)
@@ -587,7 +954,7 @@ class FormulaEngine:
     def _fn_left(self, s: Any, n: Any = 1) -> str:
         try:
             num = int(float(self._to_numbers(n)[0]))
-            return str(s)[:num]
+            return str(s)[:max(0, num)]
         except Exception:
             return str(s)[:1]
 
@@ -597,6 +964,49 @@ class FormulaEngine:
             return str(s)[-num:] if num > 0 else ""
         except Exception:
             return str(s)[-1:] if str(s) else ""
+
+    def _fn_mid(self, s: Any, start_num: Any, num_chars: Any) -> Union[str, str]:
+        try:
+            start = int(float(self._to_numbers(start_num)[0])) - 1
+            count = int(float(self._to_numbers(num_chars)[0]))
+            if start < 0 or count < 0:
+                return self.ERROR_VALUE
+            return str(s)[start:start + count]
+        except Exception:
+            return self.ERROR_VALUE
+
+    def _fn_find(self, find_text: Any, within_text: Any, start_num: Any = 1) -> Union[int, str]:
+        try:
+            start = int(float(self._to_numbers(start_num)[0])) - 1
+            if start < 0:
+                return self.ERROR_VALUE
+            pos = str(within_text).find(str(find_text), start)
+            return pos + 1 if pos >= 0 else self.ERROR_VALUE
+        except Exception:
+            return self.ERROR_VALUE
+
+    def _fn_substitute(self, text: Any, old_text: Any, new_text: Any, instance_num: Any = None) -> Union[str, str]:
+        src = str(text)
+        old = str(old_text)
+        new = str(new_text)
+        if not old:
+            return src
+        if instance_num is None or instance_num == "":
+            return src.replace(old, new)
+        try:
+            target_inst = int(float(self._to_numbers(instance_num)[0]))
+            if target_inst < 1:
+                return self.ERROR_VALUE
+        except Exception:
+            return self.ERROR_VALUE
+        idx = -1
+        pos = 0
+        for _ in range(target_inst):
+            idx = src.find(old, pos)
+            if idx == -1:
+                return src
+            pos = idx + len(old)
+        return src[:idx] + new + src[idx + len(old):]
 
     def _fn_sparkline(self, *args) -> str:
         """Render inline Unicode block sparklines from a numeric range (e.g. ▂▄▆█▃)."""
@@ -619,35 +1029,17 @@ class FormulaEngine:
     def _fn_averageif(self, criteria_range: Any, criteria: Any, avg_range: Any = None) -> Union[float, str]:
         c_vals = self._flatten_values(criteria_range)
         a_vals = self._flatten_values(avg_range) if avg_range is not None else c_vals
-        crit_str = str(criteria).strip()
         matching_nums = []
         for cv, av in zip(c_vals, a_vals):
-            match = False
-            try:
-                if crit_str.startswith(">="):
-                    match = float(cv) >= float(crit_str[2:])
-                elif crit_str.startswith("<="):
-                    match = float(cv) <= float(crit_str[2:])
-                elif crit_str.startswith(">"):
-                    match = float(cv) > float(crit_str[1:])
-                elif crit_str.startswith("<"):
-                    match = float(cv) < float(crit_str[1:])
-                elif crit_str.startswith("="):
-                    match = str(cv) == crit_str[1:]
-                else:
-                    match = str(cv).lower() == crit_str.lower()
-            except Exception:
-                match = str(cv).lower() == crit_str.lower()
-            if match:
-                try:
-                    matching_nums.append(float(av))
-                except (ValueError, TypeError):
-                    pass
+            if self._matches_criteria(cv, criteria):
+                num = self._try_parse_number(av)
+                if num is not None:
+                    matching_nums.append(num)
         if not matching_nums:
             return self.ERROR_DIV_ZERO
         return sum(matching_nums) / len(matching_nums)
 
-    def _fn_vlookup(self, lookup_val: Any, cell_range: Any, col_idx: Any, exact_match: Any = True) -> Any:
+    def _fn_vlookup(self, lookup_val: Any, cell_range: Any, col_idx: Any, range_lookup: Any = False) -> Any:
         if not hasattr(cell_range, "matrix"):
             return self.ERROR_REF
         matrix = cell_range.matrix
@@ -657,28 +1049,58 @@ class FormulaEngine:
             return self.ERROR_VALUE
         if col_target < 0:
             return self.ERROR_VALUE
-        lookup_s = str(lookup_val).strip()
-        for row in matrix:
-            if not row:
-                continue
-            first_val = str(row[0]).strip()
-            match = False
-            try:
-                match = float(first_val) == float(lookup_s)
-            except Exception:
-                match = first_val.lower() == lookup_s.lower()
-            if match:
-                if col_target < len(row):
-                    return row[col_target]
-                return self.ERROR_REF
-        return self.ERROR_VALUE
 
-    def _fn_index(self, cell_range: Any, row_num: Any, col_num: Any = 1) -> Any:
+        approx = self._is_truthy(range_lookup)
+        if not approx:
+            for row in matrix:
+                if not row:
+                    continue
+                if self._values_equal_excel(row[0], lookup_val, allow_wildcards=True):
+                    if col_target < len(row):
+                        return row[col_target]
+                    return self.ERROR_REF
+            return self.ERROR_NA
+
+        # Approximate match on sorted ascending leftmost column
+        l_num = self._try_parse_number(lookup_val)
+        best_row = None
+        for row in matrix:
+            if not row or row[0] == "":
+                continue
+            r_num = self._try_parse_number(row[0])
+            if l_num is not None and r_num is not None:
+                if r_num <= l_num:
+                    best_row = row
+                else:
+                    break
+            elif l_num is None and r_num is None:
+                if str(row[0]).strip().lower() <= str(lookup_val).strip().lower():
+                    best_row = row
+                else:
+                    break
+        if best_row is not None:
+            if col_target < len(best_row):
+                return best_row[col_target]
+            return self.ERROR_REF
+        return self.ERROR_NA
+
+    def _fn_index(self, cell_range: Any, row_num: Any, col_num: Any = None) -> Any:
         if hasattr(cell_range, "matrix"):
             matrix = cell_range.matrix
             try:
-                r_idx = int(float(self._to_numbers(row_num)[0])) - 1
-                c_idx = int(float(self._to_numbers(col_num)[0])) - 1
+                r_n = int(float(self._to_numbers(row_num)[0]))
+                if col_num is None:
+                    if len(matrix) == 1 and len(matrix[0]) > 1:
+                        # Single-row horizontal range: INDEX(A1:E1, 3) selects 3rd column
+                        c_idx = r_n - 1
+                        if 0 <= c_idx < len(matrix[0]):
+                            return matrix[0][c_idx]
+                        return self.ERROR_REF
+                    r_idx = r_n - 1
+                    c_idx = 0
+                else:
+                    r_idx = r_n - 1
+                    c_idx = int(float(self._to_numbers(col_num)[0])) - 1
                 if 0 <= r_idx < len(matrix) and 0 <= c_idx < len(matrix[r_idx]):
                     return matrix[r_idx][c_idx]
                 return self.ERROR_REF
@@ -695,17 +1117,107 @@ class FormulaEngine:
 
     def _fn_match(self, lookup_val: Any, lookup_range: Any, match_type: Any = 0) -> Union[int, str]:
         flat = self._flatten_values(lookup_range)
-        lookup_s = str(lookup_val).strip()
-        for i, val in enumerate(flat):
-            val_s = str(val).strip()
-            match = False
-            try:
-                match = float(val_s) == float(lookup_s)
-            except Exception:
-                match = val_s.lower() == lookup_s.lower()
-            if match:
-                return i + 1
-        return self.ERROR_VALUE
+        try:
+            mtype = int(float(self._to_numbers(match_type)[0])) if match_type is not None else 0
+        except Exception:
+            mtype = 0
+
+        if mtype == 0:
+            for i, val in enumerate(flat):
+                if self._values_equal_excel(val, lookup_val, allow_wildcards=True):
+                    return i + 1
+            return self.ERROR_NA
+
+        l_num = self._try_parse_number(lookup_val)
+        best_pos: Optional[int] = None
+        if mtype > 0:
+            # Ascending: largest value <= lookup_val
+            for i, val in enumerate(flat):
+                if val == "":
+                    continue
+                v_num = self._try_parse_number(val)
+                if l_num is not None and v_num is not None:
+                    if v_num <= l_num:
+                        best_pos = i + 1
+                    else:
+                        break
+                elif l_num is None and v_num is None:
+                    if str(val).strip().lower() <= str(lookup_val).strip().lower():
+                        best_pos = i + 1
+                    else:
+                        break
+        else:
+            # Descending: smallest value >= lookup_val
+            for i, val in enumerate(flat):
+                if val == "":
+                    continue
+                v_num = self._try_parse_number(val)
+                if l_num is not None and v_num is not None:
+                    if v_num >= l_num:
+                        best_pos = i + 1
+                    else:
+                        break
+                elif l_num is None and v_num is None:
+                    if str(val).strip().lower() >= str(lookup_val).strip().lower():
+                        best_pos = i + 1
+                    else:
+                        break
+
+        return best_pos if best_pos is not None else self.ERROR_NA
+
+    def _fn_xlookup(
+        self,
+        lookup_val: Any,
+        lookup_array: Any,
+        return_array: Any,
+        if_not_found: Any = None,
+        match_mode: Any = 0,
+        search_mode: Any = 1,
+    ) -> Any:
+        l_vals = self._flatten_values(lookup_array)
+        r_vals = self._flatten_values(return_array)
+        try:
+            mmode = int(float(self._to_numbers(match_mode)[0])) if match_mode is not None else 0
+        except Exception:
+            mmode = 0
+        try:
+            smode = int(float(self._to_numbers(search_mode)[0])) if search_mode is not None else 1
+        except Exception:
+            smode = 1
+
+        indices = range(len(l_vals) - 1, -1, -1) if smode < 0 else range(len(l_vals))
+        allow_wc = (mmode == 2)
+        for i in indices:
+            if self._values_equal_excel(l_vals[i], lookup_val, allow_wildcards=allow_wc):
+                return r_vals[i] if i < len(r_vals) else self.ERROR_REF
+
+        if mmode in (-1, 1):
+            l_num = self._try_parse_number(lookup_val)
+            best_i: Optional[int] = None
+            best_key: Any = None
+            for i in indices:
+                val = l_vals[i]
+                if val == "":
+                    continue
+                v_num = self._try_parse_number(val)
+                if l_num is not None and v_num is not None:
+                    cand_ok = (v_num <= l_num) if mmode == -1 else (v_num >= l_num)
+                    better = best_key is None or ((v_num > best_key) if mmode == -1 else (v_num < best_key))
+                    if cand_ok and better:
+                        best_key = v_num
+                        best_i = i
+                elif l_num is None and v_num is None:
+                    vs = str(val).strip().lower()
+                    ls = str(lookup_val).strip().lower()
+                    cand_ok = (vs <= ls) if mmode == -1 else (vs >= ls)
+                    better = best_key is None or ((vs > best_key) if mmode == -1 else (vs < best_key))
+                    if cand_ok and better:
+                        best_key = vs
+                        best_i = i
+            if best_i is not None:
+                return r_vals[best_i] if best_i < len(r_vals) else self.ERROR_REF
+
+        return if_not_found if if_not_found is not None else self.ERROR_NA
 
     # -------------------------------------------------------------------------
     # Evaluation Core
@@ -809,7 +1321,78 @@ class FormulaEngine:
         if sum(1 for _ in ast.walk(tree)) > self.MAX_AST_NODES:
             return self.ERROR_VALUE
 
-        return self._eval_ast_node(tree.body, cur_r, cur_c)
+        result = self._eval_ast_node(tree.body, cur_r, cur_c)
+        return "" if result is _BLANK else result
+
+    def _build_cell_range(self, min_r: int, max_r: int, min_c: int, max_c: int) -> Any:
+        if min_r < 0 or min_c < 0 or (max_r - min_r + 1) * (max_c - min_c + 1) > self.MAX_RANGE_CELLS:
+            return self.ERROR_REF
+        flat_vals = []
+        matrix = []
+        for r in range(min_r, max_r + 1):
+            row_vals = []
+            for c in range(min_c, max_c + 1):
+                v = self.evaluate_cell(r, c)
+                row_vals.append(v)
+                flat_vals.append(v)
+            matrix.append(row_vals)
+        return CellRange(flat_vals, min_r, min_c, max_r, max_c, matrix)
+
+    @staticmethod
+    def _excel_compare(left: Any, right: Any, op: ast.cmpop) -> Any:
+        """Excel-compliant comparison semantics handling blank cells, strings, numbers, and booleans."""
+        l, r = left, right
+        if l is _BLANK and r is _BLANK:
+            l, r = 0.0, 0.0
+        elif l is _BLANK:
+            if isinstance(r, str):
+                l = ""
+            elif isinstance(r, bool):
+                l = False
+            else:
+                l = 0.0
+        elif r is _BLANK:
+            if isinstance(l, str):
+                r = ""
+            elif isinstance(l, bool):
+                r = False
+            else:
+                r = 0.0
+
+        def _type_rank(val: Any) -> int:
+            if isinstance(val, bool):
+                return 2
+            if isinstance(val, (int, float)):
+                return 0
+            return 1
+
+        if isinstance(l, bool) and isinstance(r, bool):
+            lv, rv = l, r
+        elif isinstance(l, (int, float)) and not isinstance(l, bool) and isinstance(r, (int, float)) and not isinstance(r, bool):
+            lv, rv = float(l), float(r)
+        elif isinstance(l, str) and isinstance(r, str):
+            lv, rv = l.lower(), r.lower()
+        else:
+            # Mixed types in Excel: only Eq/NotEq compare across types cleanly; inequality uses type rank (num < str < bool)
+            if isinstance(op, ast.Eq):
+                return False
+            if isinstance(op, ast.NotEq):
+                return True
+            lv, rv = _type_rank(l), _type_rank(r)
+
+        if isinstance(op, ast.Eq):
+            return lv == rv
+        if isinstance(op, ast.NotEq):
+            return lv != rv
+        if isinstance(op, ast.Lt):
+            return lv < rv
+        if isinstance(op, ast.LtE):
+            return lv <= rv
+        if isinstance(op, ast.Gt):
+            return lv > rv
+        if isinstance(op, ast.GtE):
+            return lv >= rv
+        return None
 
     def _eval_ast_node(self, node: ast.AST, cur_r: int, cur_c: int) -> Any:
         """Safely evaluate an AST node."""
@@ -818,12 +1401,12 @@ class FormulaEngine:
 
         elif isinstance(node, ast.Name):
             name_upper = node.id.upper()
-            # Check if this name is a single cell reference like A1 or B12
             cell_pos = parse_cell_ref(node.id)
             if cell_pos is not None:
                 val = self.evaluate_cell(cell_pos[0], cell_pos[1])
-                return 0.0 if val == "" else val
-            # Check for boolean literals
+                if val == "" and cell_pos not in self.raw_cells:
+                    return _BLANK
+                return val
             if name_upper == "TRUE":
                 return True
             if name_upper == "FALSE":
@@ -832,25 +1415,26 @@ class FormulaEngine:
 
         elif isinstance(node, ast.BinOp):
             left = self._eval_ast_node(node.left, cur_r, cur_c)
-            right = self._eval_ast_node(node.right, cur_r, cur_c)
-
-            if isinstance(left, str) and left.startswith("#"):
+            if isinstance(left, str) and left in self._ALL_ERRORS:
                 return left
-            if isinstance(right, str) and right.startswith("#"):
+            right = self._eval_ast_node(node.right, cur_r, cur_c)
+            if isinstance(right, str) and right in self._ALL_ERRORS:
                 return right
 
             # Excel string concatenation operator (&)
             if isinstance(node.op, ast.BitAnd):
-                l_str = "" if left is None else str(left)
-                r_str = "" if right is None else str(right)
+                l_str = "" if left is None or left is _BLANK else str(left)
+                r_str = "" if right is None or right is _BLANK else str(right)
                 return l_str + r_str
 
             try:
-                l_num = float(left) if left != "" else 0.0
-                r_num = float(right) if right != "" else 0.0
+                l_num = 0.0 if (left is _BLANK or left == "") else float(left)
+                r_num = 0.0 if (right is _BLANK or right == "") else float(right)
             except (ValueError, TypeError):
                 if isinstance(node.op, ast.Add):
-                    return str(left) + str(right)
+                    ls = "" if left is _BLANK or left is None else str(left)
+                    rs = "" if right is _BLANK or right is None else str(right)
+                    return ls + rs
                 return self.ERROR_VALUE
 
             if isinstance(node.op, ast.Add):
@@ -875,45 +1459,30 @@ class FormulaEngine:
 
         elif isinstance(node, ast.UnaryOp):
             operand = self._eval_ast_node(node.operand, cur_r, cur_c)
-            if isinstance(operand, str) and operand.startswith("#"):
+            if isinstance(operand, str) and operand in self._ALL_ERRORS:
                 return operand
+            if isinstance(node.op, ast.Not):
+                return not self._is_truthy(operand)
             try:
-                num = float(operand)
+                num = 0.0 if (operand is _BLANK or operand == "") else float(operand)
             except (ValueError, TypeError):
                 return self.ERROR_VALUE
             if isinstance(node.op, ast.USub):
                 return -num
             elif isinstance(node.op, ast.UAdd):
                 return num
-            elif isinstance(node.op, ast.Not):
-                return not bool(operand)
             return self.ERROR_VALUE
 
         elif isinstance(node, ast.Compare):
             left = self._eval_ast_node(node.left, cur_r, cur_c)
+            if isinstance(left, str) and left in self._ALL_ERRORS:
+                return left
             for op, comparator in zip(node.ops, node.comparators):
                 right = self._eval_ast_node(comparator, cur_r, cur_c)
-                try:
-                    # Try numeric comparison first
-                    l_val = float(left) if left != "" else 0.0
-                    r_val = float(right) if right != "" else 0.0
-                except (ValueError, TypeError):
-                    l_val = str(left)
-                    r_val = str(right)
-
-                if isinstance(op, ast.Eq):
-                    match = (l_val == r_val)
-                elif isinstance(op, ast.NotEq):
-                    match = (l_val != r_val)
-                elif isinstance(op, ast.Lt):
-                    match = (l_val < r_val)
-                elif isinstance(op, ast.LtE):
-                    match = (l_val <= r_val)
-                elif isinstance(op, ast.Gt):
-                    match = (l_val > r_val)
-                elif isinstance(op, ast.GtE):
-                    match = (l_val >= r_val)
-                else:
+                if isinstance(right, str) and right in self._ALL_ERRORS:
+                    return right
+                match = self._excel_compare(left, right, op)
+                if match is None:
                     return self.ERROR_VALUE
                 if not match:
                     return False
@@ -923,49 +1492,142 @@ class FormulaEngine:
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
                 func_name = node.func.id.upper()
-                # Internal Range Constructor: _RANGE_('A1', 'C5')
+                # Internal Range Constructors
                 if func_name == "_RANGE_":
+                    if len(node.args) < 2:
+                        return self.ERROR_REF
                     r1_str = self._eval_ast_node(node.args[0], cur_r, cur_c)
                     r2_str = self._eval_ast_node(node.args[1], cur_r, cur_c)
                     p1 = parse_cell_ref(str(r1_str))
                     p2 = parse_cell_ref(str(r2_str))
                     if p1 is None or p2 is None:
                         return self.ERROR_REF
-                    min_r, max_r = min(p1[0], p2[0]), max(p1[0], p2[0])
-                    min_c, max_c = min(p1[1], p2[1]), max(p1[1], p2[1])
-                    if (max_r - min_r + 1) * (max_c - min_c + 1) > self.MAX_RANGE_CELLS:
-                        return self.ERROR_REF
-                    flat_vals = []
-                    matrix = []
-                    for r in range(min_r, max_r + 1):
-                        row_vals = []
-                        for c in range(min_c, max_c + 1):
-                            v = self.evaluate_cell(r, c)
-                            row_vals.append(v)
-                            flat_vals.append(v)
-                        matrix.append(row_vals)
-                    return CellRange(flat_vals, min_r, min_c, max_r, max_c, matrix)
-
-                # Evaluate Arguments
-                eval_args = [self._eval_ast_node(arg, cur_r, cur_c) for arg in node.args]
-
-                if func_name != "IFERROR":
-                    _ERR_SET = (
-                        self.ERROR_DIV_ZERO,
-                        self.ERROR_VALUE,
-                        self.ERROR_NAME,
-                        self.ERROR_REF,
-                        self.ERROR_CIRC,
-                        self.ERROR_GENERIC,
+                    return self._build_cell_range(
+                        min(p1[0], p2[0]), max(p1[0], p2[0]),
+                        min(p1[1], p2[1]), max(p1[1], p2[1]),
                     )
-                    for arg_val in eval_args:
-                        if isinstance(arg_val, str) and arg_val in _ERR_SET:
-                            return arg_val
+
+                if func_name == "_COLRANGE_":
+                    if len(node.args) < 2:
+                        return self.ERROR_REF
+                    c1_str = str(self._eval_ast_node(node.args[0], cur_r, cur_c))
+                    c2_str = str(self._eval_ast_node(node.args[1], cur_r, cur_c))
+                    try:
+                        c1 = col_letter_to_index(c1_str)
+                        c2 = col_letter_to_index(c2_str)
+                    except Exception:
+                        return self.ERROR_REF
+                    max_r = max((r for (r, _c) in self.raw_cells.keys()), default=0)
+                    return self._build_cell_range(0, max_r, min(c1, c2), max(c1, c2))
+
+                if func_name == "_ROWRANGE_":
+                    if len(node.args) < 2:
+                        return self.ERROR_REF
+                    try:
+                        r1 = int(self._eval_ast_node(node.args[0], cur_r, cur_c)) - 1
+                        r2 = int(self._eval_ast_node(node.args[1], cur_r, cur_c)) - 1
+                    except Exception:
+                        return self.ERROR_REF
+                    max_c = max((c for (_r, c) in self.raw_cells.keys()), default=0)
+                    return self._build_cell_range(min(r1, r2), max(r1, r2), 0, max_c)
+
+                # Short-circuit control flow & type inspection functions
+                if func_name == "IF":
+                    if len(node.args) < 2:
+                        return self.ERROR_VALUE
+                    cond_val = self._eval_ast_node(node.args[0], cur_r, cur_c)
+                    if isinstance(cond_val, str) and cond_val in self._ALL_ERRORS:
+                        return cond_val
+                    if self._is_truthy(cond_val):
+                        res = self._eval_ast_node(node.args[1], cur_r, cur_c)
+                    elif len(node.args) >= 3:
+                        res = self._eval_ast_node(node.args[2], cur_r, cur_c)
+                    else:
+                        return False
+                    return "" if res is _BLANK else res
+
+                if func_name == "IFERROR":
+                    if len(node.args) < 2:
+                        return self.ERROR_VALUE
+                    primary = self._eval_ast_node(node.args[0], cur_r, cur_c)
+                    if isinstance(primary, str) and primary.startswith("#"):
+                        fallback = self._eval_ast_node(node.args[1], cur_r, cur_c)
+                        return "" if fallback is _BLANK else fallback
+                    return "" if primary is _BLANK else primary
+
+                if func_name == "IFNA":
+                    if len(node.args) < 2:
+                        return self.ERROR_VALUE
+                    primary = self._eval_ast_node(node.args[0], cur_r, cur_c)
+                    if primary == self.ERROR_NA:
+                        fallback = self._eval_ast_node(node.args[1], cur_r, cur_c)
+                        return "" if fallback is _BLANK else fallback
+                    return "" if primary is _BLANK else primary
+
+                if func_name == "ISBLANK":
+                    if not node.args:
+                        return self.ERROR_VALUE
+                    val = self._eval_ast_node(node.args[0], cur_r, cur_c)
+                    return val is _BLANK
+
+                if func_name == "ISERROR":
+                    if not node.args:
+                        return self.ERROR_VALUE
+                    val = self._eval_ast_node(node.args[0], cur_r, cur_c)
+                    return isinstance(val, str) and val.startswith("#")
+
+                if func_name == "ISNA":
+                    if not node.args:
+                        return self.ERROR_VALUE
+                    val = self._eval_ast_node(node.args[0], cur_r, cur_c)
+                    return val == self.ERROR_NA
+
+                if func_name == "ISNUMBER":
+                    if not node.args:
+                        return self.ERROR_VALUE
+                    val = self._eval_ast_node(node.args[0], cur_r, cur_c)
+                    return isinstance(val, (int, float)) and not isinstance(val, bool)
+
+                if func_name == "ISTEXT":
+                    if not node.args:
+                        return self.ERROR_VALUE
+                    val = self._eval_ast_node(node.args[0], cur_r, cur_c)
+                    return isinstance(val, str) and not val.startswith("#")
+
+                if func_name in ("AND", "OR"):
+                    if not node.args:
+                        return self.ERROR_VALUE
+                    is_and = (func_name == "AND")
+                    saw_value = False
+                    for arg in node.args:
+                        val = self._eval_ast_node(arg, cur_r, cur_c)
+                        if isinstance(val, str) and val in self._ALL_ERRORS:
+                            return val
+                        items = val if isinstance(val, CellRange) else [val]
+                        for item in items:
+                            if isinstance(item, str) and item in self._ALL_ERRORS:
+                                return item
+                            if item is _BLANK or item == "":
+                                continue
+                            saw_value = True
+                            truthy = self._is_truthy(item)
+                            if is_and and not truthy:
+                                return False
+                            if (not is_and) and truthy:
+                                return True
+                    return saw_value if is_and else False
+
+                # Standard Eager Functions
+                raw_args = [self._eval_ast_node(arg, cur_r, cur_c) for arg in node.args]
+                for arg_val in raw_args:
+                    if isinstance(arg_val, str) and arg_val in self._ALL_ERRORS:
+                        return arg_val
+                eval_args = [("" if a is _BLANK else a) for a in raw_args]
 
                 if func_name in self.functions:
                     try:
                         return self.functions[func_name](*eval_args)
-                    except Exception as e:
+                    except Exception:
                         return self.ERROR_GENERIC
                 return self.ERROR_NAME
 
@@ -1013,10 +1675,19 @@ class SpreadsheetGrid(tk.Canvas):
         ("VAR", "VAR(range_or_vals...)", "Compute sample variance."),
         ("IF", "IF(condition, true_val, [false_val])", "Conditional evaluation."),
         ("IFERROR", "IFERROR(val, fallback_val)", "Return fallback if formula errors."),
+        ("IFNA", "IFNA(val, fallback_val)", "Return fallback only if value is #N/A."),
+        ("ISBLANK", "ISBLANK(val)", "Return True if referenced cell is empty."),
+        ("ISERROR", "ISERROR(val)", "Return True if value is any formula error."),
+        ("ISNA", "ISNA(val)", "Return True if value is #N/A."),
+        ("ISNUMBER", "ISNUMBER(val)", "Return True if value is numeric."),
+        ("ISTEXT", "ISTEXT(val)", "Return True if value is text."),
+        ("SUMIFS", "SUMIFS(sum_range, crit_range1, crit1, ...)", "Sum cells matching multiple criteria."),
+        ("COUNTIFS", "COUNTIFS(crit_range1, crit1, ...)", "Count cells matching multiple criteria."),
         ("AND", "AND(cond1, cond2, ...)", "Return True if all arguments are truthy."),
         ("OR", "OR(cond1, cond2, ...)", "Return True if any argument is truthy."),
         ("NOT", "NOT(val)", "Invert boolean value."),
-        ("VLOOKUP", "VLOOKUP(lookup_val, range, col_idx, [exact])", "Vertical lookup by leftmost column."),
+        ("VLOOKUP", "VLOOKUP(lookup_val, range, col_idx, [approx])", "Vertical lookup by leftmost column."),
+        ("XLOOKUP", "XLOOKUP(lookup_val, lookup_arr, return_arr, [if_not_found], [match_mode], [search_mode])", "Modern flexible lookup across columns or rows."),
         ("INDEX", "INDEX(range, row_num, [col_num])", "Return value at row/col offset in range."),
         ("MATCH", "MATCH(lookup_val, range, [match_type])", "Return 1-based position of match in range."),
         ("LEN", "LEN(text)", "Return character length of text."),
@@ -1025,6 +1696,9 @@ class SpreadsheetGrid(tk.Canvas):
         ("TRIM", "TRIM(text)", "Strip leading/trailing whitespace."),
         ("LEFT", "LEFT(text, [n])", "Return leftmost n characters."),
         ("RIGHT", "RIGHT(text, [n])", "Return rightmost n characters."),
+        ("MID", "MID(text, start_num, num_chars)", "Extract substring starting at 1-based index."),
+        ("FIND", "FIND(find_text, within_text, [start_num])", "Case-sensitive 1-based position search."),
+        ("SUBSTITUTE", "SUBSTITUTE(text, old_text, new_text, [instance])", "Replace matching text occurrences."),
         ("CONCAT", "CONCAT(val1, val2, ...)", "Join values into a single string."),
         ("CONCATENATE", "CONCATENATE(val1, val2, ...)", "Join values into a single string."),
         ("SPARKLINE", "SPARKLINE(range)", "Render Unicode bar sparkline chart."),
@@ -1088,7 +1762,7 @@ class SpreadsheetGrid(tk.Canvas):
         self._row_offsets: List[int] = []
 
         # Font cache for high-speed measurement
-        self._font_cache: Dict[Tuple[str, int, str], tkfont.Font] = {}
+        self._font_cache: Dict[Tuple[str, int, str, str, int], tkfont.Font] = {}
 
         # Viewport position tracking for fast-path selection redraw
         self._last_vx0: Optional[float] = None
@@ -1141,10 +1815,19 @@ class SpreadsheetGrid(tk.Canvas):
     # Layout & Metrics Calculations (O(1) Cached)
     # -------------------------------------------------------------------------
 
-    def _get_font(self, family: str, size: int, weight: str = "normal") -> tkfont.Font:
-        key = (family, size, weight)
+    def _get_font(
+        self,
+        family: str,
+        size: int,
+        weight: str = "normal",
+        slant: str = "roman",
+        underline: int = 0,
+    ) -> tkfont.Font:
+        key = (family, size, weight, slant, int(bool(underline)))
         if key not in self._font_cache:
-            self._font_cache[key] = tkfont.Font(family=family, size=size, weight=weight)
+            self._font_cache[key] = tkfont.Font(
+                family=family, size=size, weight=weight, slant=slant, underline=bool(underline)
+            )
         return self._font_cache[key]
 
     def _update_coordinate_cache(self):
@@ -1394,13 +2077,21 @@ class SpreadsheetGrid(tk.Canvas):
         f_size = max(7, min(24, int(9 * self.zoom_factor)))
         default_wrap = getattr(self.tab_owner, "default_wrap", False)
 
-        # 1. Draw Cell Grid Lines & Content
+        # 1. Draw Cell Fill, Grid Lines & Content
         for r in range(start_row, end_row + 1):
             y = self.row_to_y(r)
             h = self.get_row_height(r)
             for c in range(start_col, end_col + 1):
                 x = self.col_to_x(c)
                 w = self.get_col_width(c)
+
+                st = self.engine.cell_styles.get((r, c), {})
+                bg_hex = _normalize_hex_color(st.get("bg"))
+                if bg_hex:
+                    self.create_rectangle(
+                        x, y, x + w, y + h,
+                        outline="", fill=bg_hex, tags="cell_bg"
+                    )
 
                 # Cell grid border
                 self.create_rectangle(
@@ -1412,19 +2103,21 @@ class SpreadsheetGrid(tk.Canvas):
                 val = self.engine.get_value(r, c)
                 if val != "" and val is not None:
                     txt = self._format_display_value(val, r, c)
-                    st = self.engine.cell_styles.get((r, c), {})
                     align = st.get("align", "auto")
-                    is_bold = st.get("bold", False)
+                    is_bold = bool(st.get("bold", False))
+                    is_italic = bool(st.get("italic", False))
+                    is_underline = bool(st.get("underline", False))
                     is_wrap = st.get("wrap", False) or default_wrap
 
                     f_family = "Segoe UI"
                     f_weight = "bold" if is_bold else "normal"
-                    font_spec = (f_family, f_size, f_weight)
-                    font_obj = self._get_font(f_family, f_size, f_weight)
+                    f_slant = "italic" if is_italic else "roman"
+                    font_obj = self._get_font(f_family, f_size, f_weight, f_slant, int(is_underline))
 
-                    fg_color = "#000000"
                     if isinstance(val, str) and val.startswith("#"):
                         fg_color = "#dc2626"
+                    else:
+                        fg_color = _normalize_hex_color(st.get("fg")) or "#000000"
 
                     if is_wrap:
                         # Multi-line word wrapped cell
@@ -1440,7 +2133,7 @@ class SpreadsheetGrid(tk.Canvas):
                             anchor = "nw"
                         self.create_text(
                             tx, y + 4, text=txt, anchor=anchor,
-                            font=font_spec, fill=fg_color, width=avail_w, tags="cell_text"
+                            font=font_obj, fill=fg_color, width=avail_w, tags="cell_text"
                         )
                     else:
                         # Single-line mode: smart empty-neighbor overflow & clean ellipsis truncation
@@ -1488,7 +2181,7 @@ class SpreadsheetGrid(tk.Canvas):
                         # Never pass width= to create_text when wrap is False
                         self.create_text(
                             tx, y + h // 2, text=disp_txt, anchor=anchor,
-                            font=font_spec, fill=fg_color, tags="cell_text"
+                            font=font_obj, fill=fg_color, tags="cell_text"
                         )
 
         # 2. Selection Layers & Floating Headers / Frozen Row / Corner Box
@@ -1526,18 +2219,26 @@ class SpreadsheetGrid(tk.Canvas):
                 for c in range(start_col, end_col + 1):
                     x = self.col_to_x(c)
                     w = self.get_col_width(c)
+                    st = self.engine.cell_styles.get((0, c), {})
+                    bg_hex = _normalize_hex_color(st.get("bg")) or "#fcfaff"
                     self.create_rectangle(
                         x, frozen_y0, x + w, frozen_y1,
-                        outline=self._grid_line_color, fill="#fcfaff", tags="frozen_row"
+                        outline=self._grid_line_color, fill=bg_hex, tags="frozen_row"
                     )
                     val = self.engine.get_value(0, c)
                     if val != "" and val is not None:
                         txt = self._format_display_value(val, 0, c)
-                        st = self.engine.cell_styles.get((0, c), {})
                         align = st.get("align", "auto")
                         is_bold = st.get("bold", True)
-                        f_spec = ("Segoe UI", f_size, "bold" if is_bold else "normal")
-                        f_obj = self._get_font("Segoe UI", f_size, "bold" if is_bold else "normal")
+                        is_italic = bool(st.get("italic", False))
+                        is_underline = bool(st.get("underline", False))
+                        f_obj = self._get_font(
+                            "Segoe UI", f_size,
+                            "bold" if is_bold else "normal",
+                            "italic" if is_italic else "roman",
+                            int(is_underline),
+                        )
+                        fg_col = "#dc2626" if (isinstance(val, str) and val.startswith("#")) else (_normalize_hex_color(st.get("fg")) or "#1e1b4b")
                         single_txt = txt.replace("\r\n", " ").replace("\n", " ")
                         avail_px = max(10, w - 10)
                         if f_obj.measure(single_txt) <= avail_px:
@@ -1564,8 +2265,8 @@ class SpreadsheetGrid(tk.Canvas):
                             anchor = "w"
                         self.create_text(
                             tx, frozen_y0 + frozen_h // 2,
-                            text=disp_txt, anchor=anchor, font=f_spec,
-                            fill="#1e1b4b", tags="frozen_row"
+                            text=disp_txt, anchor=anchor, font=f_obj,
+                            fill=fg_col, tags="frozen_row"
                         )
                 self.create_line(
                     vx0, frozen_y1, vx1, frozen_y1,
@@ -1686,24 +2387,41 @@ class SpreadsheetGrid(tk.Canvas):
                 fill=self._selection_bg, outline="",
                 tags=("sel_overlay", "sel_bg")
             )
-            # Active anchor cell remains white inside multi-cell selection (Excel convention)
+            vis_r0, vis_r1 = max(start_row, min_sr), min(end_row, max_sr)
+            vis_c0, vis_c1 = max(start_col, min_sc), min(end_col, max_sc)
             ac_r, ac_c = self.active_cell
+            for r in range(vis_r0, vis_r1 + 1):
+                for c in range(vis_c0, vis_c1 + 1):
+                    if (r, c) == (ac_r, ac_c):
+                        continue
+                    bg_hex = _normalize_hex_color(self.engine.cell_styles.get((r, c), {}).get("bg"))
+                    if bg_hex:
+                        cx1 = self.col_to_x(c)
+                        cy1 = self.row_to_y(r)
+                        self.create_rectangle(
+                            cx1, cy1, cx1 + self.get_col_width(c), cy1 + self.get_row_height(r),
+                            fill=_blend_hex_colors(bg_hex, self._selection_bg, 0.72), outline="",
+                            tags=("sel_overlay", "sel_bg")
+                        )
+            # Active anchor cell preserves its crisp fill inside multi-cell selection (Excel convention)
             ac_x = self.col_to_x(ac_c)
             ac_y = self.row_to_y(ac_r)
             ac_w = self.get_col_width(ac_c)
             ac_h = self.get_row_height(ac_r)
             st = self.engine.cell_styles.get((ac_r, ac_c), {})
-            anchor_bg = st.get("bg", "#ffffff")
+            anchor_bg = _normalize_hex_color(st.get("bg")) or "#ffffff"
             self.create_rectangle(
                 ac_x, ac_y, ac_x + ac_w, ac_y + ac_h,
                 fill=anchor_bg, outline="",
                 tags=("sel_overlay", "sel_bg")
             )
-            # Lower sel_bg below grid and cell_text so text and grid are ALWAYS on top
+            # Lower sel_bg below grid and cell_text, while keeping cell_bg beneath sel_bg
             if self.find_withtag("grid"):
                 self.tag_lower("sel_bg", "grid")
             else:
                 self.tag_lower("sel_bg")
+            if self.find_withtag("cell_bg"):
+                self.tag_lower("cell_bg", "sel_bg")
 
         # 2. Foreground outline layer ("sel_fg") - hollow borders and fill handle
         if max_sr > min_sr or max_sc > min_sc:
@@ -1953,6 +2671,10 @@ class SpreadsheetGrid(tk.Canvas):
         self.bind("<Control-semicolon>", lambda e: (self.insert_today_date(), "break")[1])
         self.bind("<Control-b>", lambda e: (self.toggle_bold_selection(), "break")[1])
         self.bind("<Control-B>", lambda e: (self.toggle_bold_selection(), "break")[1])
+        self.bind("<Control-i>", lambda e: (self.toggle_italic_selection(), "break")[1])
+        self.bind("<Control-I>", lambda e: (self.toggle_italic_selection(), "break")[1])
+        self.bind("<Control-u>", lambda e: (self.toggle_underline_selection(), "break")[1])
+        self.bind("<Control-U>", lambda e: (self.toggle_underline_selection(), "break")[1])
 
         # Direct Clipboard, Undo/Redo & Select-All bindings (only when not inline editing)
         def _grid_chord(action):
@@ -2593,7 +3315,7 @@ class SpreadsheetGrid(tk.Canvas):
                 r += 1
             return end_r
 
-        # Collect columns referenced by formulas in selection (e.g. A1 in =A1*2)
+        # Collect columns referenced by formulas in selection (e.g. A1 in =A1*2 or $D:$D)
         ref_cols: List[int] = []
         for r in range(min_r, max_r + 1):
             for c in range(min_c, max_c + 1):
@@ -2605,6 +3327,15 @@ class SpreadsheetGrid(tk.Canvas):
                             ci = col_letter_to_index(m.group(1))
                             if 0 <= ci < self.total_cols and not (min_c <= ci <= max_c) and ci not in ref_cols:
                                 ref_cols.append(ci)
+                        except Exception:
+                            pass
+                    for m in re.finditer(r"(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3}):\$?([A-Za-z]{1,3})(?![A-Za-z0-9_])", cleaned):
+                        try:
+                            ci1 = col_letter_to_index(m.group(1))
+                            ci2 = col_letter_to_index(m.group(2))
+                            for ci in range(min(ci1, ci2), max(ci1, ci2) + 1):
+                                if 0 <= ci < self.total_cols and not (min_c <= ci <= max_c) and ci not in ref_cols:
+                                    ref_cols.append(ci)
                         except Exception:
                             pass
 
@@ -2639,49 +3370,90 @@ class SpreadsheetGrid(tk.Canvas):
             self.tab_owner._notify_status(f"Auto-filled selection down to Row {target_r + 1}")
         return True
 
-    def toggle_bold_selection(self):
-        """Toggle bold font on selected cells."""
+    def _snapshot_styles(self) -> Dict[Tuple[int, int], Dict[str, Any]]:
+        """Return a shallow-per-cell copy of engine cell_styles for Undo/Redo isolation."""
+        return {k: dict(v) for k, v in self.engine.cell_styles.items()}
+
+    def _toggle_bool_style(self, key: str) -> None:
         (min_r, min_c), (max_r, max_c) = self.get_selected_range()
-        old_styles = dict(self.engine.cell_styles)
-        first_bold = self.engine.cell_styles.get((min_r, min_c), {}).get("bold", False)
-        new_bold = not first_bold
+        old_styles = self._snapshot_styles()
+        new_val = not bool(self.engine.cell_styles.get((min_r, min_c), {}).get(key, False))
         for r in range(min_r, max_r + 1):
             for c in range(min_c, max_c + 1):
                 st = dict(self.engine.cell_styles.get((r, c), {}))
-                st["bold"] = new_bold
+                st[key] = new_val
                 self.engine.cell_styles[(r, c)] = st
-        self._save_undo_state({"type": "styles", "old_styles": old_styles, "new_styles": dict(self.engine.cell_styles)})
+        self._save_undo_state({"type": "styles", "old_styles": old_styles, "new_styles": self._snapshot_styles()})
         self.redraw()
         if self.on_modified_cb:
             self.on_modified_cb()
+
+    def _set_style_attr_selection(self, key: str, value: Any) -> None:
+        (min_r, min_c), (max_r, max_c) = self.get_selected_range()
+        old_styles = self._snapshot_styles()
+        for r in range(min_r, max_r + 1):
+            for c in range(min_c, max_c + 1):
+                st = dict(self.engine.cell_styles.get((r, c), {}))
+                if value is None:
+                    st.pop(key, None)
+                    if st:
+                        self.engine.cell_styles[(r, c)] = st
+                    else:
+                        self.engine.cell_styles.pop((r, c), None)
+                else:
+                    st[key] = value
+                    self.engine.cell_styles[(r, c)] = st
+        self._save_undo_state({"type": "styles", "old_styles": old_styles, "new_styles": self._snapshot_styles()})
+        self.redraw()
+        if self.on_modified_cb:
+            self.on_modified_cb()
+
+    def toggle_bold_selection(self):
+        """Toggle bold font on selected cells."""
+        self._toggle_bool_style("bold")
+
+    def toggle_italic_selection(self):
+        """Toggle italic font on selected cells."""
+        self._toggle_bool_style("italic")
+
+    def toggle_underline_selection(self):
+        """Toggle underline font on selected cells."""
+        self._toggle_bool_style("underline")
+
+    def set_cell_bg_color(self, hex_color: Optional[str]):
+        """Set or clear (when None) fill/highlight color on selected cells."""
+        norm = _normalize_hex_color(hex_color) if hex_color is not None else None
+        self._set_style_attr_selection("bg", norm)
+
+    def set_cell_fg_color(self, hex_color: Optional[str]):
+        """Set or reset (when None) font color on selected cells."""
+        norm = _normalize_hex_color(hex_color) if hex_color is not None else None
+        self._set_style_attr_selection("fg", norm)
+
+    def clear_formatting_selection(self):
+        """Remove all visual, numeric, alignment, and font styling from selected cells."""
+        (min_r, min_c), (max_r, max_c) = self.get_selected_range()
+        old_styles = self._snapshot_styles()
+        changed = False
+        for r in range(min_r, max_r + 1):
+            for c in range(min_c, max_c + 1):
+                if (r, c) in self.engine.cell_styles:
+                    self.engine.cell_styles.pop((r, c), None)
+                    changed = True
+        if changed:
+            self._save_undo_state({"type": "styles", "old_styles": old_styles, "new_styles": self._snapshot_styles()})
+            self.redraw()
+            if self.on_modified_cb:
+                self.on_modified_cb()
 
     def format_selection(self, fmt: str):
         """Apply number format (currency, percent, fixed2, general) to selection."""
-        (min_r, min_c), (max_r, max_c) = self.get_selected_range()
-        old_styles = dict(self.engine.cell_styles)
-        for r in range(min_r, max_r + 1):
-            for c in range(min_c, max_c + 1):
-                st = dict(self.engine.cell_styles.get((r, c), {}))
-                st["format"] = fmt
-                self.engine.cell_styles[(r, c)] = st
-        self._save_undo_state({"type": "styles", "old_styles": old_styles, "new_styles": dict(self.engine.cell_styles)})
-        self.redraw()
-        if self.on_modified_cb:
-            self.on_modified_cb()
+        self._set_style_attr_selection("format", fmt)
 
-    def set_alignment(self, align: str):
-        """Apply alignment (left, center, right) to selection."""
-        (min_r, min_c), (max_r, max_c) = self.get_selected_range()
-        old_styles = dict(self.engine.cell_styles)
-        for r in range(min_r, max_r + 1):
-            for c in range(min_c, max_c + 1):
-                st = dict(self.engine.cell_styles.get((r, c), {}))
-                st["align"] = align
-                self.engine.cell_styles[(r, c)] = st
-        self._save_undo_state({"type": "styles", "old_styles": old_styles, "new_styles": dict(self.engine.cell_styles)})
-        self.redraw()
-        if self.on_modified_cb:
-            self.on_modified_cb()
+    def set_alignment(self, align: Optional[str]):
+        """Apply alignment (left, center, right, or auto/None) to selection."""
+        norm = align if align in ("left", "center", "right") else None
+        self._set_style_attr_selection("align", norm)
 
     def _on_double_click(self, event):
         cx = self.canvasx(event.x)
@@ -3250,7 +4022,7 @@ class SpreadsheetGrid(tk.Canvas):
         self._refresh_editing_overlays()
 
     def _draw_formula_ref_highlights(self, formula_text: str):
-        """Highlight cell and range references parsed from active formula with distinct dashed frames."""
+        """Highlight cell, range, whole-column, and whole-row references parsed from active formula."""
         self.delete("formula_ref_hl")
         if not isinstance(formula_text, str) or not formula_text.startswith("="):
             return
@@ -3260,34 +4032,58 @@ class SpreadsheetGrid(tk.Canvas):
         seen: Set[Tuple[int, int, int, int]] = set()
         color_idx = 0
 
-        for m in re.finditer(r"\$?([A-Za-z]{1,3})\$?([0-9]+)(?::\$?([A-Za-z]{1,3})\$?([0-9]+))?", cleaned):
-            c1 = col_letter_to_index(m.group(1))
-            r1 = int(m.group(2)) - 1
-            if m.group(3) and m.group(4):
-                c2 = col_letter_to_index(m.group(3))
-                r2 = int(m.group(4)) - 1
-            else:
-                r2, c2 = r1, c1
-            min_r, max_r = min(r1, r2), max(r1, r2)
-            min_c, max_c = min(c1, c2), max(c1, c2)
+        def _add_hl(min_r: int, min_c: int, max_r: int, max_c: int):
+            nonlocal color_idx
             if not (0 <= min_r < self.total_rows and 0 <= max_r < self.total_rows and 0 <= min_c < self.total_cols and 0 <= max_c < self.total_cols):
-                continue
+                return
             key = (min_r, min_c, max_r, max_c)
             if key in seen:
-                continue
+                return
             seen.add(key)
-
             x1 = self.col_to_x(min_c)
             y1 = self.row_to_y(min_r)
             x2 = self.col_to_x(max_c) + self.get_col_width(max_c)
             y2 = self.row_to_y(max_r) + self.get_row_height(max_r)
             col_hex = colors[color_idx % len(colors)]
             color_idx += 1
-
             self.create_rectangle(
                 x1 + 1, y1 + 1, x2 - 1, y2 - 1,
                 fill="", outline=col_hex, width=2, dash=(4, 2), tags="formula_ref_hl"
             )
+
+        for m in re.finditer(r"\$?([A-Za-z]{1,3})\$?([0-9]+)(?::\$?([A-Za-z]{1,3})\$?([0-9]+))?", cleaned):
+            try:
+                c1 = col_letter_to_index(m.group(1))
+                r1 = int(m.group(2)) - 1
+                if m.group(3) and m.group(4):
+                    c2 = col_letter_to_index(m.group(3))
+                    r2 = int(m.group(4)) - 1
+                else:
+                    r2, c2 = r1, c1
+                _add_hl(min(r1, r2), min(c1, c2), max(r1, r2), max(c1, c2))
+            except Exception:
+                pass
+
+        pop_max_r = max((r for (r, _c) in self.engine.raw_cells.keys()), default=15)
+        pop_max_c = max((c for (_r, c) in self.engine.raw_cells.keys()), default=10)
+        hl_max_r = min(self.total_rows - 1, max(pop_max_r, 30))
+        hl_max_c = min(self.total_cols - 1, max(pop_max_c, 15))
+
+        for m in re.finditer(r"(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3}):\$?([A-Za-z]{1,3})(?![A-Za-z0-9_])", cleaned):
+            try:
+                c1 = col_letter_to_index(m.group(1))
+                c2 = col_letter_to_index(m.group(2))
+                _add_hl(0, min(c1, c2), hl_max_r, max(c1, c2))
+            except Exception:
+                pass
+
+        for m in re.finditer(r"(?<![A-Za-z0-9_])\$?([0-9]+):\$?([0-9]+)(?![A-Za-z0-9_])", cleaned):
+            try:
+                r1 = int(m.group(1)) - 1
+                r2 = int(m.group(2)) - 1
+                _add_hl(min(r1, r2), 0, max(r1, r2), hl_max_c)
+            except Exception:
+                pass
 
         for hdr_tag in ("frozen_row", "header_row", "header_col", "corner", "editor_win"):
             if self.find_withtag(hdr_tag) and self.find_withtag("formula_ref_hl"):
@@ -3487,10 +4283,10 @@ class SpreadsheetGrid(tk.Canvas):
             for (r, c), old_val in action["old_cells"].items():
                 self.engine.set_cell(r, c, old_val)
         elif action["type"] == "styles":
-            self.engine.cell_styles = dict(action["old_styles"])
+            self.engine.cell_styles = {k: dict(v) for k, v in action["old_styles"].items()}
         elif action["type"] == "replace_sheet":
             self.engine.raw_cells = dict(action["old_raw"])
-            self.engine.cell_styles = dict(action["old_styles"])
+            self.engine.cell_styles = {k: dict(v) for k, v in action["old_styles"].items()}
             self.recompute_bounds()
         self.engine.recalculate_all()
         self.redraw()
@@ -3509,10 +4305,10 @@ class SpreadsheetGrid(tk.Canvas):
             for (r, c), new_val in action["new_cells"].items():
                 self.engine.set_cell(r, c, new_val)
         elif action["type"] == "styles":
-            self.engine.cell_styles = dict(action["new_styles"])
+            self.engine.cell_styles = {k: dict(v) for k, v in action["new_styles"].items()}
         elif action["type"] == "replace_sheet":
             self.engine.raw_cells = dict(action["new_raw"])
-            self.engine.cell_styles = dict(action["new_styles"])
+            self.engine.cell_styles = {k: dict(v) for k, v in action["new_styles"].items()}
             self.recompute_bounds()
         self.engine.recalculate_all()
         self.redraw()
@@ -3754,6 +4550,8 @@ class SpreadsheetTab(ttk.Frame):
         self.default_wrap: bool = False
         self.formula_bar_expanded: bool = False
         self._formula_bar_height: int = 1
+        self._last_fill_color: str = "#fef08a"
+        self._last_font_color: str = "#dc2626"
 
         self._setup_ui()
 
@@ -3798,6 +4596,74 @@ class SpreadsheetTab(ttk.Frame):
         b_bold = ttk.Button(btn_frame, text="𝐁", command=self.toggle_bold_selection, width=3, style="Toolbar.TButton")
         b_bold.pack(side=tk.LEFT, padx=1)
         ToolTip(b_bold, "Toggle Bold font on selected cells (Ctrl+B)")
+
+        b_italic = ttk.Button(btn_frame, text="𝐼", command=self.toggle_italic_selection, width=3, style="Toolbar.TButton")
+        b_italic.pack(side=tk.LEFT, padx=1)
+        ToolTip(b_italic, "Toggle Italic font on selected cells (Ctrl+I)")
+
+        b_underline = ttk.Button(btn_frame, text="U̲", command=self.toggle_underline_selection, width=3, style="Toolbar.TButton")
+        b_underline.pack(side=tk.LEFT, padx=1)
+        ToolTip(b_underline, "Toggle Underline font on selected cells (Ctrl+U)")
+
+        # Fill Color split button (applies active fill or opens palette)
+        self._fill_group = ttk.Frame(btn_frame)
+        self._fill_group.pack(side=tk.LEFT, padx=1)
+        fill_left = ttk.Frame(self._fill_group)
+        fill_left.pack(side=tk.LEFT)
+        self.b_fill_apply = ttk.Button(
+            fill_left, text="🎨", width=3,
+            command=lambda: self.set_cell_bg_color(self._last_fill_color),
+            style="Toolbar.TButton",
+        )
+        self.b_fill_apply.pack(side=tk.TOP)
+        self._fill_swatch = tk.Frame(fill_left, height=3, bg=self._last_fill_color)
+        self._fill_swatch.pack(side=tk.TOP, fill=tk.X)
+        b_fill_drop = ttk.Button(
+            self._fill_group, text="▾", width=2,
+            command=self._open_fill_palette,
+            style="Toolbar.TButton",
+        )
+        b_fill_drop.pack(side=tk.LEFT, fill=tk.Y)
+        ToolTip(self.b_fill_apply, "Apply active cell fill/highlight color to selection")
+        ToolTip(b_fill_drop, "Choose cell fill/highlight color, custom color, or No Fill")
+
+        # Font Color split button (applies active font color or opens palette)
+        self._font_group = ttk.Frame(btn_frame)
+        self._font_group.pack(side=tk.LEFT, padx=1)
+        font_left = ttk.Frame(self._font_group)
+        font_left.pack(side=tk.LEFT)
+        self.b_font_apply = ttk.Button(
+            font_left, text="A", width=3,
+            command=lambda: self.set_cell_fg_color(self._last_font_color),
+            style="Toolbar.TButton",
+        )
+        self.b_font_apply.pack(side=tk.TOP)
+        self._font_swatch = tk.Frame(font_left, height=3, bg=self._last_font_color)
+        self._font_swatch.pack(side=tk.TOP, fill=tk.X)
+        b_font_drop = ttk.Button(
+            self._font_group, text="▾", width=2,
+            command=self._open_font_palette,
+            style="Toolbar.TButton",
+        )
+        b_font_drop.pack(side=tk.LEFT, fill=tk.Y)
+        ToolTip(self.b_font_apply, "Apply active font color to selected cells")
+        ToolTip(b_font_drop, "Choose font color, custom color, or Automatic (Default)")
+
+        # Cell Alignment menu button
+        self.b_align = ttk.Menubutton(btn_frame, text="≡▾", style="Toolbar.TButton")
+        align_tb_menu = tk.Menu(self.b_align, tearoff=0)
+        align_tb_menu.add_command(label="Left", command=lambda: self.set_alignment("left"))
+        align_tb_menu.add_command(label="Center", command=lambda: self.set_alignment("center"))
+        align_tb_menu.add_command(label="Right", command=lambda: self.set_alignment("right"))
+        align_tb_menu.add_separator()
+        align_tb_menu.add_command(label="Auto (Default)", command=lambda: self.set_alignment(""))
+        self.b_align.config(menu=align_tb_menu)
+        self.b_align.pack(side=tk.LEFT, padx=1)
+        ToolTip(self.b_align, "Align text horizontally inside selected cells (Left, Center, Right, or Auto)")
+
+        b_clear_fmt = ttk.Button(btn_frame, text="🧹", command=self.clear_formatting_selection, width=3, style="Toolbar.TButton")
+        b_clear_fmt.pack(side=tk.LEFT, padx=1)
+        ToolTip(b_clear_fmt, "Clear visual formatting (fill, font color, bold/italic/underline, alignment, number format) from selected cells")
 
         b_curr = ttk.Button(btn_frame, text="$", command=lambda: self.format_selection("currency"), width=3, style="Toolbar.TButton")
         b_curr.pack(side=tk.LEFT, padx=1)
@@ -4430,15 +5296,78 @@ class SpreadsheetTab(ttk.Frame):
         self.grid_widget.redraw()
 
     def toggle_bold_selection(self):
-        """Toggle bold formatting on selected cells (Ctrl+B)."""
+        """Toggle bold formatting on selected cells."""
         self.grid_widget.toggle_bold_selection()
+
+    def toggle_italic_selection(self):
+        """Toggle italic formatting on selected cells."""
+        self.grid_widget.toggle_italic_selection()
+
+    def toggle_underline_selection(self):
+        """Toggle underline formatting on selected cells."""
+        self.grid_widget.toggle_underline_selection()
+
+    def set_cell_bg_color(self, color: Optional[str]):
+        """Set or clear fill/highlight color on selected cells."""
+        self.grid_widget.set_cell_bg_color(color)
+        norm = _normalize_hex_color(color) if color is not None else None
+        if norm:
+            self._last_fill_color = norm
+            if hasattr(self, "_fill_swatch"):
+                self._fill_swatch.config(bg=norm)
+            self._notify_status(f"Cell fill color set to {norm}")
+        else:
+            self._notify_status("Cell fill color cleared")
+
+    def set_cell_fg_color(self, color: Optional[str]):
+        """Set or reset font color on selected cells."""
+        self.grid_widget.set_cell_fg_color(color)
+        norm = _normalize_hex_color(color) if color is not None else None
+        if norm:
+            self._last_font_color = norm
+            if hasattr(self, "_font_swatch"):
+                self._font_swatch.config(bg=norm)
+            self._notify_status(f"Cell font color set to {norm}")
+        else:
+            self._notify_status("Cell font color reset to automatic")
+
+    def clear_formatting_selection(self):
+        """Clear all formatting from selected cells."""
+        self.grid_widget.clear_formatting_selection()
+        self._notify_status("Cleared formatting on selected cells")
+
+    def _open_fill_palette(self):
+        _ColorPalettePopup(
+            self._fill_group,
+            palette=CELL_FILL_PALETTE,
+            reset_label="No Fill",
+            on_select=self.set_cell_bg_color,
+        )
+
+    def _open_font_palette(self):
+        _ColorPalettePopup(
+            self._font_group,
+            palette=CELL_FONT_PALETTE,
+            reset_label="Automatic (Default)",
+            on_select=self.set_cell_fg_color,
+        )
+
+    def _choose_custom_fill_color(self):
+        chosen = colorchooser.askcolor(color=self._last_fill_color, title="Choose Fill Color", parent=self)
+        if chosen and chosen[1]:
+            self.set_cell_bg_color(chosen[1])
+
+    def _choose_custom_font_color(self):
+        chosen = colorchooser.askcolor(color=self._last_font_color, title="Choose Font Color", parent=self)
+        if chosen and chosen[1]:
+            self.set_cell_fg_color(chosen[1])
 
     def format_selection(self, fmt: str):
         """Format selected cells (currency, percent, fixed2, general)."""
         self.grid_widget.format_selection(fmt)
 
-    def set_alignment(self, align: str):
-        """Set text alignment on selected cells (left, center, right)."""
+    def set_alignment(self, align: Optional[str]):
+        """Set text alignment on selected cells (left, center, right, or auto/empty)."""
         self.grid_widget.set_alignment(align)
 
     def _copy_as_markdown_table(self):
@@ -4524,7 +5453,7 @@ class SpreadsheetTab(ttk.Frame):
     def toggle_wrap_selection(self):
         """Toggle word wrap on selected cells."""
         (min_r, min_c), (max_r, max_c) = self.grid_widget.get_selected_range()
-        old_styles = dict(self.engine.cell_styles)
+        old_styles = self.grid_widget._snapshot_styles()
         first_wrap = self.engine.cell_styles.get((min_r, min_c), {}).get("wrap", self.default_wrap)
         new_wrap = not first_wrap
         for r in range(min_r, max_r + 1):
@@ -4532,7 +5461,7 @@ class SpreadsheetTab(ttk.Frame):
                 st = dict(self.engine.cell_styles.get((r, c), {}))
                 st["wrap"] = new_wrap
                 self.engine.cell_styles[(r, c)] = st
-        self.grid_widget._save_undo_state({"type": "styles", "old_styles": old_styles, "new_styles": dict(self.engine.cell_styles)})
+        self.grid_widget._save_undo_state({"type": "styles", "old_styles": old_styles, "new_styles": self.grid_widget._snapshot_styles()})
         self.grid_widget.recompute_bounds()
         self.grid_widget.redraw()
         self._on_grid_modified()
@@ -4704,6 +5633,48 @@ class SpreadsheetTab(ttk.Frame):
         menu.add_command(label="Delete Selected Column(s)", command=self._delete_selected_cols)
         menu.add_separator()
         menu.add_command(label="Toggle Bold", command=self.toggle_bold_selection, accelerator="Ctrl+B")
+        menu.add_command(label="Toggle Italic", command=self.toggle_italic_selection, accelerator="Ctrl+I")
+        menu.add_command(label="Toggle Underline", command=self.toggle_underline_selection, accelerator="Ctrl+U")
+
+        fill_sub = tk.Menu(menu, tearoff=0)
+        for lbl, col in (
+            ("Yellow Highlight", "#fef08a"),
+            ("Soft Green", "#bbf7d0"),
+            ("Soft Blue", "#bfdbfe"),
+            ("Rose Pink", "#fecdd3"),
+            ("Warm Peach", "#fed7aa"),
+            ("Light Gray", "#e2e8f0"),
+        ):
+            fill_sub.add_command(label=lbl, command=lambda hx=col: self.set_cell_bg_color(hx))
+        fill_sub.add_separator()
+        fill_sub.add_command(label="No Fill", command=lambda: self.set_cell_bg_color(None))
+        fill_sub.add_command(label="Custom Color...", command=self._choose_custom_fill_color)
+        menu.add_cascade(label="Fill / Highlight Color", menu=fill_sub)
+
+        font_sub = tk.Menu(menu, tearoff=0)
+        for lbl, col in (
+            ("Red", "#dc2626"),
+            ("Blue", "#2563eb"),
+            ("Green", "#16a34a"),
+            ("Purple", "#7c3aed"),
+            ("Orange", "#ea580c"),
+            ("Slate", "#334155"),
+        ):
+            font_sub.add_command(label=lbl, command=lambda hx=col: self.set_cell_fg_color(hx))
+        font_sub.add_separator()
+        font_sub.add_command(label="Automatic (Default)", command=lambda: self.set_cell_fg_color(None))
+        font_sub.add_command(label="Custom Color...", command=self._choose_custom_font_color)
+        menu.add_cascade(label="Font Color", menu=font_sub)
+
+        align_sub = tk.Menu(menu, tearoff=0)
+        align_sub.add_command(label="Left", command=lambda: self.set_alignment("left"))
+        align_sub.add_command(label="Center", command=lambda: self.set_alignment("center"))
+        align_sub.add_command(label="Right", command=lambda: self.set_alignment("right"))
+        align_sub.add_separator()
+        align_sub.add_command(label="Auto (Default)", command=lambda: self.set_alignment(""))
+        menu.add_cascade(label="Cell Alignment", menu=align_sub)
+
+        menu.add_command(label="Clear Formatting", command=self.clear_formatting_selection)
         menu.add_command(label="Format as Currency ($)", command=lambda: self.format_selection("currency"))
         menu.add_command(label="Format as Percent (%)", command=lambda: self.format_selection("percent"))
         menu.add_command(label="Format as Decimal (.00)", command=lambda: self.format_selection("fixed2"))
@@ -5403,6 +6374,18 @@ class SpreadsheetDiffDialog(tk.Toplevel):
 # Spreadsheet File I/O Helpers
 # =============================================================================
 
+def _extract_xlsx_rgb(color_obj) -> Optional[str]:
+    """Extract normalized '#rrggbb' color from an openpyxl Color object when explicit RGB."""
+    if color_obj is None or getattr(color_obj, "type", None) != "rgb":
+        return None
+    rgb = str(getattr(color_obj, "rgb", "") or "").strip()
+    if len(rgb) == 8 and rgb != "00000000":
+        return _normalize_hex_color("#" + rgb[2:])
+    if len(rgb) == 6:
+        return _normalize_hex_color("#" + rgb)
+    return None
+
+
 def open_spreadsheet_file(filepath: str, tab: SpreadsheetTab) -> bool:
     """Load an existing file (.csv, .tsv, .xlsx, .mdsheet) into SpreadsheetTab."""
     if not os.path.exists(filepath):
@@ -5415,10 +6398,45 @@ def open_spreadsheet_file(filepath: str, tab: SpreadsheetTab) -> bool:
             wb = openpyxl.load_workbook(filepath, data_only=False)
             sheet = wb.active
             tab.engine.raw_cells.clear()
+            tab.engine.cell_styles.clear()
             for r_idx, row in enumerate(sheet.iter_rows(values_only=False)):
                 for c_idx, cell in enumerate(row):
                     if cell.value is not None:
                         tab.engine.set_cell(r_idx, c_idx, str(cell.value))
+                    st: Dict[str, Any] = {}
+                    fill = getattr(cell, "fill", None)
+                    if fill is not None and getattr(fill, "fill_type", None) == "solid":
+                        bg_hex = _extract_xlsx_rgb(getattr(fill, "fgColor", None)) or _extract_xlsx_rgb(getattr(fill, "start_color", None))
+                        if bg_hex:
+                            st["bg"] = bg_hex
+                    fnt = getattr(cell, "font", None)
+                    if fnt is not None:
+                        if getattr(fnt, "bold", False):
+                            st["bold"] = True
+                        if getattr(fnt, "italic", False):
+                            st["italic"] = True
+                        ul = getattr(fnt, "underline", None)
+                        if ul and ul != "none":
+                            st["underline"] = True
+                        fg_hex = _extract_xlsx_rgb(getattr(fnt, "color", None))
+                        if fg_hex:
+                            st["fg"] = fg_hex
+                    al = getattr(cell, "alignment", None)
+                    if al is not None:
+                        horiz = getattr(al, "horizontal", None)
+                        if horiz in ("left", "center", "right"):
+                            st["align"] = horiz
+                        if getattr(al, "wrap_text", False):
+                            st["wrap"] = True
+                    nf = str(getattr(cell, "number_format", "") or "")
+                    if "$" in nf:
+                        st["format"] = "currency"
+                    elif "%" in nf:
+                        st["format"] = "percent"
+                    elif "0.00" in nf:
+                        st["format"] = "fixed2"
+                    if st:
+                        tab.engine.cell_styles[(r_idx, c_idx)] = st
             tab.engine.recalculate_all()
             tab.grid_widget.recompute_bounds()
             tab.grid_widget.redraw()
@@ -5466,8 +6484,44 @@ def save_spreadsheet_file(tab: SpreadsheetTab, filepath: str) -> bool:
         try:
             wb = openpyxl.Workbook()
             ws = wb.active
-            for (r, c), raw in tab.engine.raw_cells.items():
-                ws.cell(row=r + 1, column=c + 1, value=raw)
+            all_coords = set(tab.engine.raw_cells.keys()) | set(tab.engine.cell_styles.keys())
+            for r, c in sorted(all_coords):
+                ws_cell = ws.cell(row=r + 1, column=c + 1)
+                if (r, c) in tab.engine.raw_cells:
+                    ws_cell.value = tab.engine.raw_cells[(r, c)]
+                st = tab.engine.cell_styles.get((r, c), {})
+                if not st:
+                    continue
+                bg_hex = _normalize_hex_color(st.get("bg"))
+                if bg_hex and PatternFill is not None:
+                    bg8 = "FF" + bg_hex.lstrip("#").upper()
+                    ws_cell.fill = PatternFill(fill_type="solid", start_color=bg8, end_color=bg8)
+                font_kwargs: Dict[str, Any] = {}
+                if st.get("bold"):
+                    font_kwargs["bold"] = True
+                if st.get("italic"):
+                    font_kwargs["italic"] = True
+                if st.get("underline"):
+                    font_kwargs["underline"] = "single"
+                fg_hex = _normalize_hex_color(st.get("fg"))
+                if fg_hex:
+                    font_kwargs["color"] = "FF" + fg_hex.lstrip("#").upper()
+                if font_kwargs and OpenpyxlFont is not None:
+                    ws_cell.font = OpenpyxlFont(**font_kwargs)
+                align_kwargs: Dict[str, Any] = {}
+                if st.get("align") in ("left", "center", "right"):
+                    align_kwargs["horizontal"] = st["align"]
+                if st.get("wrap"):
+                    align_kwargs["wrap_text"] = True
+                if align_kwargs and OpenpyxlAlignment is not None:
+                    ws_cell.alignment = OpenpyxlAlignment(**align_kwargs)
+                fmt = st.get("format")
+                if fmt == "currency":
+                    ws_cell.number_format = "$#,##0.00"
+                elif fmt == "percent":
+                    ws_cell.number_format = "0.0%"
+                elif fmt == "fixed2":
+                    ws_cell.number_format = "#,##0.00"
             wb.save(filepath)
             tab.file_path = filepath
             tab.is_modified = False

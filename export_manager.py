@@ -122,6 +122,10 @@ def _build_css(theme: Optional[Dict] = None, page_settings: Optional[Dict] = Non
     bq_pad = int((theme.get('blockquote_padding', 16) if theme else 16) or 16)
     bq_space = int((theme.get('blockquote_spacing', 4) if theme else 4) or 4)
     bq_justify = (theme.get('blockquote_justify', 'left') if theme else 'left') or 'left'
+    try:
+        line_spacing = max(1.0, min(3.0, float((theme or {}).get('line_spacing', 1.6) or 1.6)))
+    except (TypeError, ValueError):
+        line_spacing = 1.6
     
     page_size = 'A4'
     margin = '2cm'
@@ -137,7 +141,7 @@ def _build_css(theme: Optional[Dict] = None, page_settings: Optional[Dict] = Non
     body {{
         font-family: '{font_family}', Georgia, 'Times New Roman', serif;
         font-size: {font_size}pt;
-        line-height: 1.6;
+        line-height: {line_spacing};
         color: {fg};
         background-color: {bg};
         max-width: 100%;
@@ -149,6 +153,15 @@ def _build_css(theme: Optional[Dict] = None, page_settings: Optional[Dict] = Non
     h4 {{ font-size: 1.1em; margin: 0.5em 0 0.25em; }}
     h5, h6 {{ font-size: 1em; margin: 0.5em 0 0.25em; }}
     p {{ margin: 0.8em 0; text-align: justify; text-justify: inter-word; hyphens: auto; }}
+    div[align="left"], div[align="left"] p, div[align="left"] h1, div[align="left"] h2, div[align="left"] h3, div[align="left"] h4 {{
+        text-align: left !important;
+    }}
+    div[align="center"], div[align="center"] p, div[align="center"] h1, div[align="center"] h2, div[align="center"] h3, div[align="center"] h4 {{
+        text-align: center !important;
+    }}
+    div[align="right"], div[align="right"] p, div[align="right"] h1, div[align="right"] h2, div[align="right"] h3, div[align="right"] h4 {{
+        text-align: right !important;
+    }}
     blockquote {{
         margin: {bq_space}px 0;
         padding: 0.5em {bq_pad}px;
@@ -316,6 +329,19 @@ def _preprocess_anchors_for_html(text: str) -> str:
         ref_id = _clean_bookmark_name('fnref_' + raw_lbl)
         return f'<sup id="{ref_id}" class="footnote-ref"><a href="#{fid}">[{label}]</a></sup>'
     text = re.sub(r'\[\^([^\]\n]+)\](?!:)', sub_fn_ref, text)
+    # Convert <div align="left|center|right"> blocks for md_in_html rendering
+    text = re.sub(
+        r'<div\s+align=["\'](left|center|right)["\']\s*>(.*?)</div>',
+        r'<div align="\1" markdown="1">\n\n\2\n\n</div>',
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(
+        r'<div\s+align=["\'](left|center|right)["\']\s*>',
+        r'<div align="\1" markdown="1">',
+        text,
+        flags=re.IGNORECASE,
+    )
     return text
 
 
@@ -382,6 +408,7 @@ def _markdown_to_html(md_content: str, theme: Optional[Dict] = None,
         'nl2br',
         'sane_lists',
         'smarty',
+        'md_in_html',
     ]
     
     extension_configs = {
@@ -572,7 +599,11 @@ def export_to_docx(md_content: str, output_path: str,
     style.font.name = font_name
     style.font.size = Pt(font_size)
     style.paragraph_format.space_after = Pt(6)
-    style.paragraph_format.line_spacing = 1.15
+    raw_ls = theme.get('line_spacing') if theme else None
+    try:
+        style.paragraph_format.line_spacing = max(1.0, min(3.0, float(raw_ls))) if raw_ls is not None else 1.15
+    except (TypeError, ValueError):
+        style.paragraph_format.line_spacing = 1.15
     
     # Setup code style
     _ensure_code_style(doc)
@@ -580,6 +611,15 @@ def export_to_docx(md_content: str, output_path: str,
     lines = md_content.split('\n')
     i = 0
     bm_counter = [0]
+    active_align: Optional[str] = None
+
+    def _apply_docx_align(paragraph, align: Optional[str]):
+        if align == 'center':
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        elif align == 'right':
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        elif align == 'left':
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
     
     while i < len(lines):
         line = lines[i]
@@ -594,6 +634,43 @@ def export_to_docx(md_content: str, output_path: str,
                 i += 1
             i += 1  # skip closing ```
             _add_code_block(doc, '\n'.join(code_lines), lang)
+            continue
+
+        # Single-line or multi-line <div align="left|center|right"> blocks
+        m_single_div = re.match(
+            r'^\s*<div\s+align=["\'](left|center|right)["\']\s*>(.*?)</div>\s*$',
+            line, re.IGNORECASE
+        )
+        if m_single_div:
+            blk_align = m_single_div.group(1).lower()
+            inner = m_single_div.group(2).strip()
+            if inner:
+                h_m = re.match(r'^(#{1,6})\s+(.*)', inner)
+                if h_m:
+                    h = doc.add_heading(level=min(len(h_m.group(1)), 9))
+                    bm_counter[0] += 1
+                    _add_docx_bookmark(h, _clean_bookmark_name(h_m.group(2).strip()), bm_counter[0])
+                    _add_inline_formatting(h, h_m.group(2).strip(), bm_counter)
+                    _apply_docx_align(h, blk_align)
+                else:
+                    p = doc.add_paragraph()
+                    _add_inline_formatting(p, inner, bm_counter)
+                    _apply_docx_align(p, blk_align)
+            i += 1
+            continue
+
+        m_open_div = re.match(
+            r'^\s*<div\s+align=["\'](left|center|right)["\']\s*>\s*$',
+            line, re.IGNORECASE
+        )
+        if m_open_div:
+            active_align = m_open_div.group(1).lower()
+            i += 1
+            continue
+
+        if active_align is not None and line.strip().lower() == '</div>':
+            active_align = None
+            i += 1
             continue
 
         # Display math block $$...$$
@@ -647,6 +724,7 @@ def export_to_docx(md_content: str, output_path: str,
             bm_name = _clean_bookmark_name(text)
             _add_docx_bookmark(h, bm_name, bm_counter[0])
             _add_inline_formatting(h, text, bm_counter)
+            _apply_docx_align(h, active_align)
             i += 1
             continue
         
@@ -702,6 +780,7 @@ def export_to_docx(md_content: str, output_path: str,
                 text = re.sub(r'^[\s]*[-*+]\s+', '', lines[i])
                 p = doc.add_paragraph(style='List Bullet')
                 _add_inline_formatting(p, text, bm_counter)
+                _apply_docx_align(p, active_align)
                 i += 1
             continue
         
@@ -711,6 +790,7 @@ def export_to_docx(md_content: str, output_path: str,
                 text = re.sub(r'^[\s]*\d+\.\s+', '', lines[i])
                 p = doc.add_paragraph(style='List Number')
                 _add_inline_formatting(p, text, bm_counter)
+                _apply_docx_align(p, active_align)
                 i += 1
             continue
         
@@ -746,6 +826,7 @@ def export_to_docx(md_content: str, output_path: str,
         if para_lines:
             p = doc.add_paragraph()
             _add_inline_formatting(p, ' '.join(para_lines), bm_counter)
+            _apply_docx_align(p, active_align)
     
     doc.save(output_path)
     return True
@@ -761,6 +842,10 @@ def _is_special_line(line: str) -> bool:
     if stripped.startswith('$$'):
         return True
     if stripped.startswith('>'):
+        return True
+    if re.match(r'^<div\s+align=["\'](?:left|center|right)["\']\s*>', stripped, re.IGNORECASE):
+        return True
+    if stripped.lower() == '</div>':
         return True
     if re.match(r'^\[\^([^\]]+)\]:', stripped):
         return True

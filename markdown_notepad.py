@@ -240,6 +240,41 @@ def _is_dark_color(hex_color):
     return False
 
 
+_ALIGN_SINGLE_RE = re.compile(
+    r'^(\s*<div\s+align=["\'](left|center|right)["\']\s*>)(.*?)(</div>\s*)$',
+    re.IGNORECASE,
+)
+_ALIGN_OPEN_RE = re.compile(
+    r'^\s*<div\s+align=["\'](left|center|right)["\']\s*>\s*$',
+    re.IGNORECASE,
+)
+_ALIGN_CLOSE_RE = re.compile(r'^\s*</div>\s*$', re.IGNORECASE)
+
+
+def _normalize_line_spacing(value: Any) -> float:
+    """Normalize document line spacing to supported values: 1.0, 1.5, or 2.0."""
+    try:
+        v = float(value)
+    except (ValueError, TypeError):
+        return 1.0
+    if v >= 1.75:
+        return 2.0
+    if v >= 1.25:
+        return 1.5
+    return 1.0
+
+
+def _calc_line_spacing_px(px_size: int, line_spacing: Any) -> Tuple[int, int, int]:
+    """Return Tkinter Text (spacing1, spacing2, spacing3) scaled for pixel height & line spacing."""
+    sp = _normalize_line_spacing(line_spacing)
+    px = max(8, int(abs(px_size)))
+    if sp >= 2.0:
+        return (max(3, round(px * 0.25)), max(10, round(px * 1.05)), max(11, round(px * 1.15)))
+    if sp >= 1.5:
+        return (max(2, round(px * 0.20)), max(5, round(px * 0.55)), max(7, round(px * 0.65)))
+    return (max(1, round(px * 0.12)), max(2, round(px * 0.18)), max(4, round(px * 0.35)))
+
+
 # =============================================================================
 # UI Components
 # =============================================================================
@@ -2539,11 +2574,9 @@ class MarkdownVisualWidget(tk.Frame):
         math_block_content = []
         in_table = False
         table_rows = []
+        active_align = None
         
         for i, line in enumerate(lines):
-            # Check if this line contains an image
-            img_match = re.search(r'!\[.*?\]\(.*?\)|<img\s+[^>]*src=.*?>', line.strip(), re.IGNORECASE)
-            
             # Handle code blocks
             if line.strip().startswith('```'):
                 # Flush any pending table
@@ -2566,8 +2599,39 @@ class MarkdownVisualWidget(tk.Frame):
                 code_block_content.append(line)
                 continue
 
+            # Handle alignment wrapper tags outside code/math blocks
+            if not in_math_block:
+                m_aopen = _ALIGN_OPEN_RE.match(line)
+                if m_aopen:
+                    if in_table and table_rows:
+                        self._render_table(table_rows)
+                        table_rows = []
+                        in_table = False
+                    active_align = m_aopen.group(1).lower()
+                    continue
+                if active_align is not None and _ALIGN_CLOSE_RE.match(line):
+                    if in_table and table_rows:
+                        self._render_table(table_rows)
+                        table_rows = []
+                        in_table = False
+                    active_align = None
+                    continue
+
+            single_align = None
+            work_line = line
+            if not in_math_block:
+                m_asingle = _ALIGN_SINGLE_RE.match(line)
+                if m_asingle:
+                    single_align = m_asingle.group(2).lower()
+                    work_line = m_asingle.group(3)
+            line_align = single_align or active_align
+            align_extra = (f"align_{line_align}",) if line_align else ()
+
+            # Check if this line contains an image
+            img_match = re.search(r'!\[.*?\]\(.*?\)|<img\s+[^>]*src=.*?>', work_line.strip(), re.IGNORECASE)
+
             # Handle display math blocks ($$ ... $$)
-            stripped_line = line.strip()
+            stripped_line = work_line.strip()
             if stripped_line.startswith('$$'):
                 if in_table and table_rows:
                     self._render_table(table_rows)
@@ -2604,14 +2668,14 @@ class MarkdownVisualWidget(tk.Frame):
                     math_block_content = []
                     in_math_block = False
                 else:
-                    math_block_content.append(line)
+                    math_block_content.append(work_line)
                 continue
             
             # Handle tables - collect consecutive table rows
-            if '|' in line and line.strip().startswith('|'):
+            if '|' in work_line and work_line.strip().startswith('|'):
                 if not in_table:
                     in_table = True
-                table_rows.append(line)
+                table_rows.append(work_line)
                 continue
             else:
                 # End of table - render it
@@ -2621,7 +2685,7 @@ class MarkdownVisualWidget(tk.Frame):
                     in_table = False
             
             # Handle footnote definition: [^id]: text
-            fn_def_match = re.match(r'^\[\^([^\]]+)\]:\s*(.+)$', line.strip())
+            fn_def_match = re.match(r'^\[\^([^\]]+)\]:\s*(.+)$', work_line.strip())
             if fn_def_match:
                 fn_id = fn_def_match.group(1).strip()
                 fn_key = fn_id.lower()
@@ -2638,9 +2702,9 @@ class MarkdownVisualWidget(tk.Frame):
                 self.text_widget.mark_gravity(fn_occ_mark, tk.LEFT)
                 fn_occs.append(fn_occ_mark)
                 back_tag = f"fn_back_{self._link_counter}"
-                self.text_widget.insert(tk.END, f"[{fn_id}] ", ('footnote_def', 'footnote_badge', back_tag))
-                self._insert_inline(fn_body, ('footnote_def',))
-                self.text_widget.insert(tk.END, " ↩\n", ('footnote_def', 'link', back_tag))
+                self.text_widget.insert(tk.END, f"[{fn_id}] ", ('footnote_def', 'footnote_badge', back_tag) + align_extra)
+                self._insert_inline(fn_body, ('footnote_def',) + align_extra)
+                self.text_widget.insert(tk.END, " ↩\n", ('footnote_def', 'link', back_tag) + align_extra)
                 for seq in ("<Button-1>", "<Control-Button-1>", "<Shift-Button-1>", "<Control-Shift-Button-1>"):
                     self.text_widget.tag_bind(back_tag, seq, lambda e, fid=fn_id, om=fn_occ_mark: self._cycle_footnote_occurrence(fid, om, reverse=bool(e.state & 0x0001)))
                 self.text_widget.tag_bind(back_tag, "<Enter>", lambda e: self.text_widget.config(cursor="hand2"))
@@ -2651,79 +2715,79 @@ class MarkdownVisualWidget(tk.Frame):
             if img_match and PIL_AVAILABLE:
                 matched_img = None
                 for img in images:
-                    if img.get('full_match') and img['full_match'] in line:
+                    if img.get('full_match') and img['full_match'] in work_line:
                         matched_img = img
                         break
 
                 if matched_img:
                     full_match = matched_img['full_match']
-                    before, _, after = line.partition(full_match)
+                    before, _, after = work_line.partition(full_match)
                     if before.strip():
-                        self._insert_inline(before, ('paragraph',))
+                        self._insert_inline(before, ('paragraph',) + align_extra)
                     self._insert_image_inline(matched_img)
                     if after.strip():
-                        self._insert_inline(after, ('paragraph',))
+                        self._insert_inline(after, ('paragraph',) + align_extra)
                     self.text_widget.insert(tk.END, '\n')
                 else:
-                    self._insert_inline(line, ('paragraph',))
-                    self.text_widget.insert(tk.END, '\n', 'paragraph')
+                    self._insert_inline(work_line, ('paragraph',) + align_extra)
+                    self.text_widget.insert(tk.END, '\n', ('paragraph',) + align_extra)
                 continue
             
             # Headers
-            if line.startswith('######'):
-                self._register_heading(line[6:].strip())
-                self._insert_inline(line[6:].strip(), ('h6',))
-                self.text_widget.insert(tk.END, '\n', 'h6')
-            elif line.startswith('#####'):
-                self._register_heading(line[5:].strip())
-                self._insert_inline(line[5:].strip(), ('h5',))
-                self.text_widget.insert(tk.END, '\n', 'h5')
-            elif line.startswith('####'):
-                self._register_heading(line[4:].strip())
-                self._insert_inline(line[4:].strip(), ('h4',))
-                self.text_widget.insert(tk.END, '\n', 'h4')
-            elif line.startswith('###'):
-                self._register_heading(line[3:].strip())
-                self._insert_inline(line[3:].strip(), ('h3',))
-                self.text_widget.insert(tk.END, '\n', 'h3')
-            elif line.startswith('##'):
-                self._register_heading(line[2:].strip())
-                self._insert_inline(line[2:].strip(), ('h2',))
-                self.text_widget.insert(tk.END, '\n', 'h2')
-            elif line.startswith('#'):
-                self._register_heading(line[1:].strip())
-                self._insert_inline(line[1:].strip(), ('h1',))
-                self.text_widget.insert(tk.END, '\n', 'h1')
+            if work_line.startswith('######'):
+                self._register_heading(work_line[6:].strip())
+                self._insert_inline(work_line[6:].strip(), ('h6',) + align_extra)
+                self.text_widget.insert(tk.END, '\n', ('h6',) + align_extra)
+            elif work_line.startswith('#####'):
+                self._register_heading(work_line[5:].strip())
+                self._insert_inline(work_line[5:].strip(), ('h5',) + align_extra)
+                self.text_widget.insert(tk.END, '\n', ('h5',) + align_extra)
+            elif work_line.startswith('####'):
+                self._register_heading(work_line[4:].strip())
+                self._insert_inline(work_line[4:].strip(), ('h4',) + align_extra)
+                self.text_widget.insert(tk.END, '\n', ('h4',) + align_extra)
+            elif work_line.startswith('###'):
+                self._register_heading(work_line[3:].strip())
+                self._insert_inline(work_line[3:].strip(), ('h3',) + align_extra)
+                self.text_widget.insert(tk.END, '\n', ('h3',) + align_extra)
+            elif work_line.startswith('##'):
+                self._register_heading(work_line[2:].strip())
+                self._insert_inline(work_line[2:].strip(), ('h2',) + align_extra)
+                self.text_widget.insert(tk.END, '\n', ('h2',) + align_extra)
+            elif work_line.startswith('#'):
+                self._register_heading(work_line[1:].strip())
+                self._insert_inline(work_line[1:].strip(), ('h1',) + align_extra)
+                self.text_widget.insert(tk.END, '\n', ('h1',) + align_extra)
             
             # Horizontal rule
-            elif line.strip() in ['---', '***', '___']:
+            elif work_line.strip() in ['---', '***', '___']:
                 self._insert_hr()
             
             # Blockquote
-            elif line.startswith('>'):
-                self.text_widget.insert(tk.END, '▌ ', ('blockquote', 'quote_bar'))
-                self._insert_inline(line[1:].strip(), ('blockquote',))
-                self.text_widget.insert(tk.END, '\n', 'blockquote')
+            elif work_line.startswith('>'):
+                self.text_widget.insert(tk.END, '▌ ', ('blockquote', 'quote_bar') + align_extra)
+                self._insert_inline(work_line[1:].strip(), ('blockquote',) + align_extra)
+                self.text_widget.insert(tk.END, '\n', ('blockquote',) + align_extra)
             
             # List items (nesting by leading whitespace)
-            elif re.match(r'^[\*\-\+]\s', line.strip()):
-                depth = self._list_depth(line)
+            elif re.match(r'^[\*\-\+]\s', work_line.strip()):
+                depth = self._list_depth(work_line)
                 bullet = ('•', '◦', '▪', '▪')[depth]
-                tags = ('list_item', f'list_d{depth}')
+                tags = ('list_item', f'list_d{depth}') + align_extra
                 self.text_widget.insert(tk.END, bullet + ' ', tags)
-                self._insert_inline(line.strip()[2:], tags)
+                self._insert_inline(work_line.strip()[2:], tags)
                 self.text_widget.insert(tk.END, '\n', tags)
-            elif re.match(r'^\d+\.\s', line.strip()):
-                m_li = re.match(r'^(\d+\.\s)', line.strip())
-                tags = ('list_item', f'list_d{self._list_depth(line)}')
+            elif re.match(r'^\d+\.\s', work_line.strip()):
+                m_li = re.match(r'^(\d+\.\s)', work_line.strip())
+                tags = ('list_item', f'list_d{self._list_depth(work_line)}') + align_extra
                 self.text_widget.insert(tk.END, m_li.group(1), tags)
-                self._insert_inline(line.strip()[m_li.end():], tags)
+                self._insert_inline(work_line.strip()[m_li.end():], tags)
                 self.text_widget.insert(tk.END, '\n', tags)
             
             # Normal text
             else:
-                self._insert_inline(line, ('paragraph',))
-                self.text_widget.insert(tk.END, '\n', 'paragraph')
+                self._insert_inline(work_line, ('paragraph',) + align_extra)
+                self.text_widget.insert(tk.END, '\n', ('paragraph',) + align_extra)
         
         # Flush any remaining table at end of content
         if in_table and table_rows:
@@ -2970,8 +3034,17 @@ class MarkdownVisualWidget(tk.Frame):
         tw.tag_configure("image_placeholder", font=(font_family, self._px(font_size)), foreground=cap_fg,
                          background=quote_bg, lmargin1=self._s(24), spacing1=self._s(6), spacing3=self._s(6))
 
-        # Paragraph spacing (reading rhythm: ~1.2 line height, 8px between paragraphs)
-        tw.tag_configure("paragraph", spacing1=0, spacing2=max(1, int(bpx * 0.2)), spacing3=self._s(8))
+        # Paragraph spacing (scaled by active document line spacing 1.0 / 1.5 / 2.0)
+        s1, s2, s3 = _calc_line_spacing_px(bpx, theme.get('line_spacing', 1.0))
+        tw.tag_configure("paragraph", spacing1=s1, spacing2=s2, spacing3=s3)
+
+        # Explicit paragraph/selection alignment overrides
+        tw.tag_configure("align_left", justify="left")
+        tw.tag_configure("align_center", justify="center")
+        tw.tag_configure("align_right", justify="right")
+        tw.tag_raise("align_left")
+        tw.tag_raise("align_center")
+        tw.tag_raise("align_right")
 
     def get_content(self):
         """Get the current content"""
@@ -3367,7 +3440,14 @@ class DocumentTab(ttk.Frame):
         """Apply a zoom factor (1.0 = 100%) to both the source page and the visual page."""
         self.zoom = zoom
         self.source_page.set_zoom(zoom)
-        self.source_editor.config(font=self._source_font())
+        if self.current_mode == "visual":
+            v_font = self.theme.get('visual_font') or VISUAL_FONT or SANS_FONT or 'Segoe UI'
+            v_sz = self.theme.get('visual_font_size', 11)
+            px = max(4, round(v_sz * self.source_page.dpi() / 72.0 * self.zoom))
+            s1, s2, s3 = _calc_line_spacing_px(px, self.theme.get('line_spacing', 1.0))
+            self.source_editor.config(font=(v_font, -px), spacing1=s1, spacing2=s2, spacing3=s3)
+        else:
+            self.source_editor.config(font=self._source_font())
         self._setup_syntax_tags()
         self.visual_viewer.set_zoom(zoom)
 
@@ -3534,31 +3614,35 @@ class DocumentTab(ttk.Frame):
                     line_start = f'{old_line}.0'
                     line_end = f'{old_line}.end'
                     line_text = self.source_editor.get(line_start, line_end)
-                    h_m = re.match(r'^(#{1,6}\s+)', line_text)
+                    m_al = _ALIGN_SINGLE_RE.match(line_text)
+                    scan_text = m_al.group(3) if m_al else line_text
+                    col_off = m_al.start(3) if m_al else 0
+
+                    h_m = re.match(r'^(#{1,6}\s+)', scan_text)
                     if h_m:
-                        self.source_editor.tag_add('syn_delimiter', line_start, f'{old_line}.{len(h_m.group(1))}')
-                    bq_m = re.match(r'^(>\s?)', line_text)
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off}', f'{old_line}.{col_off + len(h_m.group(1))}')
+                    bq_m = re.match(r'^(>\s?)', scan_text)
                     if bq_m:
-                        self.source_editor.tag_add('syn_delimiter', line_start, f'{old_line}.{len(bq_m.group(1))}')
-                    for m in re.finditer(r'(\*\*\*|___)(.+?)\1', line_text):
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off}', f'{old_line}.{col_off + len(bq_m.group(1))}')
+                    for m in re.finditer(r'(\*\*\*|___)(.+?)\1', scan_text):
                         p_len = len(m.group(1))
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start()}', f'{old_line}.{m.start() + p_len}')
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.end() - p_len}', f'{old_line}.{m.end()}')
-                    for m in re.finditer(r'(?<!\*)\*\*([^\*\n]+?)\*\*(?!\*)', line_text):
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start()}', f'{old_line}.{m.start() + 2}')
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.end() - 2}', f'{old_line}.{m.end()}')
-                    for m in re.finditer(r'(?<!\*)\*([^\*\n]+?)\*(?!\*)', line_text):
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start()}', f'{old_line}.{m.start() + 1}')
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.end() - 1}', f'{old_line}.{m.end()}')
-                    for m in re.finditer(r'==([^=\n]+)==', line_text):
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start()}', f'{old_line}.{m.start() + 2}')
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.end() - 2}', f'{old_line}.{m.end()}')
-                    for m in re.finditer(r'`([^`\n]+)`', line_text):
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start()}', f'{old_line}.{m.start() + 1}')
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.end() - 1}', f'{old_line}.{m.end()}')
-                    for m in re.finditer(r'(?<!!)(\[)([^\]\n]+)(\])\(([^\)\n]+)\)', line_text):
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start(1)}', f'{old_line}.{m.end(1)}')
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{m.start(3)}', f'{old_line}.{m.end(4)}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start()}', f'{old_line}.{col_off + m.start() + p_len}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.end() - p_len}', f'{old_line}.{col_off + m.end()}')
+                    for m in re.finditer(r'(?<!\*)\*\*([^\*\n]+?)\*\*(?!\*)', scan_text):
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start()}', f'{old_line}.{col_off + m.start() + 2}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.end() - 2}', f'{old_line}.{col_off + m.end()}')
+                    for m in re.finditer(r'(?<!\*)\*([^\*\n]+?)\*(?!\*)', scan_text):
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start()}', f'{old_line}.{col_off + m.start() + 1}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.end() - 1}', f'{old_line}.{col_off + m.end()}')
+                    for m in re.finditer(r'==([^=\n]+)==', scan_text):
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start()}', f'{old_line}.{col_off + m.start() + 2}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.end() - 2}', f'{old_line}.{col_off + m.end()}')
+                    for m in re.finditer(r'`([^`\n]+)`', scan_text):
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start()}', f'{old_line}.{col_off + m.start() + 1}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.end() - 1}', f'{old_line}.{col_off + m.end()}')
+                    for m in re.finditer(r'(?<!!)(\[)([^\]\n]+)(\])\(([^\)\n]+)\)', scan_text):
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start(1)}', f'{old_line}.{col_off + m.end(1)}')
+                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start(3)}', f'{old_line}.{col_off + m.end(4)}')
 
                 self.source_editor.tag_remove('syn_delimiter', f'{curr_line}.0', f'{curr_line}.end')
         except Exception:
@@ -3638,14 +3722,15 @@ class DocumentTab(ttk.Frame):
             v_font = theme.get('visual_font') or VISUAL_FONT or SANS_FONT or 'Segoe UI'
             v_sz = theme.get('visual_font_size', 11)
             px = max(4, round(v_sz * self.source_page.dpi() / 72.0 * self.zoom))
+            s1, s2, s3 = _calc_line_spacing_px(px, theme.get('line_spacing', 1.0))
             self.source_editor.config(
                 bg=theme.get('visual_bg', '#ffffff'),
                 fg=theme.get('visual_fg', '#1a1a1a'),
                 insertbackground=theme.get('visual_fg', '#1a1a1a'),
                 font=(v_font, -px),
-                spacing1=2,
-                spacing2=3,
-                spacing3=6,
+                spacing1=s1,
+                spacing2=s2,
+                spacing3=s3,
             )
             self.source_page.set_colors(theme.get('desk_bg', '#d9dce1'), theme.get('visual_bg', '#ffffff'))
         else:
@@ -3767,18 +3852,28 @@ class DocumentTab(ttk.Frame):
         editor.tag_configure('syn_list_marker', font=(b_font, px(sz), 'bold'), foreground=link_fg)
         editor.tag_configure('syn_hr', foreground=hr_fg)
 
+        # Alignment marker elision & paragraph alignment tags
+        editor.tag_configure('syn_align_tag', elide=is_visual, foreground='#94a3b8')
+        editor.tag_configure('syn_align_left', justify='left')
+        editor.tag_configure('syn_align_center', justify='center')
+        editor.tag_configure('syn_align_right', justify='right')
+        for _atag in ('syn_align_left', 'syn_align_center', 'syn_align_right'):
+            editor.tag_raise(_atag)
+
     def _apply_syntax_highlighting(self):
         """Apply markdown syntax highlighting and visual elision/widgets to the source editor."""
         editor = self.source_editor
         for tag in ('syn_h1', 'syn_h2', 'syn_h3', 'syn_h4', 'syn_bold', 'syn_italic',
                     'syn_bold_italic', 'syn_highlight', 'syn_code_inline', 'syn_code_block',
                     'syn_link', 'syn_anchor', 'syn_footnote', 'syn_math', 'syn_flash',
-                    'syn_blockquote', 'syn_list_marker', 'syn_hr', 'syn_delimiter', 'syn_block_elide'):
+                    'syn_blockquote', 'syn_list_marker', 'syn_hr', 'syn_delimiter', 'syn_block_elide',
+                    'syn_align_left', 'syn_align_center', 'syn_align_right', 'syn_align_tag'):
             editor.tag_remove(tag, '1.0', tk.END)
 
         content = editor.get('1.0', tk.END)
         lines = content.split('\n')
         in_code_block = False
+        active_align = None
 
         for lineno, line in enumerate(lines, start=1):
             line_start = f'{lineno}.0'
@@ -3793,58 +3888,87 @@ class DocumentTab(ttk.Frame):
                 editor.tag_add('syn_code_block', line_start, line_end)
                 continue
 
-            h_match = re.match(r'^(#{1,6}\s+)(.*)$', line)
+            m_single = _ALIGN_SINGLE_RE.match(line)
+            if m_single:
+                a_mode = m_single.group(2).lower()
+                editor.tag_add('syn_align_tag', f'{lineno}.0', f'{lineno}.{m_single.end(1)}')
+                editor.tag_add('syn_align_tag', f'{lineno}.{m_single.start(4)}', line_end)
+                editor.tag_add(f'syn_align_{a_mode}', line_start, line_end)
+                scan_line = m_single.group(3)
+                col_off = m_single.start(3)
+                scan_start = f'{lineno}.{col_off}'
+                scan_end = f'{lineno}.{m_single.end(3)}'
+            else:
+                m_open = _ALIGN_OPEN_RE.match(line)
+                if m_open:
+                    active_align = m_open.group(1).lower()
+                    elide_end = f'{lineno + 1}.0' if lineno < len(lines) else line_end
+                    editor.tag_add('syn_align_tag', line_start, elide_end)
+                    continue
+                if active_align is not None and _ALIGN_CLOSE_RE.match(line):
+                    active_align = None
+                    elide_end = f'{lineno + 1}.0' if lineno < len(lines) else line_end
+                    editor.tag_add('syn_align_tag', line_start, elide_end)
+                    continue
+                if active_align:
+                    editor.tag_add(f'syn_align_{active_align}', line_start, line_end)
+                scan_line = line
+                col_off = 0
+                scan_start = line_start
+                scan_end = line_end
+
+            h_match = re.match(r'^(#{1,6}\s+)(.*)$', scan_line)
             if h_match:
                 pfx_len = len(h_match.group(1))
                 h_lvl = min(len(h_match.group(1).strip()), 4)
-                editor.tag_add('syn_delimiter', line_start, f'{lineno}.{pfx_len}')
-                editor.tag_add(f'syn_h{h_lvl}', f'{lineno}.{pfx_len}', line_end)
-            elif line.strip() in ('---', '***', '___'):
-                editor.tag_add('syn_hr', line_start, line_end)
-            elif line.startswith('>'):
-                bq_match = re.match(r'^(>\s?)(.*)$', line)
+                editor.tag_add('syn_delimiter', scan_start, f'{lineno}.{col_off + pfx_len}')
+                editor.tag_add(f'syn_h{h_lvl}', f'{lineno}.{col_off + pfx_len}', scan_end)
+            elif scan_line.strip() in ('---', '***', '___'):
+                editor.tag_add('syn_hr', scan_start, scan_end)
+            elif scan_line.startswith('>'):
+                bq_match = re.match(r'^(>\s?)(.*)$', scan_line)
                 if bq_match:
                     pfx_len = len(bq_match.group(1))
-                    editor.tag_add('syn_delimiter', line_start, f'{lineno}.{pfx_len}')
-                editor.tag_add('syn_blockquote', line_start, line_end)
+                    editor.tag_add('syn_delimiter', scan_start, f'{lineno}.{col_off + pfx_len}')
+                editor.tag_add('syn_blockquote', scan_start, scan_end)
             else:
-                m = re.match(r'^(\s*)([-*+]|\d+\.)\s', line)
+                m = re.match(r'^(\s*)([-*+]|\d+\.)\s', scan_line)
                 if m:
-                    editor.tag_add('syn_list_marker', line_start, f'{lineno}.{m.end()}')
+                    editor.tag_add('syn_list_marker', scan_start, f'{lineno}.{col_off + m.end()}')
 
-            for m in re.finditer(r'(\*\*\*|___)(.+?)\1', line):
+            for m in re.finditer(r'(\*\*\*|___)(.+?)\1', scan_line):
                 p_len = len(m.group(1))
-                editor.tag_add('syn_delimiter', f'{lineno}.{m.start()}', f'{lineno}.{m.start() + p_len}')
-                editor.tag_add('syn_bold_italic', f'{lineno}.{m.start() + p_len}', f'{lineno}.{m.end() - p_len}')
-                editor.tag_add('syn_delimiter', f'{lineno}.{m.end() - p_len}', f'{lineno}.{m.end()}')
-            for m in re.finditer(r'(?<!\*)\*\*([^\*\n]+?)\*\*(?!\*)', line):
-                editor.tag_add('syn_delimiter', f'{lineno}.{m.start()}', f'{lineno}.{m.start() + 2}')
-                editor.tag_add('syn_bold', f'{lineno}.{m.start() + 2}', f'{lineno}.{m.end() - 2}')
-                editor.tag_add('syn_delimiter', f'{lineno}.{m.end() - 2}', f'{lineno}.{m.end()}')
-            for m in re.finditer(r'(?<!\*)\*([^\*\n]+?)\*(?!\*)', line):
-                editor.tag_add('syn_delimiter', f'{lineno}.{m.start()}', f'{lineno}.{m.start() + 1}')
-                editor.tag_add('syn_italic', f'{lineno}.{m.start() + 1}', f'{lineno}.{m.end() - 1}')
-                editor.tag_add('syn_delimiter', f'{lineno}.{m.end() - 1}', f'{lineno}.{m.end()}')
-            for m in re.finditer(r'==([^=\n]+)==', line):
-                editor.tag_add('syn_delimiter', f'{lineno}.{m.start()}', f'{lineno}.{m.start() + 2}')
-                editor.tag_add('syn_highlight', f'{lineno}.{m.start() + 2}', f'{lineno}.{m.end() - 2}')
-                editor.tag_add('syn_delimiter', f'{lineno}.{m.end() - 2}', f'{lineno}.{m.end()}')
-            for m in re.finditer(r'`([^`\n]+)`', line):
-                editor.tag_add('syn_delimiter', f'{lineno}.{m.start()}', f'{lineno}.{m.start() + 1}')
-                editor.tag_add('syn_code_inline', f'{lineno}.{m.start() + 1}', f'{lineno}.{m.end() - 1}')
-                editor.tag_add('syn_delimiter', f'{lineno}.{m.end() - 1}', f'{lineno}.{m.end()}')
-            for m in re.finditer(r'\$\$(.+?)\$\$|(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)', line):
-                editor.tag_add('syn_math', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
-            for m in re.finditer(r'\[\^([^\]\n]+)\]', line):
-                editor.tag_add('syn_footnote', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
-            for m in re.finditer(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', line):
-                editor.tag_add('syn_anchor', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
-            for m in re.finditer(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', line):
-                editor.tag_add('syn_link', f'{lineno}.{m.start()}', f'{lineno}.{m.end()}')
-            for m in re.finditer(r'(?<!!)(\[)([^\]\n]+)(\])\(([^\)\n]+)\)', line):
-                editor.tag_add('syn_delimiter', f'{lineno}.{m.start(1)}', f'{lineno}.{m.end(1)}')
-                editor.tag_add('syn_link', f'{lineno}.{m.start(2)}', f'{lineno}.{m.end(2)}')
-                editor.tag_add('syn_delimiter', f'{lineno}.{m.start(3)}', f'{lineno}.{m.end(4)}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + p_len}')
+                editor.tag_add('syn_bold_italic', f'{lineno}.{col_off + m.start() + p_len}', f'{lineno}.{col_off + m.end() - p_len}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.end() - p_len}', f'{lineno}.{col_off + m.end()}')
+            for m in re.finditer(r'(?<!\*)\*\*([^\*\n]+?)\*\*(?!\*)', scan_line):
+                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + 2}')
+                editor.tag_add('syn_bold', f'{lineno}.{col_off + m.start() + 2}', f'{lineno}.{col_off + m.end() - 2}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.end() - 2}', f'{lineno}.{col_off + m.end()}')
+            for m in re.finditer(r'(?<!\*)\*([^\*\n]+?)\*(?!\*)', scan_line):
+                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + 1}')
+                editor.tag_add('syn_italic', f'{lineno}.{col_off + m.start() + 1}', f'{lineno}.{col_off + m.end() - 1}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.end() - 1}', f'{lineno}.{col_off + m.end()}')
+            for m in re.finditer(r'==([^=\n]+)==', scan_line):
+                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + 2}')
+                editor.tag_add('syn_highlight', f'{lineno}.{col_off + m.start() + 2}', f'{lineno}.{col_off + m.end() - 2}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.end() - 2}', f'{lineno}.{col_off + m.end()}')
+            for m in re.finditer(r'`([^`\n]+)`', scan_line):
+                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + 1}')
+                editor.tag_add('syn_code_inline', f'{lineno}.{col_off + m.start() + 1}', f'{lineno}.{col_off + m.end() - 1}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.end() - 1}', f'{lineno}.{col_off + m.end()}')
+            for m in re.finditer(r'\$\$(.+?)\$\$|(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)', scan_line):
+                editor.tag_add('syn_math', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.end()}')
+            for m in re.finditer(r'\[\^([^\]\n]+)\]', scan_line):
+                editor.tag_add('syn_footnote', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.end()}')
+            for m in re.finditer(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', scan_line):
+                editor.tag_add('syn_anchor', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.end()}')
+            for m in re.finditer(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', scan_line):
+                editor.tag_add('syn_link', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.end()}')
+            for m in re.finditer(r'(?<!!)(\[)([^\]\n]+)(\])\(([^\)\n]+)\)', scan_line):
+                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start(1)}', f'{lineno}.{col_off + m.end(1)}')
+                editor.tag_add('syn_link', f'{lineno}.{col_off + m.start(2)}', f'{lineno}.{col_off + m.end(2)}')
+                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start(3)}', f'{lineno}.{col_off + m.end(4)}')
 
         if self.current_mode == "visual":
             try:
@@ -5192,6 +5316,7 @@ class MarkdownNotepad(tk.Tk):
         'page_size': 'Letter',
         'page_margin': 'Normal',
         'zoom_pct': 100,
+        'line_spacing': 1.0,
         'typewriter_scrolling': False,
         # Blockquote customization (empty strings/0 mean inherit from active theme)
         'blockquote_font': '',
@@ -5268,6 +5393,9 @@ class MarkdownNotepad(tk.Tk):
         self.page_size_var = tk.StringVar(value=self.theme.get('page_size', 'Letter'))
         self.page_margin_var = tk.StringVar(value=self.theme.get('page_margin', 'Normal'))
         self.typewriter_var = tk.BooleanVar(value=bool(self.theme.get('typewriter_scrolling', False)))
+        self.line_spacing_var = tk.StringVar(
+            value=f"{_normalize_line_spacing(self.theme.get('line_spacing', 1.0)):.1f}"
+        )
         self.source_view_var = tk.BooleanVar(value=False)
         self.mode_var = tk.StringVar(value="visual")
         self._setup_ui()
@@ -5636,6 +5764,26 @@ class MarkdownNotepad(tk.Tk):
         format_menu.add_command(label="Highlight", command=lambda: self._insert_format("==", "=="), accelerator="Ctrl+Shift+H")
         format_menu.add_command(label="Inline Code", command=lambda: self._insert_format("`", "`"), accelerator="Ctrl+`")
         format_menu.add_separator()
+
+        line_spacing_menu = tk.Menu(format_menu, tearoff=0)
+        for sp_lbl, sp_val in (("1.0 (Single)", 1.0), ("1.5 (1.5x)", 1.5), ("2.0 (Double)", 2.0)):
+            line_spacing_menu.add_radiobutton(
+                label=sp_lbl,
+                variable=self.line_spacing_var,
+                value=f"{sp_val:.1f}",
+                command=lambda v=sp_val: self.set_document_line_spacing(v),
+            )
+        format_menu.add_cascade(label="Line Spacing", menu=line_spacing_menu)
+
+        align_menu = tk.Menu(format_menu, tearoff=0)
+        align_menu.add_command(label="Left", command=lambda: self.set_document_alignment("left"))
+        align_menu.add_command(label="Center", command=lambda: self.set_document_alignment("center"))
+        align_menu.add_command(label="Right", command=lambda: self.set_document_alignment("right"))
+        align_menu.add_separator()
+        align_menu.add_command(label="None (Default)", command=lambda: self.set_document_alignment("none"))
+        format_menu.add_cascade(label="Alignment", menu=align_menu)
+
+        format_menu.add_separator()
         format_menu.add_command(label="Heading 1", command=lambda: self._insert_line_prefix("# "))
         format_menu.add_command(label="Heading 2", command=lambda: self._insert_line_prefix("## "))
         format_menu.add_command(label="Heading 3", command=lambda: self._insert_line_prefix("### "))
@@ -5797,6 +5945,34 @@ class MarkdownNotepad(tk.Tk):
         add_format_button("\U0001d43c", lambda: self._insert_format("*", "*"), "Format selected text as italic (*text*) (Ctrl+I).", width=3)
         add_format_button("\U0001f58d HL", lambda: self._insert_format("==", "=="), "Format selected text with a highlight marker (==text==) (Ctrl+Shift+H).")
         add_format_button("</>", lambda: self._insert_format("`", "`"), "Format selected text as inline code (`code`) (Ctrl+`).")
+
+        # Line Spacing (1 / 1.5 / 2) and Selected-Text Alignment (Left / Center / Right / None)
+        ls_init = _normalize_line_spacing(self.theme.get('line_spacing', 1.0))
+        self.line_spacing_mb = ttk.Menubutton(btm, text=f"\u2195 {ls_init:.1f} \u25be", style="Toolbar.TButton")
+        ls_tb_menu = tk.Menu(self.line_spacing_mb, tearoff=0)
+        for sp_lbl, sp_val in (("1.0 (Single)", 1.0), ("1.5 (1.5x)", 1.5), ("2.0 (Double)", 2.0)):
+            ls_tb_menu.add_radiobutton(
+                label=sp_lbl,
+                variable=self.line_spacing_var,
+                value=f"{sp_val:.1f}",
+                command=lambda v=sp_val: self.set_document_line_spacing(v),
+            )
+        self.line_spacing_mb.config(menu=ls_tb_menu)
+        self.line_spacing_mb.pack(side=tk.LEFT, padx=1)
+        ToolTip(self.line_spacing_mb, "Set document paragraph line spacing (1.0, 1.5, or 2.0).")
+        self._format_buttons.append(self.line_spacing_mb)
+
+        self.align_mb = ttk.Menubutton(btm, text="\u2261 Align \u25be", style="Toolbar.TButton")
+        align_tb_menu = tk.Menu(self.align_mb, tearoff=0)
+        align_tb_menu.add_command(label="Align Left", command=lambda: self.set_document_alignment("left"))
+        align_tb_menu.add_command(label="Align Center", command=lambda: self.set_document_alignment("center"))
+        align_tb_menu.add_command(label="Align Right", command=lambda: self.set_document_alignment("right"))
+        align_tb_menu.add_separator()
+        align_tb_menu.add_command(label="None (Default)", command=lambda: self.set_document_alignment("none"))
+        self.align_mb.config(menu=align_tb_menu)
+        self.align_mb.pack(side=tk.LEFT, padx=1)
+        ToolTip(self.align_mb, "Align selected text or active paragraph(s): Left, Center, Right, or None (Default).")
+        self._format_buttons.append(self.align_mb)
 
         ttk.Separator(btm, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=6, fill=tk.Y)
 
@@ -6486,6 +6662,17 @@ class MarkdownNotepad(tk.Tk):
             menu.add_command(label="Bold", command=lambda: self._insert_format("**", "**"), accelerator="Ctrl+B")
             menu.add_command(label="Italic", command=lambda: self._insert_format("*", "*"), accelerator="Ctrl+I")
             menu.add_command(label="Highlight", command=lambda: self._insert_format("==", "=="), accelerator="Ctrl+Shift+H")
+
+        if self.current_tab and getattr(self.current_tab, 'tab_type', 'document') == 'document':
+            align_ctx = tk.Menu(menu, tearoff=0)
+            align_ctx.add_command(label="Left", command=lambda: self.set_document_alignment("left"))
+            align_ctx.add_command(label="Center", command=lambda: self.set_document_alignment("center"))
+            align_ctx.add_command(label="Right", command=lambda: self.set_document_alignment("right"))
+            align_ctx.add_separator()
+            align_ctx.add_command(label="None (Default)", command=lambda: self.set_document_alignment("none"))
+            if not has_selection:
+                menu.add_separator()
+            menu.add_cascade(label="Alignment", menu=align_ctx)
 
         # AI-powered actions (only when text is selected and AI is available)
         if has_selection and AI_CHAT_AVAILABLE:
@@ -8266,6 +8453,8 @@ class MarkdownNotepad(tk.Tk):
         if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
             if prefix == "**":
                 self.current_tab.toggle_bold_selection()
+            elif prefix == "*":
+                self.current_tab.toggle_italic_selection()
             return "break"
         
         tab = self.current_tab
@@ -8350,6 +8539,113 @@ class MarkdownNotepad(tk.Tk):
             self._schedule_syntax_highlight()
             self._refresh_active_visual_view()
             return "break"
+
+    def set_document_line_spacing(self, spacing: Any):
+        """Apply global document line spacing (1.0, 1.5, or 2.0) to all DocumentTabs and save theme."""
+        sp = _normalize_line_spacing(spacing)
+        self.theme['line_spacing'] = sp
+        if hasattr(self, 'line_spacing_var'):
+            self.line_spacing_var.set(f"{sp:.1f}")
+        if hasattr(self, 'line_spacing_mb'):
+            self.line_spacing_mb.config(text=f"\u2195 {sp:.1f} \u25be")
+        for tab in self.tabs:
+            if getattr(tab, 'tab_type', 'document') == 'document':
+                tab.apply_theme(self.theme)
+        self._save_theme()
+        self._set_status(f"Document line spacing set to {sp:.1f}")
+
+    def set_document_alignment(self, align: str):
+        """Apply text alignment ('left', 'center', 'right', or 'none') to selected text or active paragraph."""
+        align_norm = (align or 'none').strip().lower()
+        if align_norm not in ('left', 'center', 'right', 'none'):
+            return "break"
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') != 'document':
+            return "break"
+
+        tab = self.current_tab
+        editor = tab.source_editor
+        had_selection = False
+        sel_s_line = sel_s_col = sel_e_line = sel_e_col = 0
+        try:
+            s_idx = editor.index(tk.SEL_FIRST)
+            e_idx = editor.index(tk.SEL_LAST)
+            had_selection = True
+            sel_s_line, sel_s_col = map(int, s_idx.split('.'))
+            sel_e_line, sel_e_col = map(int, e_idx.split('.'))
+            start_line = sel_s_line
+            end_line = sel_e_line - 1 if (sel_e_col == 0 and sel_e_line > start_line) else sel_e_line
+        except tk.TclError:
+            cur_idx = editor.index(tk.INSERT)
+            sel_s_line, sel_s_col = map(int, cur_idx.split('.'))
+            start_line = end_line = sel_s_line
+
+        total_lines = int(editor.index('end-1c').split('.')[0])
+        if start_line > 1 and end_line < total_lines:
+            prev_line = editor.get(f'{start_line - 1}.0', f'{start_line - 1}.end')
+            next_line = editor.get(f'{end_line + 1}.0', f'{end_line + 1}.end')
+            if _ALIGN_OPEN_RE.match(prev_line) and _ALIGN_CLOSE_RE.match(next_line):
+                start_line -= 1
+                end_line += 1
+
+        raw_lines = [editor.get(f'{ln}.0', f'{ln}.end') for ln in range(start_line, end_line + 1)]
+        clean_lines = []
+        old_prefix_len_single = 0
+        for raw in raw_lines:
+            if _ALIGN_OPEN_RE.match(raw) or _ALIGN_CLOSE_RE.match(raw):
+                continue
+            m_s = _ALIGN_SINGLE_RE.match(raw)
+            if m_s:
+                if len(raw_lines) == 1:
+                    old_prefix_len_single = len(m_s.group(1))
+                clean_lines.append(m_s.group(3))
+            else:
+                clean_lines.append(raw)
+        if not clean_lines:
+            clean_lines = [""]
+
+        if align_norm == 'none':
+            replacement = "\n".join(clean_lines)
+        elif len(clean_lines) == 1:
+            replacement = f'<div align="{align_norm}">{clean_lines[0]}</div>'
+        else:
+            replacement = f'<div align="{align_norm}">\n' + "\n".join(clean_lines) + "\n</div>"
+
+        editor.edit_separator()
+        editor.delete(f'{start_line}.0', f'{end_line}.end')
+        editor.insert(f'{start_line}.0', replacement)
+        editor.edit_separator()
+
+        # Restore cursor / selection cleanly inside the resulting aligned or unwrapped content
+        new_open_len = len(f'<div align="{align_norm}">') if (align_norm != 'none' and len(clean_lines) == 1) else 0
+        if len(clean_lines) == 1:
+            content_len = len(clean_lines[0])
+            if had_selection and sel_s_line == sel_e_line:
+                c0 = max(0, min(content_len, sel_s_col - old_prefix_len_single))
+                c1 = max(c0, min(content_len, sel_e_col - old_prefix_len_single))
+                new_first = f'{start_line}.{new_open_len + c0}'
+                new_last = f'{start_line}.{new_open_len + c1}'
+                editor.tag_add(tk.SEL, new_first, new_last)
+                editor.mark_set(tk.INSERT, new_last)
+            else:
+                col_offset = max(0, min(content_len, sel_s_col - old_prefix_len_single))
+                new_cur = f'{start_line}.{new_open_len + col_offset}'
+                if had_selection:
+                    editor.tag_add(tk.SEL, f'{start_line}.{new_open_len}', f'{start_line}.{new_open_len + content_len}')
+                editor.mark_set(tk.INSERT, new_cur)
+        else:
+            first_c_line = start_line + (1 if align_norm != 'none' else 0)
+            last_c_line = first_c_line + len(clean_lines) - 1
+            if had_selection:
+                editor.tag_add(tk.SEL, f'{first_c_line}.0', f'{last_c_line}.end')
+            editor.mark_set(tk.INSERT, f'{first_c_line}.0')
+
+        tab.is_modified = True
+        self._update_tab_title(tab)
+        tab._apply_syntax_highlighting()
+        self._refresh_active_visual_view()
+        label = "Default (None)" if align_norm == 'none' else align_norm.capitalize()
+        self._set_status(f"Text alignment set to {label}")
+        return "break"
     
     def _insert_line_prefix(self, prefix):
         """Insert prefix at the beginning of the current line (with toggle/replace support)"""
@@ -8793,7 +9089,13 @@ class MarkdownNotepad(tk.Tk):
     def _apply_theme(self, new_theme):
         """Apply a new theme to the application"""
         self.theme = new_theme
+        sp = _normalize_line_spacing(self.theme.get('line_spacing', 1.0))
+        self.theme['line_spacing'] = sp
         self.theme['zoom_pct'] = self.zoom_pct
+        if hasattr(self, 'line_spacing_var'):
+            self.line_spacing_var.set(f"{sp:.1f}")
+        if hasattr(self, 'line_spacing_mb'):
+            self.line_spacing_mb.config(text=f"\u2195 {sp:.1f} \u25be")
         self.configure(bg=self.theme.get('desk_bg', '#d9dce1'))
         self._save_theme()
         
@@ -8999,6 +9301,19 @@ class ThemeDialog(tk.Toplevel):
         self.visual_size_var = tk.IntVar(value=self.theme['visual_font_size'])
         vsize_spin = ttk.Spinbox(vfont_frame, from_=8, to=24, width=5, textvariable=self.visual_size_var)
         vsize_spin.pack(side=tk.LEFT, padx=2)
+
+        # Document Line Spacing
+        vls_frame = ttk.Frame(visual_frame)
+        vls_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(vls_frame, text="Line Spacing:", width=12).pack(side=tk.LEFT)
+        self.line_spacing_var = tk.StringVar(
+            value=f"{_normalize_line_spacing(self.theme.get('line_spacing', 1.0)):.1f}"
+        )
+        vls_combo = ttk.Combobox(
+            vls_frame, textvariable=self.line_spacing_var,
+            values=("1.0", "1.5", "2.0"), state="readonly", width=6,
+        )
+        vls_combo.pack(side=tk.LEFT, padx=2)
         
         # Desk (background behind the page)
         desk_frame = ttk.LabelFrame(controls_col, text="Page Layout & Blockquote", padding=10)
@@ -9050,7 +9365,7 @@ class ThemeDialog(tk.Toplevel):
         for var in (
             self.source_bg_var, self.source_fg_var, self.source_font_var, self.source_size_var,
             self.visual_bg_var, self.visual_fg_var, self.visual_font_var, self.visual_size_var,
-            self.desk_bg_var,
+            self.desk_bg_var, self.line_spacing_var,
         ):
             var.trace_add("write", self._update_template_preview)
 
@@ -9184,15 +9499,18 @@ class ThemeDialog(tk.Toplevel):
         )
         c.create_line(ml + 4, mt + 28, mr - 4, mt + 28, fill=accent, width=1, tags="preview_page")
 
-        # Body Prose Paragraph
-        body_text = (
-            "The quick brown fox jumps over the lazy dog. "
-            "Preview how headings, prose typography, and margins appear on the printed page."
-        )
-        c.create_text(
-            ml + 4, mt + 36, text=body_text,
-            font=(v_font, v_scaled), fill=v_fg, width=text_wrap_w, anchor="nw", tags="preview_page"
-        )
+        # Body Prose Paragraph (reflects active line_spacing setting in preview)
+        ls_val = _normalize_line_spacing(self.line_spacing_var.get() if hasattr(self, 'line_spacing_var') else 1.0)
+        body_lines = [
+            "The quick brown fox jumps over the lazy dog.",
+            "Preview typography, margins, and spacing on page.",
+        ]
+        line_gap = int(round(v_scaled * (1.25 if ls_val < 1.25 else (1.55 if ls_val < 1.75 else 1.85))))
+        for bi, bline in enumerate(body_lines):
+            c.create_text(
+                ml + 4, mt + 36 + bi * line_gap, text=bline,
+                font=(v_font, v_scaled), fill=v_fg, anchor="nw", tags="preview_page"
+            )
 
         # Blockquote Sample Box inside Page
         bq_bg = self._safe_hex(self.theme.get('blockquote_bg', ''), "#2d1d42" if self._is_dark_hex(v_bg) else "#f5f3ff")
@@ -9203,7 +9521,8 @@ class ThemeDialog(tk.Toplevel):
         bq_scaled = max(7, min(13, int(round((bq_raw_sz if bq_raw_sz > 0 else v_size_raw) * 0.78))))
         bq_style = self.theme.get('blockquote_style') or 'italic'
         bq_justify = self.theme.get('blockquote_justify') or 'left'
-        bq_y0, bq_y1 = mt + 106, mt + 150
+        bq_y0 = mt + 36 + line_gap * 2 + 12
+        bq_y1 = bq_y0 + 44
         c.create_rectangle(ml + 6, bq_y0, mr - 6, bq_y1, fill=bq_bg, outline="", tags="preview_page")
         c.create_line(ml + 8, bq_y0, ml + 8, bq_y1, fill=bq_bar, width=4, tags="preview_page")
         bq_tx = ml + 18 if bq_justify == 'left' else ((ml + mr) // 2 if bq_justify == 'center' else mr - 14)
@@ -9217,8 +9536,8 @@ class ThemeDialog(tk.Toplevel):
 
         # Sample Bulleted List Rows inside Page
         c.create_text(
-            ml + 10, bq_y1 + 12,
-            text="• Primary section outline item\n• Secondary formatted note sample",
+            ml + 10, min(mb - 24, bq_y1 + 10),
+            text=f"• Line spacing: {ls_val:.1f}x\n• Secondary formatted note sample",
             font=(v_font, max(7, v_scaled - 1)), fill=v_fg, anchor="nw", tags="preview_page"
         )
 
@@ -9333,6 +9652,7 @@ class ThemeDialog(tk.Toplevel):
             'visual_fg': self.visual_fg_var.get(),
             'visual_font': self.visual_font_var.get() or VISUAL_FONT,
             'visual_font_size': self._safe_int(self.visual_size_var, 11),
+            'line_spacing': _normalize_line_spacing(self.line_spacing_var.get()),
             'desk_bg': self.desk_bg_var.get(),
         }
         self.on_apply(self.theme)
@@ -9357,6 +9677,7 @@ class ThemeDialog(tk.Toplevel):
         self.visual_fg_preview.config(bg=default['visual_fg'])
         self.visual_font_var.set(default['visual_font'] or VISUAL_FONT)
         self.visual_size_var.set(default['visual_font_size'])
+        self.line_spacing_var.set(f"{_normalize_line_spacing(default.get('line_spacing', 1.0)):.1f}")
         self.desk_bg_var.set(default['desk_bg'])
         self.desk_bg_preview.config(bg=default['desk_bg'])
         self._update_template_preview()
