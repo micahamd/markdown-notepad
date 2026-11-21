@@ -7,6 +7,7 @@ This allows documents to persist even if not explicitly saved.
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -121,11 +122,51 @@ class SessionManager:
     
     # Session file location
     SESSION_FILE = Path.home() / '.markitdown_session.json'
+
+    _NON_PLAINTEXT_SUFFIXES = {
+        '.html', '.htm', '.pdf', '.docx', '.doc', '.pptx', '.ppt',
+        '.xlsx', '.xls', '.xlsm', '.xlsb', '.ods', '.odt', '.odp',
+        '.epub', '.msg', '.rtf', '.zip',
+        '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg',
+        '.wav', '.mp3', '.m4a', '.ogg', '.flac',
+    }
     
     def __init__(self):
         self.state = SessionState()
         self._auto_save_interval = 30000  # 30 seconds in milliseconds
         self._auto_save_job = None
+
+    @property
+    def session_file(self) -> Path:
+        return Path(self.SESSION_FILE)
+
+    @session_file.setter
+    def session_file(self, value) -> None:
+        self.SESSION_FILE = Path(value)
+
+    def _atomic_write_json(self, data: Dict[str, Any]) -> None:
+        """Write JSON payload to SESSION_FILE atomically via temp file + os.replace()."""
+        target = os.path.abspath(str(self.session_file))
+        parent_dir = os.path.dirname(target)
+        os.makedirs(parent_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix='.markitdown_session_', suffix='.tmp', dir=parent_dir)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(tmp_path, 0o600)
+            except Exception:
+                pass
+            os.replace(tmp_path, target)
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
     
     def load_session(self) -> SessionState:
         """
@@ -133,8 +174,8 @@ class SessionManager:
         Returns the loaded state, or a default state if file doesn't exist.
         """
         try:
-            if Path(self.SESSION_FILE).exists():
-                with open(self.SESSION_FILE, 'r', encoding='utf-8') as f:
+            if self.session_file.exists():
+                with open(self.session_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     self.state = SessionState.from_dict(data)
                     
@@ -144,13 +185,16 @@ class SessionManager:
                         if tab.file_path:
                             # For saved files, check if file still exists
                             if os.path.exists(tab.file_path):
-                                # Optionally reload content from file if not modified
+                                # Reload plaintext content from disk only for non-converted document files
                                 if not tab.is_modified:
-                                    try:
-                                        with open(tab.file_path, 'r', encoding='utf-8') as doc:
-                                            tab.content = doc.read()
-                                    except:
-                                        pass  # Keep cached content if file read fails
+                                    suffix = Path(tab.file_path).suffix.lower()
+                                    is_non_mdsheet_sheet = (tab.tab_type == 'spreadsheet' and suffix != '.mdsheet')
+                                    if not is_non_mdsheet_sheet and suffix not in self._NON_PLAINTEXT_SUFFIXES:
+                                        try:
+                                            with open(tab.file_path, 'r', encoding='utf-8') as doc:
+                                                tab.content = doc.read()
+                                        except Exception:
+                                            pass  # Keep cached content if file read fails
                                 valid_tabs.append(tab)
                             else:
                                 # File no longer exists - keep tab but mark as modified/unsaved
@@ -175,17 +219,12 @@ class SessionManager:
         Returns True if successful, False otherwise.
         """
         if not self.state.caching_enabled:
-            # If caching is disabled, don't save and remove existing session file
+            # If caching is disabled, clear tabs and persist opt-out flag
             self.clear_session()
             return True
         
         try:
-            with open(self.SESSION_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.state.to_dict(), f, indent=2)
-            try:
-                os.chmod(self.SESSION_FILE, 0o600)
-            except Exception:
-                pass
+            self._atomic_write_json(self.state.to_dict())
             return True
         except Exception as e:
             print(f"Error saving session: {e}")
@@ -193,13 +232,18 @@ class SessionManager:
     
     def clear_session(self) -> bool:
         """
-        Clear the saved session file.
+        Clear the saved session file, preserving caching opt-out preference.
         Called when caching is disabled or when user explicitly clears.
         """
+        prev_caching = self.state.caching_enabled
         try:
-            if Path(self.SESSION_FILE).exists():
-                Path(self.SESSION_FILE).unlink()
             self.state = SessionState()
+            self.state.caching_enabled = prev_caching
+            if not prev_caching:
+                self._atomic_write_json({"caching_enabled": False, "tabs": []})
+            else:
+                if self.session_file.exists():
+                    self.session_file.unlink()
             return True
         except Exception as e:
             print(f"Error clearing session: {e}")

@@ -40,7 +40,7 @@ try:
     import docx
     from docx import Document as DocxDocument
     from docx.shared import Inches, Pt, Cm, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
     from docx.enum.table import WD_TABLE_ALIGNMENT
     from docx.enum.style import WD_STYLE_TYPE
     from docx.oxml.ns import qn
@@ -92,7 +92,7 @@ def _export_latex_to_unicode(expr: str) -> str:
         r'\Leftarrow': '⇐', r'\Leftrightarrow': '⇔', r'\iff': '⇔', r'\dots': '…', r'\cdots': '⋯',
     }
     for cmd in sorted(symbols.keys(), key=len, reverse=True):
-        s = s.replace(cmd, symbols[cmd])
+        s = re.sub(re.escape(cmd) + r'(?![a-zA-Z])', lambda _, rep=symbols[cmd]: rep, s)
     sup_map = str.maketrans("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ")
     sub_map = str.maketrans("0123456789+-=()aeioruvxjk", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑᵢₒᵣᵤᵥₓⱼₖ")
     s = re.sub(r'\^\{([^{}]+)\}', lambda m: m.group(1).translate(sup_map), s)
@@ -209,6 +209,12 @@ def _build_css(theme: Optional[Dict] = None, page_settings: Optional[Dict] = Non
         border-radius: 3px;
         font-size: 0.9em;
     }}
+    mark {{
+        background: #fef08a;
+        color: #1a1a1a;
+        padding: 0.05em 0.2em;
+        border-radius: 2px;
+    }}
     pre {{
         background: #f4f4f4;
         padding: 1em;
@@ -284,8 +290,165 @@ def _clean_bookmark_name(name: str) -> str:
     return clean[:40]
 
 
+_INLINE_MATH_RE = re.compile(
+    r'(?<!\$)(?<!\\)\$(?!\$)(?!\s)([^$\n]+?)(?<!\s)(?<!\\)\$(?!\$)(?!\d)'
+)
+_COLOR_SPAN_RE = re.compile(
+    r'<span\s+style=["\']\s*color\s*:\s*(#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?)\s*;?\s*["\']\s*>(.*?)</span>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _protect_code_for_preprocess(text: str, placeholders: List[str]) -> str:
+    """Replace fenced code blocks and inline code spans with null-delimited placeholders."""
+    lines = text.splitlines(keepends=True)
+    out_parts: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        m_fence = re.match(r'^\s*(`{3,}|~{3,})', lines[i])
+        if m_fence:
+            fence = m_fence.group(1)
+            fence_char, fence_len = fence[0], len(fence)
+            close_re = re.compile(rf'^\s*{re.escape(fence_char)}{{{fence_len},}}\s*$')
+            block_lines = [lines[i]]
+            i += 1
+            while i < n:
+                block_lines.append(lines[i])
+                if close_re.match(lines[i].rstrip('\r\n')):
+                    i += 1
+                    break
+                i += 1
+            block_text = ''.join(block_lines)
+            trailing_nl = '\n' if block_text.endswith('\n') else ''
+            stored = block_text[:-1] if trailing_nl else block_text
+            idx = len(placeholders)
+            placeholders.append(stored)
+            out_parts.append(f"\x00MDPH{idx}\x00{trailing_nl}")
+        else:
+            out_parts.append(lines[i])
+            i += 1
+
+    text = ''.join(out_parts)
+
+    def _sub_inline_code(m: re.Match) -> str:
+        idx = len(placeholders)
+        placeholders.append(m.group(0))
+        return f"\x00MDPH{idx}\x00"
+
+    text = re.sub(r'(`+)(?!`)([^\n]+?)(?<!`)\1(?!`)', _sub_inline_code, text)
+    return text
+
+
+def _render_footnote_body_html(raw_body: str) -> str:
+    """Render footnote body inline Markdown/math/anchors safely without double-escaping or XSS."""
+    fn_ph: List[str] = []
+
+    def _stash(html_frag: str) -> str:
+        idx = len(fn_ph)
+        fn_ph.append(html_frag)
+        return f"\x00FNPH{idx}\x00"
+
+    def _sub_anchor(m: re.Match) -> str:
+        aid = _clean_bookmark_name(m.group(1).strip())
+        return _stash(f'<a id="{aid}" class="anchor-target"></a>')
+
+    def _sub_ref(m: re.Match) -> str:
+        raw_lbl = m.group(1).strip()
+        aid = _clean_bookmark_name(raw_lbl)
+        safe_lbl = _html.escape(raw_lbl, quote=True)
+        return _stash(f'<a href="#{aid}" class="internal-link">[@{safe_lbl}]</a>')
+
+    def _sub_math(m: re.Match) -> str:
+        rendered = _html.escape(_export_latex_to_unicode(m.group(1)), quote=True)
+        return _stash(f'<span class="math-inline">{rendered}</span>')
+
+    def _sub_color(m: re.Match) -> str:
+        hex_col = m.group(1)
+        inner = _render_footnote_body_html(m.group(2))
+        return _stash(f'<span style="color:{hex_col}">{inner}</span>')
+
+    def _sub_mark(m: re.Match) -> str:
+        inner = _render_footnote_body_html(m.group(1))
+        return _stash(f'<mark>{inner}</mark>')
+
+    work = re.sub(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', _sub_anchor, raw_body, flags=re.IGNORECASE)
+    work = re.sub(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', _sub_ref, work, flags=re.IGNORECASE)
+    work = _INLINE_MATH_RE.sub(_sub_math, work)
+    work = _COLOR_SPAN_RE.sub(_sub_color, work)
+    work = re.sub(r'==([^=\n]+)==', _sub_mark, work)
+
+    escaped = _html.escape(work, quote=True)
+    escaped = re.sub(r'\*\*\*(.+?)\*\*\*', r'<strong><em>\1</em></strong>', escaped)
+    escaped = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', escaped)
+    escaped = re.sub(r'(?<!\w)__(.+?)__(?!\w)', r'<strong>\1</strong>', escaped)
+    escaped = re.sub(r'\*([^\*\n]+?)\*', r'<em>\1</em>', escaped)
+    escaped = re.sub(r'(?<!\w)_([^_\n]+?)_(?!\w)', r'<em>\1</em>', escaped)
+    escaped = re.sub(r'~~(.+?)~~', r'<del>\1</del>', escaped)
+
+    for idx in range(len(fn_ph) - 1, -1, -1):
+        escaped = escaped.replace(f"\x00FNPH{idx}\x00", fn_ph[idx])
+    return escaped
+
+
+def _convert_align_divs_for_html(text: str) -> str:
+    """Depth-aware rewrite of <div align="left|center|right">...</div> for md_in_html."""
+    tag_re = re.compile(r'<(/?)div\b([^>]*)>', re.IGNORECASE)
+    stack: List[Tuple[int, int, Optional[str]]] = []
+    edits: List[Tuple[int, int, str]] = []
+
+    for m in tag_re.finditer(text):
+        is_close = bool(m.group(1))
+        attrs = m.group(2) or ''
+        if not is_close:
+            m_align = re.match(r'^\s*align\s*=\s*["\'](left|center|right)["\']\s*$', attrs, re.IGNORECASE)
+            align_val = m_align.group(1).lower() if m_align else None
+            stack.append((m.start(), m.end(), align_val))
+        else:
+            if stack:
+                open_start, open_end, align_val = stack.pop()
+                if align_val is not None:
+                    edits.append((open_start, open_end, f'<div align="{align_val}" markdown="1">\n\n'))
+                    edits.append((m.start(), m.end(), '\n\n</div>'))
+
+    for open_start, open_end, align_val in stack:
+        if align_val is not None:
+            edits.append((open_start, open_end, f'<div align="{align_val}" markdown="1">'))
+
+    if not edits:
+        return text
+
+    edits.sort(key=lambda e: e[0])
+    parts: List[str] = []
+    pos = 0
+    for start, end, repl in edits:
+        if start >= pos:
+            parts.append(text[pos:start])
+            parts.append(repl)
+            pos = end
+    parts.append(text[pos:])
+    return ''.join(parts)
+
+
 def _preprocess_anchors_for_html(text: str) -> str:
-    """Convert [@anchor: point], [@point], footnotes [^id], and math $...$ into HTML for PDF/HTML export."""
+    """Convert [@anchor: point], [@point], footnotes [^id], highlights, color spans, and math $...$ into HTML."""
+    placeholders: List[str] = []
+    text = _protect_code_for_preprocess(text, placeholders)
+
+    # Process footnote definitions BEFORE global math/anchor substitution so generated HTML is not double-escaped
+    def sub_fn_def(m: re.Match) -> str:
+        raw_lbl = m.group(1).strip()
+        fid = _clean_bookmark_name('fn_' + raw_lbl)
+        ref_id = _clean_bookmark_name('fnref_' + raw_lbl)
+        label = _html.escape(raw_lbl, quote=True)
+        body_html = _render_footnote_body_html(m.group(2).strip())
+        fn_html = f'<div id="{fid}" class="footnote-def"><strong>[{label}]</strong> {body_html} <a href="#{ref_id}">↩</a></div>'
+        idx = len(placeholders)
+        placeholders.append(fn_html)
+        return f"\x00MDPH{idx}\x00"
+
+    text = re.sub(r'^\[\^([^\]]+)\]:[ \t]*(.*)$', sub_fn_def, text, flags=re.MULTILINE)
+
     def sub_anchor(m):
         lbl = m.group(1).strip()
         aid = _clean_bookmark_name(lbl)
@@ -305,21 +468,18 @@ def _preprocess_anchors_for_html(text: str) -> str:
         lambda m: f'<div class="math-block">{_html.escape(_export_latex_to_unicode(m.group(1)), quote=True)}</div>',
         text
     )
-    # Inline math $...$
-    text = re.sub(
-        r'(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)',
+    # Inline math $...$ (currency-safe)
+    text = _INLINE_MATH_RE.sub(
         lambda m: f'<span class="math-inline">{_html.escape(_export_latex_to_unicode(m.group(1)), quote=True)}</span>',
         text
     )
-    # Footnote definitions [^id]: text
-    def sub_fn_def(m):
-        raw_lbl = m.group(1).strip()
-        fid = _clean_bookmark_name('fn_' + raw_lbl)
-        ref_id = _clean_bookmark_name('fnref_' + raw_lbl)
-        label = _html.escape(raw_lbl, quote=True)
-        body = _html.escape(m.group(2).strip(), quote=True)
-        return f'<div id="{fid}" class="footnote-def"><strong>[{label}]</strong> {body} <a href="#{ref_id}">↩</a></div>'
-    text = re.sub(r'^\[\^([^\]]+)\]:\s*(.+)$', sub_fn_def, text, flags=re.MULTILINE)
+    # Highlight ==...==
+    text = re.sub(r'==([^=\n]+)==', r'<mark>\1</mark>', text)
+    # Preserve validated <span style="color:#rrggbb">...</span>
+    text = _COLOR_SPAN_RE.sub(
+        lambda m: f'<span style="color:{m.group(1)}">{m.group(2)}</span>',
+        text,
+    )
 
     # Inline footnote refs [^id]
     def sub_fn_ref(m):
@@ -329,19 +489,13 @@ def _preprocess_anchors_for_html(text: str) -> str:
         ref_id = _clean_bookmark_name('fnref_' + raw_lbl)
         return f'<sup id="{ref_id}" class="footnote-ref"><a href="#{fid}">[{label}]</a></sup>'
     text = re.sub(r'\[\^([^\]\n]+)\](?!:)', sub_fn_ref, text)
-    # Convert <div align="left|center|right"> blocks for md_in_html rendering
-    text = re.sub(
-        r'<div\s+align=["\'](left|center|right)["\']\s*>(.*?)</div>',
-        r'<div align="\1" markdown="1">\n\n\2\n\n</div>',
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    text = re.sub(
-        r'<div\s+align=["\'](left|center|right)["\']\s*>',
-        r'<div align="\1" markdown="1">',
-        text,
-        flags=re.IGNORECASE,
-    )
+
+    # Depth-aware <div align="left|center|right">...</div> conversion for md_in_html
+    text = _convert_align_divs_for_html(text)
+
+    # Restore placeholders in reverse order
+    for idx in range(len(placeholders) - 1, -1, -1):
+        text = text.replace(f"\x00MDPH{idx}\x00", placeholders[idx])
     return text
 
 
@@ -464,16 +618,53 @@ def _is_safe_export_asset_path(candidate_path: str, base_dir: str) -> bool:
 
 def _resolve_image_paths(html: str, base_path: str) -> str:
     """Resolve safe relative image paths in HTML to absolute file:// URIs confined to *base_path*."""
+    real_base = os.path.realpath(base_path) if base_path else ""
+
     def replace_src(match):
-        src = match.group(1)
+        quote_char = match.group(1)
+        src = match.group(2)
         if src.startswith(('data:', 'http://', 'https://', 'file://')):
             return match.group(0)
-        abs_path = os.path.abspath(os.path.join(base_path, src))
+
+        decoded_src = unquote(src)
+        if not decoded_src or os.path.isabs(decoded_src):
+            # Reject absolute paths outside base_path; allow only if strictly inside base_path
+            if decoded_src and _is_safe_export_asset_path(decoded_src, base_path):
+                return f'src={quote_char}{Path(os.path.abspath(decoded_src)).as_uri()}{quote_char}'
+            return match.group(0)
+
+        abs_path = os.path.abspath(os.path.join(base_path, decoded_src))
+        # Block path traversal escaping base_path before any fallback lookup
+        try:
+            if real_base and os.path.commonpath([real_base, os.path.realpath(abs_path)]) != real_base:
+                return match.group(0)
+        except Exception:
+            return match.group(0)
+
         if _is_safe_export_asset_path(abs_path, base_path):
-            return f'src="{Path(abs_path).as_uri()}"'
+            return f'src={quote_char}{Path(abs_path).as_uri()}{quote_char}'
+
+        # Search safe subdirectories strictly inside base_path (*_assets, assets, images, Images, media)
+        if os.path.isdir(base_path):
+            fname = os.path.basename(decoded_src)
+            try:
+                for entry in os.scandir(base_path):
+                    if entry.is_dir() and (
+                        entry.name.endswith('_assets')
+                        or entry.name in ('assets', 'images', 'Images', 'media')
+                    ):
+                        for rel_cand in (decoded_src, fname):
+                            if not rel_cand:
+                                continue
+                            sub_cand = os.path.abspath(os.path.join(entry.path, rel_cand))
+                            if _is_safe_export_asset_path(sub_cand, base_path):
+                                return f'src={quote_char}{Path(sub_cand).as_uri()}{quote_char}'
+            except Exception:
+                pass
+
         return match.group(0)
 
-    return re.sub(r'src="([^"]*)"', replace_src, html)
+    return re.sub(r'src=(["\'])([^"\']*)\1', replace_src, html)
 
 
 def _make_safe_weasyprint_fetcher(base_path: Optional[str]):
@@ -569,6 +760,49 @@ def export_to_html(md_content: str, output_path: str,
 # Export to DOCX
 # =============================================================================
 
+def _parse_hex_rgb(hex_color: Optional[str]):
+    """Validate #rgb or #rrggbb hex string and return RGBColor, or None."""
+    if not DOCX_AVAILABLE or not hex_color:
+        return None
+    s = hex_color.strip()
+    m = re.fullmatch(r'#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})', s)
+    if not m:
+        return None
+    h = m.group(1)
+    if len(h) == 3:
+        h = ''.join(ch * 2 for ch in h)
+    return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+def _parse_html_img_tag(line_stripped: str) -> Optional[Tuple[str, str]]:
+    """Parse a standalone HTML <img ...> tag into (src, alt_spec_with_params)."""
+    m = re.match(r'^<img\s+([^>]*?)/?>$', line_stripped, re.IGNORECASE)
+    if not m:
+        return None
+    attrs_str = m.group(1)
+    attrs: Dict[str, str] = {}
+    for am in re.finditer(r'([a-zA-Z_:][\w:.-]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'>]+))', attrs_str):
+        k = am.group(1).lower()
+        v = am.group(2) if am.group(2) is not None else (am.group(3) if am.group(3) is not None else (am.group(4) or ''))
+        attrs[k] = v.strip()
+    src = attrs.get('src', '')
+    if not src:
+        return None
+    alt_base = attrs.get('alt', '')
+    params: List[str] = []
+    if 'width' in attrs:
+        params.append(f"width={attrs['width']}")
+    if 'height' in attrs:
+        params.append(f"height={attrs['height']}")
+    if 'align' in attrs:
+        params.append(f"align={attrs['align']}")
+    cap = attrs.get('caption') or attrs.get('title')
+    if cap:
+        params.append(f'caption="{cap}"')
+    alt_spec = '|'.join([alt_base] + params) if params else alt_base
+    return src, alt_spec
+
+
 def export_to_docx(md_content: str, output_path: str,
                     theme: Optional[Dict] = None,
                     base_path: Optional[str] = None) -> bool:
@@ -624,19 +858,24 @@ def export_to_docx(md_content: str, output_path: str,
     while i < len(lines):
         line = lines[i]
         
-        # Fenced code block
-        if line.strip().startswith('```'):
+        # Fenced code block (``` or ~~~)
+        m_fence = re.match(r'^\s*(`{3,}|~{3,})(.*)$', line)
+        if m_fence:
+            fence = m_fence.group(1)
+            fence_char, fence_len = fence[0], len(fence)
+            close_re = re.compile(rf'^\s*{re.escape(fence_char)}{{{fence_len},}}\s*$')
             code_lines = []
-            lang = line.strip()[3:].strip()
+            lang = m_fence.group(2).strip()
             i += 1
-            while i < len(lines) and not lines[i].strip().startswith('```'):
+            while i < len(lines) and not close_re.match(lines[i]):
                 code_lines.append(lines[i])
                 i += 1
-            i += 1  # skip closing ```
+            if i < len(lines):
+                i += 1  # skip closing fence
             _add_code_block(doc, '\n'.join(code_lines), lang)
             continue
 
-        # Single-line or multi-line <div align="left|center|right"> blocks
+        # Single-line <div align="left|center|right">...</div> block
         m_single_div = re.match(
             r'^\s*<div\s+align=["\'](left|center|right)["\']\s*>(.*?)</div>\s*$',
             line, re.IGNORECASE
@@ -659,16 +898,31 @@ def export_to_docx(md_content: str, output_path: str,
             i += 1
             continue
 
+        # Opening <div align="left|center|right"> with optional trailing inline text (no closing </div> on same line)
         m_open_div = re.match(
-            r'^\s*<div\s+align=["\'](left|center|right)["\']\s*>\s*$',
+            r'^\s*<div\s+align=["\'](left|center|right)["\']\s*>(.*)$',
             line, re.IGNORECASE
         )
         if m_open_div:
             active_align = m_open_div.group(1).lower()
+            trailing = m_open_div.group(2).strip()
+            if trailing:
+                h_m = re.match(r'^(#{1,6})\s+(.*)', trailing)
+                if h_m:
+                    h = doc.add_heading(level=min(len(h_m.group(1)), 9))
+                    bm_counter[0] += 1
+                    _add_docx_bookmark(h, _clean_bookmark_name(h_m.group(2).strip()), bm_counter[0])
+                    _add_inline_formatting(h, h_m.group(2).strip(), bm_counter)
+                    _apply_docx_align(h, active_align)
+                else:
+                    p = doc.add_paragraph()
+                    _add_inline_formatting(p, trailing, bm_counter)
+                    _apply_docx_align(p, active_align)
             i += 1
             continue
 
-        if active_align is not None and line.strip().lower() == '</div>':
+        # Closing </div> (matched or unmatched)
+        if line.strip().lower() == '</div>':
             active_align = None
             i += 1
             continue
@@ -698,8 +952,8 @@ def export_to_docx(md_content: str, output_path: str,
             r.italic = True
             continue
 
-        # Footnote definition [^id]: text
-        fn_def_m = re.match(r'^\[\^([^\]]+)\]:\s*(.+)$', line.strip())
+        # Footnote definition [^id]: text (also handles empty [^id]:)
+        fn_def_m = re.match(r'^\[\^([^\]]+)\]:\s*(.*)$', line.strip())
         if fn_def_m:
             fn_id = fn_def_m.group(1).strip()
             fn_body = fn_def_m.group(2).strip()
@@ -710,12 +964,13 @@ def export_to_docx(md_content: str, output_path: str,
             r_badge = p.add_run(f"[{fn_id}] ")
             r_badge.bold = True
             r_badge.font.size = Pt(max(8, font_size - 1))
-            _add_inline_formatting(p, fn_body, bm_counter)
+            if fn_body:
+                _add_inline_formatting(p, fn_body, bm_counter)
             i += 1
             continue
         
-        # Heading
-        heading_match = re.match(r'^(#{1,6})\s+(.*)', line)
+        # Heading (allows leading indentation; #hashtag without space falls through to paragraph)
+        heading_match = re.match(r'^\s*(#{1,6})\s+(.*)', line)
         if heading_match:
             level = len(heading_match.group(1))
             text = heading_match.group(2).strip()
@@ -730,7 +985,6 @@ def export_to_docx(md_content: str, output_path: str,
         
         # Horizontal rule
         if re.match(r'^[\s]*([-*_])\s*\1\s*\1[\s\-\*_]*$', line):
-            # Add a thin paragraph as a visual separator
             p = doc.add_paragraph()
             p.paragraph_format.space_before = Pt(6)
             p.paragraph_format.space_after = Pt(6)
@@ -741,13 +995,13 @@ def export_to_docx(md_content: str, output_path: str,
             i += 1
             continue
         
-        # Blockquote
-        if line.startswith('>'):
+        # Blockquote (supports optional leading indentation)
+        if line.lstrip().startswith('>'):
             quote_lines = []
-            while i < len(lines) and lines[i].startswith('>'):
-                quote_lines.append(lines[i].lstrip('>').strip())
+            while i < len(lines) and lines[i].lstrip().startswith('>'):
+                quote_lines.append(lines[i].lstrip()[1:].strip())
                 i += 1
-            p = doc.add_paragraph(' '.join(quote_lines))
+            p = doc.add_paragraph()
             p.style = doc.styles['Normal']
             bq_pad_px = int((theme.get('blockquote_padding', 16) if theme else 16) or 16)
             p.paragraph_format.left_indent = Cm(max(0.5, bq_pad_px / 12.0))
@@ -765,13 +1019,18 @@ def export_to_docx(md_content: str, output_path: str,
             bq_style_str = (theme.get('blockquote_style', 'italic') if theme else 'italic') or 'italic'
             bq_font_fam = (theme.get('blockquote_font') if theme else None) or font_name
             bq_sz_val = int((theme.get('blockquote_size') if theme else 0) or 0)
-            for run in p.runs:
-                run.font.name = bq_font_fam
-                if bq_sz_val > 0:
-                    run.font.size = Pt(bq_sz_val)
-                run.font.italic = ('italic' in bq_style_str)
-                run.font.bold = ('bold' in bq_style_str)
-                run.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+            bq_fg_hex = (theme.get('blockquote_fg') if theme else None) or '#555555'
+            bq_color = _parse_hex_rgb(bq_fg_hex) or RGBColor(0x55, 0x55, 0x55)
+            _add_inline_formatting(
+                p,
+                ' '.join(quote_lines),
+                bm_counter,
+                bold=('bold' in bq_style_str),
+                italic=('italic' in bq_style_str),
+                color_rgb=bq_color,
+                font_name=bq_font_fam,
+                font_size=bq_sz_val if bq_sz_val > 0 else None,
+            )
             continue
         
         # Unordered list
@@ -795,31 +1054,43 @@ def export_to_docx(md_content: str, output_path: str,
             continue
         
         # Table
-        if '|' in line and i + 1 < len(lines) and re.match(r'^[\s]*\|[\s:]*[-]+', lines[i + 1]):
+        if '|' in line and i + 1 < len(lines) and re.match(r'^[\s]*\|?[\s:]*[-]+', lines[i + 1]):
             table_lines = []
             while i < len(lines) and '|' in lines[i]:
                 table_lines.append(lines[i])
                 i += 1
-            _add_table(doc, table_lines)
+            _add_table(doc, table_lines, bm_counter)
             continue
         
-        # Image
-        img_match = re.match(r'!\[([^\]]*)\]\(([^)]+)\)', line.strip())
+        # Standalone Markdown or HTML Image
+        stripped_line = line.strip()
+        img_match = re.match(r'^!\[([^\]]*)\]\(([^)]+)\)$', stripped_line)
         if img_match:
             alt_text = img_match.group(1)
             img_path = img_match.group(2)
             _add_image(doc, img_path, alt_text, base_path)
             i += 1
             continue
+
+        html_img = _parse_html_img_tag(stripped_line)
+        if html_img:
+            _add_image(doc, html_img[0], html_img[1], base_path)
+            i += 1
+            continue
         
         # Blank line
-        if not line.strip():
+        if not stripped_line:
             i += 1
             continue
         
         # Regular paragraph — collect contiguous non-blank, non-special lines
         para_lines = []
         while i < len(lines) and lines[i].strip() and not _is_special_line(lines[i]):
+            para_lines.append(lines[i])
+            i += 1
+
+        # Safety net: force-consume unconsumed non-blank line to prevent infinite loops
+        if not para_lines and i < len(lines) and lines[i].strip():
             para_lines.append(lines[i])
             i += 1
         
@@ -835,9 +1106,9 @@ def export_to_docx(md_content: str, output_path: str,
 def _is_special_line(line: str) -> bool:
     """Check if a line is a special markdown element"""
     stripped = line.strip()
-    if stripped.startswith('#'):
+    if re.match(r'^\s*#{1,6}\s+', line):
         return True
-    if stripped.startswith('```'):
+    if stripped.startswith(('```', '~~~')):
         return True
     if stripped.startswith('$$'):
         return True
@@ -855,7 +1126,9 @@ def _is_special_line(line: str) -> bool:
         return True
     if re.match(r'^[\s]*([-*_])\s*\1\s*\1[\s\-\*_]*$', line):
         return True
-    if re.match(r'^!\[', stripped):
+    if re.match(r'^!\[([^\]]*)\]\(([^)]+)\)$', stripped):
+        return True
+    if _parse_html_img_tag(stripped) is not None:
         return True
     if '|' in line and re.match(r'^\s*\|', line):
         return True
@@ -893,51 +1166,104 @@ def _add_code_block(doc, code: str, language: str = ""):
     shading.append(shd)
 
 
-def _add_inline_formatting(paragraph, text: str, bm_counter: Optional[List[int]] = None):
-    """Parse inline markdown formatting and add runs to a paragraph"""
-    pattern = re.compile(
-        r'(\*\*(.+?)\*\*)'       # bold (1, 2)
-        r'|(\*(.+?)\*)'            # italic (3, 4)
-        r'|(`(.+?)`)'              # inline code (5, 6)
-        r'|(\[([^\]]+)\]\(([^)]+)\))'  # link (7, 8, 9)
-        r'|(~~(.+?)~~)'            # strikethrough (10, 11)
-        r'|(\[@(?:anchor|def):\s*([^\]\n]+)\])'  # anchor definition (12, 13)
-        r'|(\[@(?!(?:anchor|def):)([^\]\n]+)\])'  # anchor reference (14, 15)
-        r'|((?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$))'  # inline math (16, 17)
-        r'|(\[\^([^\]\n]+)\])'     # footnote reference (18, 19)
+_DOCX_INLINE_RE = re.compile(
+    r'(?P<code2>``[^`\n]+``)'
+    r'|(?P<code1>`[^`\n]+`)'
+    r'|(?P<anchor>\[@(?:anchor|def):\s*(?P<anchor_lbl>[^\]\n]+)\])'
+    r'|(?P<ref>\[@(?!(?:anchor|def):)(?P<ref_lbl>[^\]\n]+)\])'
+    r'|(?P<fn>\[\^(?P<fn_lbl>[^\]\n]+)\])'
+    r'|(?P<link>\[(?P<link_txt>[^\]]+)\]\((?P<link_url>[^)]+)\))'
+    r'|(?P<cspan><span\s+style=["\']\s*color\s*:\s*(?P<cspan_col>#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?)\s*;?\s*["\']\s*>(?P<cspan_body>.*?)</span>)'
+    r'|(?P<mark_html><mark>(?P<mark_html_body>.*?)</mark>)'
+    r'|(?P<mark_md>==(?P<mark_md_body>[^=\n]+)==)'
+    r'|(?P<strike>~~(?P<strike_body>.+?)~~)'
+    r'|(?P<bi_star>\*\*\*(?P<bi_star_body>.+?)\*\*\*)'
+    r'|(?P<bi_under>(?<!\w)___(?P<bi_under_body>.+?)___(?!\w))'
+    r'|(?P<b_star>\*\*(?P<b_star_body>.+?)\*\*)'
+    r'|(?P<b_under>(?<!\w)__(?P<b_under_body>.+?)__(?!\w))'
+    r'|(?P<i_star>\*(?P<i_star_body>[^\*\n]+?)\*)'
+    r'|(?P<i_under>(?<!\w)_(?P<i_under_body>[^_\n]+?)_(?!\w))'
+    r'|(?P<math>(?<!\$)(?<!\\)\$(?!\$)(?!\s)(?P<math_body>[^$\n]+?)(?<!\s)(?<!\\)\$(?!\$)(?!\d))',
+    re.IGNORECASE,
+)
+
+
+def _apply_run_style(
+    run,
+    bold: bool = False,
+    italic: bool = False,
+    strike: bool = False,
+    highlight: bool = False,
+    color_rgb=None,
+    font_name: Optional[str] = None,
+    font_size: Optional[int] = None,
+):
+    """Apply inherited inline run styles to a python-docx Run."""
+    if bold:
+        run.bold = True
+    if italic:
+        run.italic = True
+    if strike:
+        run.font.strike = True
+    if highlight:
+        run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+    if color_rgb is not None:
+        run.font.color.rgb = color_rgb
+    if font_name:
+        run.font.name = font_name
+    if font_size and font_size > 0:
+        run.font.size = Pt(font_size)
+
+
+def _add_inline_formatting(
+    paragraph,
+    text: str,
+    bm_counter: Optional[List[int]] = None,
+    bold: bool = False,
+    italic: bool = False,
+    strike: bool = False,
+    highlight: bool = False,
+    color_rgb=None,
+    font_name: Optional[str] = None,
+    font_size: Optional[int] = None,
+):
+    """Recursively parse inline markdown/HTML formatting and add styled runs to a paragraph."""
+    if not text:
+        return
+
+    style_kw = dict(
+        bold=bold,
+        italic=italic,
+        strike=strike,
+        highlight=highlight,
+        color_rgb=color_rgb,
+        font_name=font_name,
+        font_size=font_size,
     )
-    
+
     last_end = 0
-    for match in pattern.finditer(text):
-        # Add text before match
+    for match in _DOCX_INLINE_RE.finditer(text):
         if match.start() > last_end:
-            paragraph.add_run(text[last_end:match.start()])
-        
-        if match.group(2):  # bold
-            run = paragraph.add_run(match.group(2))
-            run.bold = True
-        elif match.group(4):  # italic
-            run = paragraph.add_run(match.group(4))
-            run.italic = True
-        elif match.group(6):  # code
-            run = paragraph.add_run(match.group(6))
-            run.font.name = 'Consolas'
-            run.font.size = Pt(9)
-        elif match.group(8):  # link
-            link_text = match.group(8)
-            link_url = match.group(9)
-            if link_url.startswith(('#', '@')):
-                bm_name = _clean_bookmark_name(link_url.lstrip('#@'))
-                _add_docx_internal_hyperlink(paragraph, link_text, bm_name)
-            else:
-                run = paragraph.add_run(f"{link_text} ({link_url})")
-                run.font.color.rgb = RGBColor(0x00, 0x66, 0xCC)
-                run.underline = True
-        elif match.group(11):  # strikethrough
-            run = paragraph.add_run(match.group(11))
-            run.font.strike = True
-        elif match.group(12):  # [@anchor: point]
-            anchor_raw = match.group(13).strip()
+            run = paragraph.add_run(text[last_end:match.start()])
+            _apply_run_style(run, **style_kw)
+
+        kind = match.lastgroup
+        if kind in ('code2', 'code1'):
+            raw = match.group(kind)
+            inner = raw[2:-2] if kind == 'code2' else raw[1:-1]
+            run = paragraph.add_run(inner)
+            _apply_run_style(
+                run,
+                bold=bold,
+                italic=italic,
+                strike=strike,
+                highlight=highlight,
+                color_rgb=color_rgb,
+                font_name='Consolas',
+                font_size=9,
+            )
+        elif kind == 'anchor':
+            anchor_raw = match.group('anchor_lbl').strip()
             bm_name = _clean_bookmark_name(anchor_raw)
             if bm_counter is not None:
                 bm_counter[0] += 1
@@ -945,25 +1271,135 @@ def _add_inline_formatting(paragraph, text: str, bm_counter: Optional[List[int]]
             else:
                 bm_id = 1
             _add_docx_bookmark(paragraph, bm_name, bm_id)
-        elif match.group(14):  # [@point]
-            ref_raw = match.group(15).strip()
+        elif kind == 'ref':
+            ref_raw = match.group('ref_lbl').strip()
             bm_name = _clean_bookmark_name(ref_raw)
             _add_docx_internal_hyperlink(paragraph, f"[@{ref_raw}]", bm_name)
-        elif match.group(16):  # $math$
-            math_raw = match.group(17).strip()
-            run = paragraph.add_run(_export_latex_to_unicode(math_raw))
-            run.font.name = 'Cambria Math'
-            run.italic = True
-        elif match.group(18):  # [^footnote]
-            fn_id = match.group(19).strip()
+        elif kind == 'fn':
+            fn_id = match.group('fn_lbl').strip()
             bm_name = _clean_bookmark_name('fn_' + fn_id)
             _add_docx_internal_hyperlink(paragraph, f"[{fn_id}]", bm_name)
-        
+        elif kind == 'link':
+            link_text = match.group('link_txt')
+            link_url = match.group('link_url')
+            if link_url.startswith(('#', '@')):
+                bm_name = _clean_bookmark_name(link_url.lstrip('#@'))
+                _add_docx_internal_hyperlink(paragraph, link_text, bm_name)
+            else:
+                run = paragraph.add_run(f"{link_text} ({link_url})")
+                _apply_run_style(
+                    run,
+                    bold=bold,
+                    italic=italic,
+                    strike=strike,
+                    highlight=highlight,
+                    color_rgb=color_rgb or RGBColor(0x00, 0x66, 0xCC),
+                    font_name=font_name,
+                    font_size=font_size,
+                )
+                run.underline = True
+        elif kind == 'cspan':
+            parsed_rgb = _parse_hex_rgb(match.group('cspan_col'))
+            _add_inline_formatting(
+                paragraph,
+                match.group('cspan_body'),
+                bm_counter,
+                bold=bold,
+                italic=italic,
+                strike=strike,
+                highlight=highlight,
+                color_rgb=parsed_rgb if parsed_rgb is not None else color_rgb,
+                font_name=font_name,
+                font_size=font_size,
+            )
+        elif kind in ('mark_html', 'mark_md'):
+            body_key = 'mark_html_body' if kind == 'mark_html' else 'mark_md_body'
+            _add_inline_formatting(
+                paragraph,
+                match.group(body_key),
+                bm_counter,
+                bold=bold,
+                italic=italic,
+                strike=strike,
+                highlight=True,
+                color_rgb=color_rgb,
+                font_name=font_name,
+                font_size=font_size,
+            )
+        elif kind == 'strike':
+            _add_inline_formatting(
+                paragraph,
+                match.group('strike_body'),
+                bm_counter,
+                bold=bold,
+                italic=italic,
+                strike=True,
+                highlight=highlight,
+                color_rgb=color_rgb,
+                font_name=font_name,
+                font_size=font_size,
+            )
+        elif kind in ('bi_star', 'bi_under'):
+            body_key = f"{kind}_body"
+            _add_inline_formatting(
+                paragraph,
+                match.group(body_key),
+                bm_counter,
+                bold=True,
+                italic=True,
+                strike=strike,
+                highlight=highlight,
+                color_rgb=color_rgb,
+                font_name=font_name,
+                font_size=font_size,
+            )
+        elif kind in ('b_star', 'b_under'):
+            body_key = f"{kind}_body"
+            _add_inline_formatting(
+                paragraph,
+                match.group(body_key),
+                bm_counter,
+                bold=True,
+                italic=italic,
+                strike=strike,
+                highlight=highlight,
+                color_rgb=color_rgb,
+                font_name=font_name,
+                font_size=font_size,
+            )
+        elif kind in ('i_star', 'i_under'):
+            body_key = f"{kind}_body"
+            _add_inline_formatting(
+                paragraph,
+                match.group(body_key),
+                bm_counter,
+                bold=bold,
+                italic=True,
+                strike=strike,
+                highlight=highlight,
+                color_rgb=color_rgb,
+                font_name=font_name,
+                font_size=font_size,
+            )
+        elif kind == 'math':
+            math_raw = match.group('math_body').strip()
+            run = paragraph.add_run(_export_latex_to_unicode(math_raw))
+            _apply_run_style(
+                run,
+                bold=bold,
+                italic=True,
+                strike=strike,
+                highlight=highlight,
+                color_rgb=color_rgb,
+                font_name='Cambria Math',
+                font_size=font_size,
+            )
+
         last_end = match.end()
-    
-    # Add remaining text
+
     if last_end < len(text):
-        paragraph.add_run(text[last_end:])
+        run = paragraph.add_run(text[last_end:])
+        _apply_run_style(run, **style_kw)
 
 
 def _parse_docx_image_params(alt_text: str):
@@ -1014,26 +1450,43 @@ def _parse_docx_image_params(alt_text: str):
     return res
 
 
-def _add_table(doc, table_lines: list):
+def _parse_md_table_row(line: str) -> List[str]:
+    """Parse a Markdown table row, preserving empty cells and unescaping escaped pipes."""
+    s = line.strip()
+    if s.startswith('|'):
+        s = s[1:]
+    if s.endswith('|') and not s.endswith('\\|'):
+        s = s[:-1]
+    raw_cells = re.split(r'(?<!\\)\|', s)
+    return [c.strip().replace(r'\|', '|') for c in raw_cells]
+
+
+def _add_table(doc, table_lines: list, bm_counter: Optional[List[int]] = None):
     """Add a styled markdown table to the document"""
     if len(table_lines) < 2:
         return
+    if bm_counter is None:
+        bm_counter = [0]
     
     # Parse header
-    headers = [c.strip() for c in table_lines[0].split('|') if c.strip()]
+    headers = _parse_md_table_row(table_lines[0])
     
     # Parse data rows (skip separator line)
     rows = []
     for line in table_lines[2:]:
-        cells = [c.strip() for c in line.split('|') if c.strip()]
-        if cells:
-            rows.append(cells)
+        if '|' in line:
+            rows.append(_parse_md_table_row(line))
     
     if not headers:
         return
     
-    num_cols = len(headers)
-    table = doc.add_table(rows=1 + len(rows), cols=num_cols)
+    num_cols = max([len(headers)] + [len(r) for r in rows])
+    if num_cols <= 0:
+        return
+    headers = headers + [''] * (num_cols - len(headers))
+    normalized_rows = [r + [''] * (num_cols - len(r)) for r in rows]
+
+    table = doc.add_table(rows=1 + len(normalized_rows), cols=num_cols)
     table.style = 'Table Grid'
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     
@@ -1043,50 +1496,90 @@ def _add_table(doc, table_lines: list):
         hdr_row._tr.makeelement(qn('w:tblHeader'), {})
     )
     for j, header in enumerate(headers):
-        if j < num_cols:
-            cell = hdr_row.cells[j]
-            cell.text = header
-            # Add subtle gray shading to header
-            shd = cell._element.get_or_add_tcPr().makeelement(
-                qn('w:shd'), {
-                    qn('w:val'): 'clear',
-                    qn('w:color'): 'auto',
-                    qn('w:fill'): 'F1F5F9'
-                }
-            )
-            cell._element.get_or_add_tcPr().append(shd)
-            for p in cell.paragraphs:
-                p.paragraph_format.space_before = Pt(4)
-                p.paragraph_format.space_after = Pt(4)
-                for run in p.runs:
-                    run.bold = True
-                    run.font.color.rgb = RGBColor(0x0F, 0x17, 0x2A)
+        cell = hdr_row.cells[j]
+        p = cell.paragraphs[0]
+        p.text = ''
+        p.paragraph_format.space_before = Pt(4)
+        p.paragraph_format.space_after = Pt(4)
+        _add_inline_formatting(
+            p, header, bm_counter,
+            bold=True,
+            color_rgb=RGBColor(0x0F, 0x17, 0x2A),
+        )
+        # Add subtle gray shading to header
+        shd = cell._element.get_or_add_tcPr().makeelement(
+            qn('w:shd'), {
+                qn('w:val'): 'clear',
+                qn('w:color'): 'auto',
+                qn('w:fill'): 'F1F5F9'
+            }
+        )
+        cell._element.get_or_add_tcPr().append(shd)
     
     # Data rows
-    for i, row in enumerate(rows):
+    for i, row in enumerate(normalized_rows):
         data_row = table.rows[i + 1]
         is_alt = (i % 2 == 1)
         for j, cell_text in enumerate(row):
-            if j < num_cols:
-                cell = data_row.cells[j]
-                cell.text = cell_text
-                if is_alt:
-                    shd = cell._element.get_or_add_tcPr().makeelement(
-                        qn('w:shd'), {
-                            qn('w:val'): 'clear',
-                            qn('w:color'): 'auto',
-                            qn('w:fill'): 'F8FAFC'
-                        }
-                    )
-                    cell._element.get_or_add_tcPr().append(shd)
-                for p in cell.paragraphs:
-                    p.paragraph_format.space_before = Pt(3)
-                    p.paragraph_format.space_after = Pt(3)
+            cell = data_row.cells[j]
+            p = cell.paragraphs[0]
+            p.text = ''
+            p.paragraph_format.space_before = Pt(3)
+            p.paragraph_format.space_after = Pt(3)
+            _add_inline_formatting(p, cell_text, bm_counter)
+            if is_alt:
+                shd = cell._element.get_or_add_tcPr().makeelement(
+                    qn('w:shd'), {
+                        qn('w:val'): 'clear',
+                        qn('w:color'): 'auto',
+                        qn('w:fill'): 'F8FAFC'
+                    }
+                )
+                cell._element.get_or_add_tcPr().append(shd)
     
     # Add spacing after table
     p_after = doc.add_paragraph()
     p_after.paragraph_format.space_before = Pt(4)
     p_after.paragraph_format.space_after = Pt(6)
+
+
+def _embed_docx_image_file(
+    doc,
+    image_file_path: str,
+    clean_alt: str = "",
+    caption: Optional[str] = None,
+    width_px: Optional[int] = None,
+    align: str = 'center',
+):
+    """Embed an image file into a DOCX paragraph with alignment, width, and optional caption."""
+    if width_px:
+        target_w = Inches(min(6.2, max(1.0, width_px / 96.0)))
+    else:
+        target_w = Inches(5.2)
+
+    p = doc.add_paragraph()
+    if align == 'left':
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    elif align == 'right':
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    else:
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    p.paragraph_format.space_before = Pt(8)
+    p.paragraph_format.space_after = Pt(2)
+    run = p.add_run()
+    run.add_picture(image_file_path, width=target_w)
+
+    display_caption = caption or clean_alt
+    if display_caption:
+        cp = doc.add_paragraph(display_caption)
+        cp.alignment = p.alignment
+        cp.paragraph_format.space_before = Pt(2)
+        cp.paragraph_format.space_after = Pt(10)
+        for crun in cp.runs:
+            crun.font.italic = True
+            crun.font.size = Pt(9.5)
+            crun.font.color.rgb = RGBColor(0x64, 0x74, 0x8B)
 
 
 def _add_image(doc, img_path: str, alt_text: str, base_path: Optional[str] = None):
@@ -1099,23 +1592,24 @@ def _add_image(doc, img_path: str, alt_text: str, base_path: Optional[str] = Non
 
     # Handle base64 data URIs
     if img_path.startswith('data:'):
-        _add_base64_image(doc, img_path, clean_alt)
+        _add_base64_image(doc, img_path, alt_text, width_px=width_px, align=align, caption=caption)
         return
     
     # Fallback search for relative image paths
+    decoded_path = unquote(img_path)
     resolved_path = None
-    if os.path.isabs(img_path) and os.path.exists(img_path):
-        resolved_path = img_path
+    if os.path.isabs(decoded_path) and os.path.exists(decoded_path):
+        resolved_path = decoded_path
     elif base_path:
-        cand1 = os.path.normpath(os.path.join(base_path, img_path))
+        cand1 = os.path.normpath(os.path.join(base_path, decoded_path))
         if os.path.exists(cand1):
             resolved_path = cand1
         else:
-            cand2 = os.path.normpath(os.path.join(base_path, os.path.basename(img_path)))
+            cand2 = os.path.normpath(os.path.join(base_path, os.path.basename(decoded_path)))
             if os.path.exists(cand2):
                 resolved_path = cand2
             elif os.path.isdir(base_path):
-                fname = os.path.basename(img_path)
+                fname = os.path.basename(decoded_path)
                 try:
                     for entry in os.scandir(base_path):
                         if entry.is_dir() and (entry.name.endswith('_assets') or entry.name in ('assets', 'images', 'Images', 'media')):
@@ -1128,43 +1622,27 @@ def _add_image(doc, img_path: str, alt_text: str, base_path: Optional[str] = Non
 
     if resolved_path and os.path.exists(resolved_path):
         try:
-            if width_px:
-                target_w = Inches(min(6.2, max(1.0, width_px / 96.0)))
-            else:
-                target_w = Inches(5.2)
-
-            p = doc.add_paragraph()
-            if align == 'left':
-                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            elif align == 'right':
-                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            else:
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-            p.paragraph_format.space_before = Pt(8)
-            p.paragraph_format.space_after = Pt(2)
-            run = p.add_run()
-            run.add_picture(resolved_path, width=target_w)
-
-            # Display caption
-            display_caption = caption or clean_alt
-            if display_caption:
-                cp = doc.add_paragraph(display_caption)
-                cp.alignment = p.alignment
-                cp.paragraph_format.space_before = Pt(2)
-                cp.paragraph_format.space_after = Pt(10)
-                for crun in cp.runs:
-                    crun.font.italic = True
-                    crun.font.size = Pt(9.5)
-                    crun.font.color.rgb = RGBColor(0x64, 0x74, 0x8B)
+            _embed_docx_image_file(doc, resolved_path, clean_alt, caption, width_px, align)
         except Exception as e:
             doc.add_paragraph(f"[Image: {clean_alt or img_path}] (Failed to embed: {e})")
     else:
         doc.add_paragraph(f"[Image: {clean_alt or img_path}] (File not found)")
 
 
-def _add_base64_image(doc, data_uri: str, alt_text: str):
-    """Add a base64-encoded image to the document"""
+def _add_base64_image(
+    doc,
+    data_uri: str,
+    alt_text: str = "",
+    width_px: Optional[int] = None,
+    align: Optional[str] = None,
+    caption: Optional[str] = None,
+):
+    """Add a base64-encoded image to the document with width/align/caption parameter support."""
+    params = _parse_docx_image_params(alt_text)
+    clean_alt = params['alt']
+    eff_width = width_px if width_px is not None else params['width']
+    eff_align = align if align is not None else params['align']
+    eff_caption = caption if caption is not None else params['caption']
     try:
         # Parse data URI: data:image/png;base64,xxxxx
         header, data = data_uri.split(',', 1)
@@ -1176,20 +1654,18 @@ def _add_base64_image(doc, data_uri: str, alt_text: str):
             suffix = '.jpg'
         elif 'gif' in header:
             suffix = '.gif'
+        elif 'webp' in header:
+            suffix = '.webp'
+        elif 'bmp' in header:
+            suffix = '.bmp'
         
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(img_bytes)
             tmp_path = tmp.name
         
         try:
-            doc.add_picture(tmp_path, width=Inches(5.5))
-            if alt_text:
-                p = doc.add_paragraph(alt_text)
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                for run in p.runs:
-                    run.font.italic = True
-                    run.font.size = Pt(9)
+            _embed_docx_image_file(doc, tmp_path, clean_alt, eff_caption, eff_width, eff_align)
         finally:
             os.unlink(tmp_path)
     except Exception as e:
-        doc.add_paragraph(f"[Image: {alt_text}] (Failed to decode base64: {e})")
+        doc.add_paragraph(f"[Image: {clean_alt or alt_text}] (Failed to decode base64: {e})")

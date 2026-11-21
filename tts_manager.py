@@ -543,6 +543,13 @@ def clean_markdown_for_speech(text: str, skip_code_blocks: bool = True) -> str:
     # 6. Strip bare HTTP/HTTPS URLs so TTS does not spell them out
     s = re.sub(r"https?://\S+", "", s)
 
+    # 6b. Strip alignment, font-color, and highlight HTML tags while preserving inner text
+    s = re.sub(r"<div\s+align=[^>]*>", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"</div>", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"<span\s+style=[^>]*>", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"</span>", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"</?mark>", "", s, flags=re.IGNORECASE)
+
     # 7. Strip inline code ticks & emphasis markers cleanly
     s = re.sub(r"`([^`\n]+)`", r"\1", s)
     s = re.sub(r"\*\*\*([^*\n]+)\*\*\*", r"\1", s)
@@ -694,9 +701,13 @@ class ReverbTTSManager:
         self._model_lock = threading.Lock()
         self._inference_lock = threading.Lock()
         self._playback_lock = threading.Lock()
+        self._voice_cache_lock = threading.Lock()
+        self._settings_lock = threading.RLock()
         self._tts: Any = None
         self._loaded_variant: Optional[str] = None
         self._loaded_device: Optional[str] = None
+        self._loaded_actual_device: Optional[str] = None
+        self._cached_preset_voices: Optional[List[str]] = None
         self._use_anonymous_hf: bool = False
         self._voice_cache: Dict[str, Any] = {}
 
@@ -727,11 +738,11 @@ class ReverbTTSManager:
 
     @property
     def loaded_info(self) -> Optional[Tuple[str, str]]:
-        with self._model_lock:
-            if self._tts is None:
+        with self._state_lock:
+            if self._loaded_variant is None:
                 return None
-            dev = getattr(self._tts, "device", self._loaded_device or "unknown")
-            return (self._loaded_variant or self.settings.variant, str(dev))
+            dev = self._loaded_actual_device or self._loaded_device or "unknown"
+            return (self._loaded_variant, str(dev))
 
     def add_state_listener(self, cb: Callable[[bool], None]) -> None:
         if cb not in self._state_listeners:
@@ -818,20 +829,23 @@ class ReverbTTSManager:
             raise RuntimeError(
                 "The 'reverb-tts' package is not installed. Run: pip install reverb-tts"
             )
-        tts_cls, _voice_cls = self._ensure_reverb_imported()
 
-        desired_variant = self.settings.variant
-        desired_device = self.settings.device
+        with self._settings_lock:
+            desired_variant = self.settings.variant
+            desired_device = self.settings.device
 
         with self._model_lock:
-            needs_load = (
-                force_reload
-                or self._tts is None
-                or self._loaded_variant != desired_variant
-                or self._loaded_device != desired_device
-            )
+            with self._state_lock:
+                needs_load = (
+                    force_reload
+                    or self._tts is None
+                    or self._loaded_variant != desired_variant
+                    or self._loaded_device != desired_device
+                )
             if not needs_load:
                 return self._tts
+
+            tts_cls, _voice_cls = self._ensure_reverb_imported()
 
             with self._state_lock:
                 self._is_loading = True
@@ -842,111 +856,130 @@ class ReverbTTSManager:
 
             try:
                 dev_arg = None if desired_device == "auto" else desired_device
-                with self._inference_lock:
-                    if self._tts is not None:
-                        old_tts = self._tts
-                        self._tts = None
-                        self._loaded_variant = None
-                        self._loaded_device = None
-                        self._voice_cache.clear()
-                        del old_tts
-                        if TORCH_AVAILABLE:
-                            try:
-                                import torch as _torch
-                                if _torch.cuda.is_available():
-                                    _torch.cuda.empty_cache()
-                            except Exception:
-                                pass
+                if self._use_anonymous_hf:
+                    with self._anonymous_hf_hub():
+                        new_tts = tts_cls.from_pretrained(REPO_ID, variant=desired_variant, device=dev_arg, token=False)
+                else:
+                    try:
+                        new_tts = tts_cls.from_pretrained(REPO_ID, variant=desired_variant, device=dev_arg)
+                    except Exception as exc:
+                        err_txt = str(exc).lower()
+                        if any(k in err_txt for k in ("401", "expired", "unauthorized", "token", "repository not found")):
+                            self._use_anonymous_hf = True
+                            with self._anonymous_hf_hub():
+                                new_tts = tts_cls.from_pretrained(REPO_ID, variant=desired_variant, device=dev_arg, token=False)
+                        else:
+                            raise
+
+                cached_presets: Optional[List[str]] = None
+                try:
                     if self._use_anonymous_hf:
                         with self._anonymous_hf_hub():
-                            self._tts = tts_cls.from_pretrained(REPO_ID, variant=desired_variant, device=dev_arg, token=False)
+                            names = new_tts.preset_voices()
                     else:
+                        names = new_tts.preset_voices()
+                    if names:
+                        cached_presets = list(names)
+                except Exception:
+                    cached_presets = None
+
+                actual_dev = str(getattr(new_tts, "device", desired_device))
+                with self._inference_lock:
+                    old_tts = self._tts
+                    self._tts = new_tts
+                    with self._voice_cache_lock:
+                        self._voice_cache.clear()
+                    with self._state_lock:
+                        self._loaded_variant = desired_variant
+                        self._loaded_device = desired_device
+                        self._loaded_actual_device = actual_dev
+                        if cached_presets is not None:
+                            self._cached_preset_voices = cached_presets
+
+                if old_tts is not None:
+                    del old_tts
+                    if TORCH_AVAILABLE:
                         try:
-                            self._tts = tts_cls.from_pretrained(REPO_ID, variant=desired_variant, device=dev_arg)
-                        except Exception as exc:
-                            err_txt = str(exc).lower()
-                            if any(k in err_txt for k in ("401", "expired", "unauthorized", "token", "repository not found")):
-                                self._use_anonymous_hf = True
-                                with self._anonymous_hf_hub():
-                                    self._tts = tts_cls.from_pretrained(REPO_ID, variant=desired_variant, device=dev_arg, token=False)
-                            else:
-                                raise
-                    self._loaded_variant = desired_variant
-                    self._loaded_device = desired_device
-                    self._voice_cache.clear()
-                    actual_dev = str(getattr(self._tts, "device", desired_device))
+                            import torch as _torch
+                            if _torch.cuda.is_available():
+                                _torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+
                 ready_msg = f"Reverb-TTS ({desired_variant}) ready on {actual_dev.upper()}"
                 self._emit_status(ready_msg)
                 if status_cb:
                     status_cb(ready_msg)
-                return self._tts
+                return new_tts
             finally:
                 with self._state_lock:
                     self._is_loading = False
 
     def list_preset_voices(self) -> List[str]:
-        """Return available built-in Reverb-TTS speaker names."""
-        if self._tts is not None:
-            try:
-                if self._use_anonymous_hf:
-                    with self._anonymous_hf_hub():
-                        names = self._tts.preset_voices()
-                else:
-                    names = self._tts.preset_voices()
-                if names:
-                    return list(names)
-            except Exception:
-                pass
+        """Return available built-in Reverb-TTS speaker names (cached, never blocks UI)."""
+        with self._state_lock:
+            if self._cached_preset_voices:
+                return list(self._cached_preset_voices)
         return list(DEFAULT_PRESET_VOICES)
 
     def get_active_voice(self) -> Any:
         """Resolve the currently configured preset or persistent custom Voice object."""
-        s = self.settings
-        if s.voice_type == "custom":
-            rec = s.get_custom_voice(s.voice_id)
-            if rec is not None:
-                cache_key = f"custom:{rec['id']}:{rec['npz_file']}"
+        with self._settings_lock:
+            voice_type = self.settings.voice_type
+            voice_id = self.settings.voice_id
+            rec = self.settings.get_custom_voice(voice_id) if voice_type == "custom" else None
+
+        if voice_type == "custom" and rec is not None:
+            cache_key = f"custom:{rec['id']}:{rec['npz_file']}"
+            with self._voice_cache_lock:
                 if cache_key in self._voice_cache:
                     return self._voice_cache[cache_key]
-                safe_path = _resolve_safe_voice_path(self.voices_dir, rec["npz_file"])
-                if safe_path.is_file() and REVERB_TTS_AVAILABLE:
-                    try:
-                        _tts_cls, voice_cls = self._ensure_reverb_imported()
-                        voice_obj = voice_cls.load(safe_path)
+            safe_path = _resolve_safe_voice_path(self.voices_dir, rec["npz_file"])
+            if safe_path.is_file() and REVERB_TTS_AVAILABLE:
+                try:
+                    _tts_cls, voice_cls = self._ensure_reverb_imported()
+                    voice_obj = voice_cls.load(safe_path)
+                    with self._voice_cache_lock:
                         self._voice_cache[cache_key] = voice_obj
-                        return voice_obj
-                    except Exception:
-                        pass
+                    return voice_obj
+                except Exception:
+                    pass
 
-        preset_name = s.voice_id if s.voice_type == "preset" and s.voice_id else "en_female_narrator"
+        preset_name = voice_id if voice_type == "preset" and voice_id else "en_female_narrator"
         cache_key = f"preset:{preset_name}"
-        if cache_key in self._voice_cache:
-            return self._voice_cache[cache_key]
+        with self._voice_cache_lock:
+            if cache_key in self._voice_cache:
+                return self._voice_cache[cache_key]
 
         if self._tts is None:
             self.ensure_model_loaded()
 
         def _fetch_preset(pname: str):
-            if self._use_anonymous_hf:
-                with self._anonymous_hf_hub():
-                    return self._tts.preset_voice(pname)
-            try:
-                return self._tts.preset_voice(pname)
-            except Exception as exc:
-                err_txt = str(exc).lower()
-                if any(k in err_txt for k in ("401", "expired", "unauthorized", "token", "repository not found")):
-                    self._use_anonymous_hf = True
-                    self._tts.token = False
+            with self._inference_lock:
+                tts = self._tts
+                if tts is None:
+                    raise RuntimeError("Reverb-TTS model is not loaded.")
+                if self._use_anonymous_hf:
                     with self._anonymous_hf_hub():
-                        return self._tts.preset_voice(pname)
-                raise
+                        return tts.preset_voice(pname)
+                try:
+                    return tts.preset_voice(pname)
+                except Exception as exc:
+                    err_txt = str(exc).lower()
+                    if any(k in err_txt for k in ("401", "expired", "unauthorized", "token", "repository not found")):
+                        self._use_anonymous_hf = True
+                        tts.token = False
+                        with self._anonymous_hf_hub():
+                            return tts.preset_voice(pname)
+                    raise
 
         try:
             voice_obj = _fetch_preset(preset_name)
         except Exception:
             voice_obj = _fetch_preset("en_female_narrator")
             cache_key = "preset:en_female_narrator"
-        self._voice_cache[cache_key] = voice_obj
+        with self._voice_cache_lock:
+            self._voice_cache[cache_key] = voice_obj
         return voice_obj
 
     def train_custom_voice(
@@ -992,6 +1025,8 @@ class ReverbTTSManager:
 
         try:
             with self._inference_lock:
+                if self._tts is None:
+                    raise RuntimeError("Reverb-TTS model is not loaded.")
                 voice_obj = self._tts.voice(str(encode_path), clean_transcript, language=language)
         finally:
             if temp_wav is not None and temp_wav.exists():
@@ -1003,35 +1038,37 @@ class ReverbTTSManager:
         self.voices_dir.mkdir(parents=True, exist_ok=True)
         _restrict_permissions(self.voices_dir, is_dir=True)
 
-        base_id = _sanitize_voice_id(clean_name)
-        voice_id = base_id
-        suffix = 1
-        while self.settings.get_custom_voice(voice_id) is not None:
-            # Reuse same id only if overwriting intentionally? Allocate unique suffix to prevent accidental overwrite.
-            voice_id = f"{base_id}_{suffix}"
-            suffix += 1
+        with self._settings_lock:
+            base_id = _sanitize_voice_id(clean_name)
+            voice_id = base_id
+            suffix = 1
+            while self.settings.get_custom_voice(voice_id) is not None:
+                sfx = f"_{suffix}"
+                voice_id = f"{base_id[:48 - len(sfx)]}{sfx}"
+                suffix += 1
 
-        npz_name = f"{voice_id}.npz"
-        safe_npz = _resolve_safe_voice_path(self.voices_dir, npz_name)
-        voice_obj.save(safe_npz)
-        _restrict_permissions(safe_npz, is_dir=False)
+            npz_name = f"{voice_id}.npz"
+            safe_npz = _resolve_safe_voice_path(self.voices_dir, npz_name)
+            voice_obj.save(safe_npz)
+            _restrict_permissions(safe_npz, is_dir=False)
 
-        record = {
-            "id": voice_id,
-            "name": clean_name,
-            "language": language,
-            "transcript": clean_transcript,
-            "npz_file": npz_name,
-            "source_audio": str(src_path),
-            "duration_sec": round(float(getattr(voice_obj, "duration", 0.0)), 2),
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        }
-        self.settings.add_or_update_custom_voice(record)
-        if set_active:
-            self.settings.voice_type = "custom"
-            self.settings.voice_id = voice_id
-        self.settings.save(self.settings_file)
-        self._voice_cache[f"custom:{voice_id}:{npz_name}"] = voice_obj
+            record = {
+                "id": voice_id,
+                "name": clean_name,
+                "language": language,
+                "transcript": clean_transcript,
+                "npz_file": npz_name,
+                "source_audio": str(src_path),
+                "duration_sec": round(float(getattr(voice_obj, "duration", 0.0) or 0.0), 2),
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            }
+            self.settings.add_or_update_custom_voice(record)
+            if set_active:
+                self.settings.voice_type = "custom"
+                self.settings.voice_id = voice_id
+            self.settings.save(self.settings_file)
+        with self._voice_cache_lock:
+            self._voice_cache[f"custom:{voice_id}:{npz_name}"] = voice_obj
 
         done_msg = f"Saved custom voice '{clean_name}' ({record['duration_sec']}s)"
         self._emit_status(done_msg)
@@ -1041,11 +1078,14 @@ class ReverbTTSManager:
 
     def delete_custom_voice(self, voice_id: str) -> bool:
         """Delete a custom voice record and its cached .npz file."""
-        removed = self.settings.remove_custom_voice(voice_id, voices_dir=self.voices_dir)
+        with self._settings_lock:
+            removed = self.settings.remove_custom_voice(voice_id, voices_dir=self.voices_dir)
+            if removed:
+                self.settings.save(self.settings_file)
         if removed:
-            for k in [k for k in self._voice_cache if k.startswith(f"custom:{voice_id}:")]:
-                self._voice_cache.pop(k, None)
-            self.settings.save(self.settings_file)
+            with self._voice_cache_lock:
+                for k in [k for k in self._voice_cache if k.startswith(f"custom:{voice_id}:")]:
+                    self._voice_cache.pop(k, None)
         return removed
 
     def record_microphone_sample(
@@ -1054,7 +1094,8 @@ class ReverbTTSManager:
         sample_rate: int = 24000,
         cancel_event: Optional[threading.Event] = None,
         progress_cb: Optional[Callable[[float], None]] = None,
-    ) -> Path:
+        abort_event: Optional[threading.Event] = None,
+    ) -> Optional[Path]:
         """Record mono microphone speech into a persistent WAV sample for voice cloning."""
         if not SOUNDDEVICE_AVAILABLE or not SOUNDFILE_AVAILABLE:
             raise RuntimeError("Microphone recording requires 'sounddevice' and 'soundfile'.")
@@ -1070,6 +1111,8 @@ class ReverbTTSManager:
 
         with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
             for step in range(total_steps):
+                if abort_event is not None and abort_event.is_set():
+                    return None
                 if cancel_event is not None and cancel_event.is_set():
                     break
                 data, _overflowed = stream.read(block)
@@ -1077,6 +1120,8 @@ class ReverbTTSManager:
                 if progress_cb:
                     progress_cb(min(duration_sec, (step + 1) * 0.1))
 
+        if abort_event is not None and abort_event.is_set():
+            return None
         if not frames:
             raise RuntimeError("No audio captured from microphone.")
         audio = np.concatenate(frames, axis=0).reshape(-1)
@@ -1167,16 +1212,24 @@ class ReverbTTSManager:
 
     def _synthesize_chunk(self, chunk: str, voice_obj: Any, chunk_idx: int) -> Tuple[np.ndarray, int]:
         """Synthesize one text segment using active Reverb-TTS settings."""
-        s = self.settings
-        chunk_seed = (s.seed + chunk_idx) if s.seed is not None else None
+        with self._settings_lock:
+            s = self.settings
+            lang = s.language
+            speed = s.speed
+            pace = s.pace
+            steps = s.steps
+            seed = s.seed
+        chunk_seed = (seed + chunk_idx) if seed is not None else None
         with self._inference_lock:
+            if self._tts is None:
+                raise RuntimeError("Reverb-TTS model is not loaded.")
             audio = self._tts.generate(
                 chunk,
                 voice_obj,
-                language=s.language,
-                speed=s.speed,
-                pace=s.pace,
-                steps=s.steps,
+                language=lang,
+                speed=speed,
+                pace=pace,
+                steps=steps,
                 seed=chunk_seed,
             )
             sr = int(getattr(self._tts, "sample_rate", 24000))
@@ -1215,10 +1268,11 @@ class ReverbTTSManager:
 
         self._set_speaking(True, tag=tag)
         audio_queue: "queue.Queue[Optional[Tuple[Any, ...]]]" = queue.Queue(maxsize=2)
+        consumer_done = threading.Event()
 
         def _put_with_cancel(item: Optional[Tuple[Any, ...]]) -> bool:
             while True:
-                if cancel_event.is_set():
+                if cancel_event.is_set() or consumer_done.is_set():
                     return False
                 try:
                     audio_queue.put(item, timeout=0.08)
@@ -1245,15 +1299,9 @@ class ReverbTTSManager:
                         return
             except Exception as e:
                 if not cancel_event.is_set():
-                    try:
-                        audio_queue.put(("ERROR", str(e)), timeout=0.2)
-                    except Exception:
-                        pass
+                    _put_with_cancel(("ERROR", str(e)))
             finally:
-                try:
-                    audio_queue.put(None, timeout=0.2)
-                except Exception:
-                    pass
+                _put_with_cancel(None)
 
         def _consumer():
             errored = False
@@ -1288,6 +1336,7 @@ class ReverbTTSManager:
                     if status_cb:
                         status_cb(err_msg)
             finally:
+                consumer_done.set()
                 cancelled = cancel_event.is_set()
                 should_clear = False
                 with self._state_lock:
@@ -1377,13 +1426,18 @@ class DictationPropertiesDialog(tk.Toplevel):
         self.result: Optional[TTSSettings] = None
 
         self._record_cancel: Optional[threading.Event] = None
+        self._record_abort: Optional[threading.Event] = None
         self._recording = False
         self._busy_training = False
         self._saved_committed = False
-        self.manager.settings.normalize()
-        self._initial_snapshot = {
-            k: v for k, v in asdict(self.manager.settings).items() if k != "custom_voices"
-        }
+        self._destroyed = False
+        self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
+        self._ui_poll_id: Optional[str] = None
+        with self.manager._settings_lock:
+            self.manager.settings.normalize()
+            self._initial_snapshot = {
+                k: v for k, v in asdict(self.manager.settings).items() if k != "custom_voices"
+            }
 
         self.title("Dictation Properties")
         self.geometry("680x650")
@@ -1401,6 +1455,7 @@ class DictationPropertiesDialog(tk.Toplevel):
         self._state_cb_ref = self._on_manager_state
         self.manager.add_status_listener(self._status_cb_ref)
         self.manager.add_state_listener(self._state_cb_ref)
+        self._ui_poll_id = self.after(30, self._drain_ui_queue)
 
         self.update_idletasks()
         try:
@@ -1412,18 +1467,30 @@ class DictationPropertiesDialog(tk.Toplevel):
 
     def _cancel_and_close(self) -> None:
         """Revert unconfirmed parameter changes while keeping trained/deleted custom voices."""
+        if self.manager.current_tag == "preview":
+            self.manager.stop()
         if not getattr(self, "_saved_committed", False):
             try:
-                for k, v in self._initial_snapshot.items():
-                    setattr(self.manager.settings, k, v)
-                self.manager.settings.normalize()
-                self.manager.settings.save(self.manager.settings_file)
+                with self.manager._settings_lock:
+                    for k, v in self._initial_snapshot.items():
+                        setattr(self.manager.settings, k, v)
+                    self.manager.settings.normalize()
+                    self.manager.settings.save(self.manager.settings_file)
             except Exception:
                 pass
         self.destroy()
 
     def destroy(self):
+        self._destroyed = True
+        if getattr(self, "_ui_poll_id", None) is not None:
+            try:
+                self.after_cancel(self._ui_poll_id)
+            except Exception:
+                pass
+            self._ui_poll_id = None
         try:
+            if self._record_abort is not None:
+                self._record_abort.set()
             if self._record_cancel is not None:
                 self._record_cancel.set()
             self.manager.remove_status_listener(self._status_cb_ref)
@@ -1433,11 +1500,34 @@ class DictationPropertiesDialog(tk.Toplevel):
         super().destroy()
 
     def _safe_after(self, fn: Callable[[], None]) -> None:
+        if not getattr(self, "_destroyed", False):
+            self._ui_queue.put(fn)
+
+    def _drain_ui_queue(self) -> None:
+        self._ui_poll_id = None
+        if getattr(self, "_destroyed", False):
+            return
         try:
-            if self.winfo_exists():
-                self.after(0, lambda: self.winfo_exists() and fn())
+            if not self.winfo_exists():
+                return
         except Exception:
-            pass
+            return
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if not getattr(self, "_destroyed", False) and self.winfo_exists():
+                    fn()
+            except Exception:
+                pass
+        if not getattr(self, "_destroyed", False):
+            try:
+                if self.winfo_exists():
+                    self._ui_poll_id = self.after(30, self._drain_ui_queue)
+            except Exception:
+                pass
 
     def _on_manager_status(self, msg: str) -> None:
         self._safe_after(lambda: self._update_status_displays(msg))
@@ -1455,17 +1545,18 @@ class DictationPropertiesDialog(tk.Toplevel):
         self._refresh_header_badge()
 
     def _refresh_header_badge(self) -> None:
-        info = self.manager.loaded_info
         if not REVERB_TTS_AVAILABLE:
             text, fg = "reverb-tts missing", "#fecaca"
         elif self.manager.is_loading:
             text, fg = "Loading model...", "#fde68a"
         elif self.manager.is_speaking:
             text, fg = "Speaking...", "#bbf7d0"
-        elif info is not None:
-            text, fg = f"{info[0]} · {info[1].upper()}", "#bbf7d0"
         else:
-            text, fg = f"{self.variant_var.get().split()[0]} · Standby", "#ddd6fe"
+            info = self.manager.loaded_info
+            if info is not None:
+                text, fg = f"{info[0]} · {info[1].upper()}", "#bbf7d0"
+            else:
+                text, fg = f"{self.variant_var.get().split()[0]} · Standby", "#ddd6fe"
         if hasattr(self, "header_badge"):
             self.header_badge.configure(text=text, fg=fg)
 
@@ -1863,10 +1954,13 @@ class DictationPropertiesDialog(tk.Toplevel):
             self.test_text_var.set(LANGUAGE_SAMPLES.get(code, LANGUAGE_SAMPLES["en"]))
 
     def _apply_to_manager(self) -> TTSSettings:
-        new_settings = self._collect_settings_from_ui()
-        self.manager.settings = new_settings
-        new_settings.save(self.manager.settings_file)
-        return new_settings
+        with self.manager._settings_lock:
+            new_settings = self._collect_settings_from_ui()
+            new_settings.custom_voices = [dict(v) for v in self.manager.settings.custom_voices]
+            new_settings.normalize()
+            self.manager.settings = new_settings
+            new_settings.save(self.manager.settings_file)
+            return new_settings
 
     # ------------------------------------------------------------------ Actions
 
@@ -1963,6 +2057,9 @@ class DictationPropertiesDialog(tk.Toplevel):
 
         self._recording = True
         self._record_cancel = threading.Event()
+        self._record_abort = threading.Event()
+        rec_cancel = self._record_cancel
+        rec_abort = self._record_abort
         self.rec_btn.configure(text="⏹ Stop (0.0s)")
         self.status_lbl.configure(text="Recording microphone reference (speak clearly for 3–8 seconds)...")
 
@@ -1974,7 +2071,10 @@ class DictationPropertiesDialog(tk.Toplevel):
             err_msg: Optional[str] = None
             try:
                 wav_path = self.manager.record_microphone_sample(
-                    duration_sec=8.0, cancel_event=self._record_cancel, progress_cb=_prog
+                    duration_sec=8.0,
+                    cancel_event=rec_cancel,
+                    progress_cb=_prog,
+                    abort_event=rec_abort,
                 )
             except Exception as exc:
                 err_msg = str(exc)
@@ -1982,7 +2082,10 @@ class DictationPropertiesDialog(tk.Toplevel):
             def _done():
                 self._recording = False
                 self._record_cancel = None
+                self._record_abort = None
                 self.rec_btn.configure(text="🎙 Record 8s")
+                if rec_abort.is_set():
+                    return
                 if err_msg:
                     self.status_lbl.configure(text=f"Recording failed: {err_msg}")
                     messagebox.showerror("Recording Error", err_msg, parent=self)
@@ -2094,12 +2197,13 @@ class DictationPropertiesDialog(tk.Toplevel):
         if not sel:
             return None
         vid = sel[0]
-        rec = self.manager.settings.get_custom_voice(vid)
-        if not rec:
-            return None
-        self.manager.settings.voice_type = "custom"
-        self.manager.settings.voice_id = vid
-        self.manager.settings.save(self.manager.settings_file)
+        with self.manager._settings_lock:
+            rec = self.manager.settings.get_custom_voice(vid)
+            if not rec:
+                return None
+            self.manager.settings.voice_type = "custom"
+            self.manager.settings.voice_id = vid
+            self.manager.settings.save(self.manager.settings_file)
         self.voice_type_var.set("custom")
         self._refresh_custom_voice_widgets()
         self._on_voice_type_changed()
@@ -2113,8 +2217,9 @@ class DictationPropertiesDialog(tk.Toplevel):
         lang = rec.get("language", "en")
         self.lang_var.set(language_to_label(lang))
         self._on_language_changed()
-        self.manager.settings.language = lang
-        self.manager.settings.save(self.manager.settings_file)
+        with self.manager._settings_lock:
+            self.manager.settings.language = lang
+            self.manager.settings.save(self.manager.settings_file)
         sample = self.test_text_var.get().strip() or LANGUAGE_SAMPLES.get(lang, LANGUAGE_SAMPLES["en"])
         self.manager.speak_preview(sample_text=sample)
 
@@ -2139,9 +2244,10 @@ class DictationPropertiesDialog(tk.Toplevel):
             self.status_lbl.configure(text=f"Deleted custom voice '{rec['name']}'.")
 
     def _reset_defaults(self) -> None:
-        kept_custom = [dict(v) for v in self.manager.settings.custom_voices]
-        self.manager.settings = TTSSettings(custom_voices=kept_custom)
-        self.manager.settings.save(self.manager.settings_file)
+        with self.manager._settings_lock:
+            kept_custom = [dict(v) for v in self.manager.settings.custom_voices]
+            self.manager.settings = TTSSettings(custom_voices=kept_custom)
+            self.manager.settings.save(self.manager.settings_file)
         self._load_settings_into_ui()
         self.status_lbl.configure(text="Restored default Dictation Properties (custom voices kept).")
 

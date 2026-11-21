@@ -8,6 +8,7 @@ acceptance, synchronized scrolling, manual editing, and flexible apply modes.
 """
 
 import difflib
+import inspect
 import re
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, font
@@ -260,13 +261,46 @@ class DiffPanel(tk.Toplevel):
         word_cb.pack(side=tk.RIGHT, padx=4)
         ToolTip(word_cb, "Highlight granular word-by-word deletions in red strikethrough and additions in green.")
 
+        # Button bar — packed at bottom BEFORE paned/hunks_outer so it never gets pushed off-screen
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.reject_btn = ttk.Button(btn_frame, text="Reject", command=self._on_reject)
+        self.reject_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        ToolTip(self.reject_btn, "Discard all suggested changes and close this diff review panel without modifying your document.")
+
+        self.edit_btn = ttk.Button(btn_frame, text="Edit", command=self._toggle_edit)
+        self.edit_btn.pack(side=tk.RIGHT, padx=(5, 0))
+        ToolTip(self.edit_btn, "Toggle manual editing mode on the suggested text pane to fine-tune revisions before applying.")
+
+        self.accept_btn = ttk.Button(btn_frame, text="✔ Accept & Apply", command=self._on_accept,
+                                     state=tk.DISABLED)
+        self.accept_btn.pack(side=tk.RIGHT)
+        ToolTip(self.accept_btn, "Apply the accepted changes directly to your document using the selected apply mode.")
+
+        # Apply mode selector
+        ttk.Label(btn_frame, text="Apply mode:", font=(self._sans_font, 9)).pack(side=tk.LEFT, padx=(0, 4))
+        mode_labels = [label for _, label in self.APPLY_MODES]
+        default_label = dict(self.APPLY_MODES).get(self.default_apply_mode, mode_labels[0])
+        self.apply_mode_var = tk.StringVar(value=default_label)
+        self.apply_mode_combo = ttk.Combobox(
+            btn_frame, textvariable=self.apply_mode_var,
+            values=mode_labels, state="readonly", width=21
+        )
+        self.apply_mode_combo.pack(side=tk.LEFT, padx=(0, 12))
+        ToolTip(self.apply_mode_combo, "Select how applied text is inserted: replace target range, insert at cursor, append to end, or replace whole document.")
+
+        # Info label
+        ttk.Label(btn_frame, text="Target: Lines " + self._format_range(),
+                  font=(self._sans_font, 9), foreground=P['muted']).pack(side=tk.LEFT)
+
         # Paned window for side-by-side
-        paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        self.paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        self.paned.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 6))
 
         # Left pane — Original
-        left_frame = ttk.LabelFrame(paned, text="Original  (Deletions highlighted)", padding=4)
-        paned.add(left_frame, weight=1)
+        left_frame = ttk.LabelFrame(self.paned, text="Original  (Deletions highlighted)", padding=4)
+        self.paned.add(left_frame, weight=1)
 
         self.original_display = scrolledtext.ScrolledText(
             left_frame, wrap=tk.WORD,
@@ -288,8 +322,8 @@ class DiffPanel(tk.Toplevel):
         self.original_display.config(state=tk.DISABLED)
 
         # Right pane — Suggestion
-        right_frame = ttk.LabelFrame(paned, text="Suggested  (Additions highlighted)", padding=4)
-        paned.add(right_frame, weight=1)
+        right_frame = ttk.LabelFrame(self.paned, text="Suggested  (Additions highlighted)", padding=4)
+        self.paned.add(right_frame, weight=1)
 
         self.suggestion_display = scrolledtext.ScrolledText(
             right_frame, wrap=tk.WORD,
@@ -333,41 +367,34 @@ class DiffPanel(tk.Toplevel):
         desel_all_btn.pack(side=tk.RIGHT, padx=2)
         ToolTip(desel_all_btn, "Exclude all changed blocks, keeping the original document text across all hunks.")
 
-        self.hunks_flow = ttk.Frame(self.hunks_outer)
-        self.hunks_flow.pack(fill=tk.X)
+        hunks_scroll_wrap = ttk.Frame(self.hunks_outer)
+        hunks_scroll_wrap.pack(fill=tk.X, expand=True)
 
-        # Button bar
-        btn_frame = ttk.Frame(main)
-        btn_frame.pack(fill=tk.X)
-
-        self.reject_btn = ttk.Button(btn_frame, text="Reject", command=self._on_reject)
-        self.reject_btn.pack(side=tk.RIGHT, padx=(5, 0))
-        ToolTip(self.reject_btn, "Discard all suggested changes and close this diff review panel without modifying your document.")
-
-        self.edit_btn = ttk.Button(btn_frame, text="Edit", command=self._toggle_edit)
-        self.edit_btn.pack(side=tk.RIGHT, padx=(5, 0))
-        ToolTip(self.edit_btn, "Toggle manual editing mode on the suggested text pane to fine-tune revisions before applying.")
-
-        self.accept_btn = ttk.Button(btn_frame, text="✔ Accept & Apply", command=self._on_accept,
-                                     state=tk.DISABLED)
-        self.accept_btn.pack(side=tk.RIGHT)
-        ToolTip(self.accept_btn, "Apply the accepted changes directly to your document using the selected apply mode.")
-
-        # Apply mode selector
-        ttk.Label(btn_frame, text="Apply mode:", font=(self._sans_font, 9)).pack(side=tk.LEFT, padx=(0, 4))
-        mode_labels = [label for _, label in self.APPLY_MODES]
-        default_label = dict(self.APPLY_MODES).get(self.default_apply_mode, mode_labels[0])
-        self.apply_mode_var = tk.StringVar(value=default_label)
-        self.apply_mode_combo = ttk.Combobox(
-            btn_frame, textvariable=self.apply_mode_var,
-            values=mode_labels, state="readonly", width=21
+        self._hunks_canvas = tk.Canvas(
+            hunks_scroll_wrap, height=60, highlightthickness=0, borderwidth=0
         )
-        self.apply_mode_combo.pack(side=tk.LEFT, padx=(0, 12))
-        ToolTip(self.apply_mode_combo, "Select how applied text is inserted: replace target range, insert at cursor, append to end, or replace whole document.")
+        self._hunks_scrollbar = ttk.Scrollbar(
+            hunks_scroll_wrap, orient=tk.VERTICAL, command=self._hunks_canvas.yview
+        )
+        self._hunks_canvas.configure(yscrollcommand=self._hunks_scrollbar.set)
+        self._hunks_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._hunks_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Info label
-        ttk.Label(btn_frame, text="Target: Lines " + self._format_range(),
-                  font=(self._sans_font, 9), foreground=P['muted']).pack(side=tk.LEFT)
+        self.hunks_flow = ttk.Frame(self._hunks_canvas)
+        self._hunks_canvas_win = self._hunks_canvas.create_window(
+            (0, 0), window=self.hunks_flow, anchor="nw"
+        )
+
+        def _on_hunks_configure(event=None):
+            self._hunks_canvas.configure(scrollregion=self._hunks_canvas.bbox("all"))
+            req_h = self.hunks_flow.winfo_reqheight()
+            self._hunks_canvas.configure(height=min(140, max(28, req_h)))
+
+        def _on_hunks_canvas_configure(event):
+            self._hunks_canvas.itemconfigure(self._hunks_canvas_win, width=event.width)
+
+        self.hunks_flow.bind("<Configure>", _on_hunks_configure)
+        self._hunks_canvas.bind("<Configure>", _on_hunks_canvas_configure)
 
     def _setup_sync_scroll(self):
         """Synchronize vertical scrolling between original and suggestion text widgets."""
@@ -426,17 +453,28 @@ class DiffPanel(tk.Toplevel):
             target_model = self.settings.agy_model if (is_agy and getattr(self.settings, 'agy_model', '')) else (self.settings.model if self.settings else None)
             target_effort = self.settings.agy_effort if (is_agy and getattr(self.settings, 'agy_effort', '')) else None
 
-            for chunk in self.llm_client.send_message_stream(
-                self.messages,
-                system_prompt=self.settings.system_prompt if self.settings else "",
-                max_tokens=self.settings.max_tokens if self.settings else 1000000,
-                temperature=self.settings.temperature if self.settings else 0.7,
-                top_p=self.settings.top_p if self.settings else 1.0,
-                top_k=self.settings.top_k if self.settings else 0,
-                images=self.images if self.images else None,
-                model=target_model,
-                effort=target_effort
-            ):
+            stream_fn = self.llm_client.send_message_stream
+            stream_kwargs: Dict[str, Any] = {
+                'system_prompt': self.settings.system_prompt if self.settings else "",
+                'max_tokens': self.settings.max_tokens if self.settings else 1000000,
+                'temperature': self.settings.temperature if self.settings else 0.7,
+                'top_p': self.settings.top_p if self.settings else 1.0,
+                'top_k': self.settings.top_k if self.settings else 0,
+                'images': self.images if self.images else None,
+                'model': target_model,
+            }
+            try:
+                sig = inspect.signature(stream_fn)
+                accepts_effort = (
+                    'effort' in sig.parameters
+                    or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                )
+            except (TypeError, ValueError):
+                accepts_effort = False
+            if accepts_effort:
+                stream_kwargs['effort'] = target_effort
+
+            for chunk in stream_fn(self.messages, **stream_kwargs):
                 response_text += chunk
                 self.response_queue.put(('chunk', chunk))
 
@@ -467,7 +505,8 @@ class DiffPanel(tk.Toplevel):
                 elif msg_type == 'error':
                     self.is_generating = False
                     self.status_label.config(text=f"Error: {content}")
-                    self.accept_btn.config(state=tk.NORMAL)
+                    has_text = bool(self.suggestion_display.get('1.0', 'end-1c'))
+                    self.accept_btn.config(state=tk.NORMAL if has_text else tk.DISABLED)
                     return
         except queue.Empty:
             pass
@@ -528,7 +567,7 @@ class DiffPanel(tk.Toplevel):
 
         # Show hunk selector bar if there are multiple changed hunks (or at least 1 when original is non-empty)
         if changed_count >= 2:
-            self.hunks_outer.pack(fill=tk.X, pady=(0, 6), before=self.accept_btn.master)
+            self.hunks_outer.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 6), before=self.paned)
             for idx, h in enumerate([hk for hk in self._hunks if not hk['equal']], 1):
                 orig_w = len(h['orig'].split())
                 sugg_w = len(h['sugg'].split())
@@ -648,7 +687,9 @@ class DiffPanel(tk.Toplevel):
         else:
             self.suggestion_display.config(state=tk.DISABLED, bg=P['sugg_bg'])
             self.edit_btn.config(text="Edit")
-            self._highlight_word_diffs()
+            self.full_suggestion_text = self.suggestion_display.get('1.0', 'end-1c')
+            self.response_text = self.full_suggestion_text
+            self._build_hunks_and_highlight()
             self.status_label.config(text="Ready for review")
 
     def _get_selected_apply_mode(self) -> str:
@@ -663,7 +704,7 @@ class DiffPanel(tk.Toplevel):
         if self.is_generating:
             return
 
-        replacement = self.suggestion_display.get('1.0', tk.END).rstrip('\n')
+        replacement = self.suggestion_display.get('1.0', 'end-1c')
         apply_mode = self._get_selected_apply_mode()
 
         if not replacement.strip() and apply_mode in ("replace", "full"):
@@ -673,9 +714,12 @@ class DiffPanel(tk.Toplevel):
                 return
 
         if self.on_accept:
-            try:
+            sig = inspect.signature(self.on_accept)
+            params = list(sig.parameters.values())
+            accepts_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+            if accepts_varargs or len(params) >= 5:
                 self.on_accept(replacement, self.start_index, self.end_index, self.original_text, apply_mode)
-            except TypeError:
+            else:
                 self.on_accept(replacement, self.start_index, self.end_index, self.original_text)
 
         self.destroy()

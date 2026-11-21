@@ -10,6 +10,7 @@ import ast
 import bisect
 import csv
 import datetime
+import decimal
 import io
 import json
 import math
@@ -254,8 +255,15 @@ def col_letter_to_index(col_str: str) -> int:
     return idx - 1
 
 
-_CELL_REF_RE = re.compile(r"^\$?([A-Za-z]+)\$?([0-9]+)$")
-_RANGE_REF_RE = re.compile(r"^\$?([A-Za-z]+)\$?([0-9]+):\$?([A-Za-z]+)\$?([0-9]+)$")
+MAX_SHEET_ROWS = 1048576  # 1-based Excel max row (0-based 0..1048575)
+MAX_SHEET_COLS = 16384    # Excel max column XFD (0-based 0..16383)
+
+_CELL_REF_RE = re.compile(r"^\$?([A-Za-z]{1,3})\$?([1-9][0-9]*)$")
+_RANGE_REF_RE = re.compile(r"^\$?([A-Za-z]{1,3})\$?([1-9][0-9]*):\$?([A-Za-z]{1,3})\$?([1-9][0-9]*)$")
+
+
+def _is_valid_sheet_coord(row: int, col: int) -> bool:
+    return 0 <= row < MAX_SHEET_ROWS and 0 <= col < MAX_SHEET_COLS
 
 
 def parse_cell_ref(ref_str: str) -> Optional[Tuple[int, int]]:
@@ -267,6 +275,8 @@ def parse_cell_ref(ref_str: str) -> Optional[Tuple[int, int]]:
     try:
         col = col_letter_to_index(col_str)
         row = int(row_str) - 1
+        if not _is_valid_sheet_coord(row, col):
+            return None
         return (row, col)
     except Exception:
         return None
@@ -288,6 +298,8 @@ def parse_range_ref(range_str: str) -> Optional[Tuple[Tuple[int, int], Tuple[int
         r1 = int(r1_str) - 1
         c2 = col_letter_to_index(c2_str)
         r2 = int(r2_str) - 1
+        if not (_is_valid_sheet_coord(r1, c1) and _is_valid_sheet_coord(r2, c2)):
+            return None
         return ((min(r1, r2), min(c1, c2)), (max(r1, r2), max(c1, c2)))
     except Exception:
         return None
@@ -304,6 +316,19 @@ def expand_range(r1: int, c1: int, r2: int, c2: int) -> List[Tuple[int, int]]:
     return cells
 
 
+def _transform_outside_strings(formula: str, pattern: re.Pattern, repl_fn: Callable) -> str:
+    """Apply regex substitution only outside single/double-quoted string literals."""
+    parts = []
+    last_end = 0
+    for m in re.finditer(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')', formula):
+        chunk = formula[last_end:m.start()]
+        parts.append(pattern.sub(repl_fn, chunk))
+        parts.append(m.group(0))
+        last_end = m.end()
+    parts.append(pattern.sub(repl_fn, formula[last_end:]))
+    return "".join(parts)
+
+
 def shift_formula_references(formula: str, dr: int, dc: int) -> str:
     """Shift relative cell/column/row coordinates in an Excel formula by (dr, dc), preserving $ locks."""
     if not formula or not formula.startswith("="):
@@ -315,8 +340,10 @@ def shift_formula_references(formula: str, dr: int, dc: int) -> str:
                 ac1, c1, ac2, c2 = m.group(1), m.group(2), m.group(3), m.group(4)
                 i1 = col_letter_to_index(c1)
                 i2 = col_letter_to_index(c2)
-                ni1 = i1 if ac1 else max(0, i1 + dc)
-                ni2 = i2 if ac2 else max(0, i2 + dc)
+                if not (0 <= i1 < MAX_SHEET_COLS and 0 <= i2 < MAX_SHEET_COLS):
+                    return m.group(0)
+                ni1 = i1 if ac1 else max(0, min(MAX_SHEET_COLS - 1, i1 + dc))
+                ni2 = i2 if ac2 else max(0, min(MAX_SHEET_COLS - 1, i2 + dc))
                 s1 = f"${col_index_to_letter(ni1)}" if ac1 else col_index_to_letter(ni1)
                 s2 = f"${col_index_to_letter(ni2)}" if ac2 else col_index_to_letter(ni2)
                 return f"{s1}:{s2}"
@@ -324,37 +351,149 @@ def shift_formula_references(formula: str, dr: int, dc: int) -> str:
                 ar1, r1, ar2, r2 = m.group(5), m.group(6), m.group(7), m.group(8)
                 row1 = int(r1) - 1
                 row2 = int(r2) - 1
-                nr1 = row1 if ar1 else max(0, row1 + dr)
-                nr2 = row2 if ar2 else max(0, row2 + dr)
+                if not (0 <= row1 < MAX_SHEET_ROWS and 0 <= row2 < MAX_SHEET_ROWS):
+                    return m.group(0)
+                nr1 = row1 if ar1 else max(0, min(MAX_SHEET_ROWS - 1, row1 + dr))
+                nr2 = row2 if ar2 else max(0, min(MAX_SHEET_ROWS - 1, row2 + dr))
                 s1 = f"${nr1 + 1}" if ar1 else str(nr1 + 1)
                 s2 = f"${nr2 + 1}" if ar2 else str(nr2 + 1)
                 return f"{s1}:{s2}"
             abs_c, col_str, abs_r, row_str = m.group(9), m.group(10), m.group(11), m.group(12)
             c = col_letter_to_index(col_str)
             r = int(row_str) - 1
-            new_c = c if abs_c else max(0, c + dc)
-            new_r = r if abs_r else max(0, r + dr)
+            if not _is_valid_sheet_coord(r, c):
+                return m.group(0)
+            new_c = c if abs_c else max(0, min(MAX_SHEET_COLS - 1, c + dc))
+            new_r = r if abs_r else max(0, min(MAX_SHEET_ROWS - 1, r + dr))
             c_str = f"${col_index_to_letter(new_c)}" if abs_c else col_index_to_letter(new_c)
             r_str = f"${new_r + 1}" if abs_r else str(new_r + 1)
             return f"{c_str}{r_str}"
         except Exception:
             return m.group(0)
 
-    # Process outside string literals
-    parts = []
-    last_end = 0
     pattern = re.compile(
-        r'(?<![A-Za-z0-9_])(\$?)([A-Za-z]{1,3}):(\$?)([A-Za-z]{1,3})(?![A-Za-z0-9_])'
-        r'|(?<![A-Za-z0-9_])(\$?)([0-9]+):(\$?)([0-9]+)(?![A-Za-z0-9_])'
-        r'|(\$?)([A-Za-z]{1,3})(\$?)([0-9]+)'
+        r'(?<![A-Za-z0-9_])(\$?)([A-Za-z]{1,3}):(\$?)([A-Za-z]{1,3})(?![A-Za-z0-9_(])'
+        r'|(?<![A-Za-z0-9_])(\$?)([1-9][0-9]*):(\$?)([1-9][0-9]*)(?![A-Za-z0-9_(])'
+        r'|(?<![A-Za-z0-9_])(\$?)([A-Za-z]{1,3})(\$?)([1-9][0-9]*)(?![A-Za-z0-9_(])'
     )
-    for m in re.finditer(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')', formula):
-        chunk = formula[last_end:m.start()]
-        parts.append(pattern.sub(_repl, chunk))
-        parts.append(m.group(0))
-        last_end = m.end()
-    parts.append(pattern.sub(_repl, formula[last_end:]))
-    return "".join(parts)
+    return _transform_outside_strings(formula, pattern, _repl)
+
+
+def _adjust_formula_for_structural_edit(formula: str, axis: str, boundary: int, delta: int) -> str:
+    """Adjust all formula references for row/col insert or delete, ignoring $ locks and marking deleted targets #REF!."""
+    if not formula or not formula.startswith("=") or delta == 0:
+        return formula
+
+    def _adj_range_pair(v1: int, v2: int) -> Optional[Tuple[int, int]]:
+        lo, hi = min(v1, v2), max(v1, v2)
+        if delta > 0:
+            n_lo = lo + delta if lo >= boundary else lo
+            n_hi = hi + delta if hi >= boundary else hi
+        else:
+            del_start = boundary
+            del_end = boundary + (-delta) - 1
+            if lo >= del_start and hi <= del_end:
+                return None
+            n_lo = lo if lo < del_start else (del_start if lo <= del_end else lo + delta)
+            n_hi = hi if hi < del_start else (del_start - 1 if hi <= del_end else hi + delta)
+        return (n_lo, n_hi) if v1 <= v2 else (n_hi, n_lo)
+
+    def _adj_single(v: int) -> Optional[int]:
+        if delta > 0:
+            return v + delta if v >= boundary else v
+        del_start = boundary
+        del_end = boundary + (-delta) - 1
+        if del_start <= v <= del_end:
+            return None
+        return v + delta if v > del_end else v
+
+    def _repl(m):
+        try:
+            # 1. Bounded cell range: [$]C1[$]R1:[$]C2[$]R2
+            if m.group(2) is not None:
+                ac1, c1_s, ar1, r1_s, ac2, c2_s, ar2, r2_s = m.groups()[:8]
+                c1, r1 = col_letter_to_index(c1_s), int(r1_s) - 1
+                c2, r2 = col_letter_to_index(c2_s), int(r2_s) - 1
+                if not (_is_valid_sheet_coord(r1, c1) and _is_valid_sheet_coord(r2, c2)):
+                    return m.group(0)
+                if axis == "row":
+                    res = _adj_range_pair(r1, r2)
+                    if res is None:
+                        return "#REF!"
+                    nr1, nr2 = res
+                    nc1, nc2 = c1, c2
+                else:
+                    res = _adj_range_pair(c1, c2)
+                    if res is None:
+                        return "#REF!"
+                    nc1, nc2 = res
+                    nr1, nr2 = r1, r2
+                if not (_is_valid_sheet_coord(nr1, nc1) and _is_valid_sheet_coord(nr2, nc2)):
+                    return "#REF!"
+                p1 = f"{'$' if ac1 else ''}{col_index_to_letter(nc1)}{'$' if ar1 else ''}{nr1 + 1}"
+                p2 = f"{'$' if ac2 else ''}{col_index_to_letter(nc2)}{'$' if ar2 else ''}{nr2 + 1}"
+                return f"{p1}:{p2}"
+
+            # 2. Whole-column range: [$]C1:[$]C2
+            if m.group(10) is not None:
+                ac1, c1_s, ac2, c2_s = m.group(9), m.group(10), m.group(11), m.group(12)
+                c1, c2 = col_letter_to_index(c1_s), col_letter_to_index(c2_s)
+                if not (0 <= c1 < MAX_SHEET_COLS and 0 <= c2 < MAX_SHEET_COLS):
+                    return m.group(0)
+                if axis != "col":
+                    return m.group(0)
+                res = _adj_range_pair(c1, c2)
+                if res is None:
+                    return "#REF!"
+                nc1, nc2 = res
+                if not (0 <= nc1 < MAX_SHEET_COLS and 0 <= nc2 < MAX_SHEET_COLS):
+                    return "#REF!"
+                return f"{'$' if ac1 else ''}{col_index_to_letter(nc1)}:{'$' if ac2 else ''}{col_index_to_letter(nc2)}"
+
+            # 3. Whole-row range: [$]R1:[$]R2
+            if m.group(14) is not None:
+                ar1, r1_s, ar2, r2_s = m.group(13), m.group(14), m.group(15), m.group(16)
+                r1, r2 = int(r1_s) - 1, int(r2_s) - 1
+                if not (0 <= r1 < MAX_SHEET_ROWS and 0 <= r2 < MAX_SHEET_ROWS):
+                    return m.group(0)
+                if axis != "row":
+                    return m.group(0)
+                res = _adj_range_pair(r1, r2)
+                if res is None:
+                    return "#REF!"
+                nr1, nr2 = res
+                if not (0 <= nr1 < MAX_SHEET_ROWS and 0 <= nr2 < MAX_SHEET_ROWS):
+                    return "#REF!"
+                return f"{'$' if ar1 else ''}{nr1 + 1}:{'$' if ar2 else ''}{nr2 + 1}"
+
+            # 4. Single cell ref: [$]C[$]R
+            ac, col_s, ar, row_s = m.group(17), m.group(18), m.group(19), m.group(20)
+            c, r = col_letter_to_index(col_s), int(row_s) - 1
+            if not _is_valid_sheet_coord(r, c):
+                return m.group(0)
+            if axis == "row":
+                nr = _adj_single(r)
+                if nr is None:
+                    return "#REF!"
+                nc = c
+            else:
+                nc = _adj_single(c)
+                if nc is None:
+                    return "#REF!"
+                nr = r
+            if not _is_valid_sheet_coord(nr, nc):
+                return "#REF!"
+            return f"{'$' if ac else ''}{col_index_to_letter(nc)}{'$' if ar else ''}{nr + 1}"
+        except Exception:
+            return m.group(0)
+
+    pattern = re.compile(
+        r'(?<![A-Za-z0-9_])(\$?)([A-Za-z]{1,3})(\$?)([1-9][0-9]*):(\$?)([A-Za-z]{1,3})(\$?)([1-9][0-9]*)(?![A-Za-z0-9_(])'
+        r'|(?<![A-Za-z0-9_])(\$?)([A-Za-z]{1,3}):(\$?)([A-Za-z]{1,3})(?![A-Za-z0-9_(])'
+        r'|(?<![A-Za-z0-9_])(\$?)([1-9][0-9]*):(\$?)([1-9][0-9]*)(?![A-Za-z0-9_(])'
+        r'|(?<![A-Za-z0-9_])(\$?)([A-Za-z]{1,3})(\$?)([1-9][0-9]*)(?![A-Za-z0-9_(])'
+    )
+    return _transform_outside_strings(formula, pattern, _repl)
 
 
 def preprocess_excel_formula(expr: str) -> str:
@@ -365,7 +504,7 @@ def preprocess_excel_formula(expr: str) -> str:
 
     def _process_chunk(chunk: str) -> str:
         # 1a. Bounded cell ranges $A$1:$B$10 -> _RANGE_('A1', 'B10')
-        range_pat = re.compile(r"(\$?[A-Za-z]{1,3}\$?[0-9]+):(\$?[A-Za-z]{1,3}\$?[0-9]+)")
+        range_pat = re.compile(r"(?<![A-Za-z0-9_])(\$?[A-Za-z]{1,3}\$?[1-9][0-9]*):(\$?[A-Za-z]{1,3}\$?[1-9][0-9]*)(?![A-Za-z0-9_(])")
         def _range_repl(m):
             c1 = m.group(1).replace('$', '')
             c2 = m.group(2).replace('$', '')
@@ -373,11 +512,11 @@ def preprocess_excel_formula(expr: str) -> str:
         chunk = range_pat.sub(_range_repl, chunk)
 
         # 1b. Whole-column ranges $E:$E or D:F -> _COLRANGE_('E', 'E')
-        col_range_pat = re.compile(r"(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3}):\$?([A-Za-z]{1,3})(?![A-Za-z0-9_])")
+        col_range_pat = re.compile(r"(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3}):\$?([A-Za-z]{1,3})(?![A-Za-z0-9_(])")
         chunk = col_range_pat.sub(lambda m: f"_COLRANGE_('{m.group(1)}', '{m.group(2)}')", chunk)
 
         # 1c. Whole-row ranges $1:$5 or 2:4 -> _ROWRANGE_(1, 5)
-        row_range_pat = re.compile(r"(?<![A-Za-z0-9_])\$?([0-9]+):\$?([0-9]+)(?![A-Za-z0-9_])")
+        row_range_pat = re.compile(r"(?<![A-Za-z0-9_])\$?([1-9][0-9]*):\$?([1-9][0-9]*)(?![A-Za-z0-9_(])")
         chunk = row_range_pat.sub(lambda m: f"_ROWRANGE_({int(m.group(1))}, {int(m.group(2))})", chunk)
 
         # 2. Caret ^ -> **
@@ -390,10 +529,19 @@ def preprocess_excel_formula(expr: str) -> str:
         chunk = re.sub(r'(?<![<>!=])=(?![=])', '==', chunk)
 
         # 5. Strip $ from remaining single cell references $A$1, A$1, $A1 -> A1
-        single_ref_pat = re.compile(r'(?<![A-Za-z0-9_])\$?([A-Za-z]+)\$?([0-9]+)(?![A-Za-z0-9_])')
+        single_ref_pat = re.compile(r'(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3})\$?([1-9][0-9]*)(?![A-Za-z0-9_(])')
         def _strip_dollar(m):
             return f"{m.group(1)}{m.group(2)}"
         chunk = single_ref_pat.sub(_strip_dollar, chunk)
+
+        # 6. Translate #REF! and standard error literals so Python AST doesn't treat '#' as a comment
+        chunk = chunk.replace("#REF!", "__EXCEL_REF_ERR__")
+        chunk = chunk.replace("#DIV/0!", "__EXCEL_DIV0_ERR__")
+        chunk = chunk.replace("#VALUE!", "__EXCEL_VALUE_ERR__")
+        chunk = chunk.replace("#NAME?", "__EXCEL_NAME_ERR__")
+        chunk = chunk.replace("#CIRC!", "__EXCEL_CIRC_ERR__")
+        chunk = chunk.replace("#N/A", "__EXCEL_NA_ERR__")
+        chunk = chunk.replace("#ERROR!", "__EXCEL_GENERIC_ERR__")
 
         return chunk
 
@@ -510,6 +658,16 @@ class FormulaEngine:
         ERROR_GENERIC,
     )
 
+    _AST_ERROR_TOKENS = {
+        "__EXCEL_REF_ERR__": ERROR_REF,
+        "__EXCEL_DIV0_ERR__": ERROR_DIV_ZERO,
+        "__EXCEL_VALUE_ERR__": ERROR_VALUE,
+        "__EXCEL_NAME_ERR__": ERROR_NAME,
+        "__EXCEL_CIRC_ERR__": ERROR_CIRC,
+        "__EXCEL_NA_ERR__": ERROR_NA,
+        "__EXCEL_GENERIC_ERR__": ERROR_GENERIC,
+    }
+
     MAX_AST_NODES = 500
     MAX_EXPONENT = 1000
     MAX_RANGE_CELLS = 50000
@@ -591,69 +749,159 @@ class FormulaEngine:
             result.append(args)
         return result
 
+    def _find_first_error(self, args: Any) -> Optional[str]:
+        """Return the first Excel error string encountered across nested args/ranges, if any."""
+        for x in self._flatten_values(args):
+            if isinstance(x, str) and x in self._ALL_ERRORS:
+                return x
+        return None
+
     def _to_numbers(self, args: Any) -> List[float]:
-        """Extract all numeric values from args, converting string numbers if valid."""
+        """Extract all finite numeric values from args, converting string numbers if valid."""
         flat = self._flatten_values(args)
         nums = []
         for x in flat:
-            if x is None or x is _BLANK or x == "":
+            if x is None or x is _BLANK or x == "" or isinstance(x, bool):
                 continue
-            if isinstance(x, (int, float)) and not isinstance(x, bool):
-                nums.append(float(x))
+            if isinstance(x, (int, float)):
+                f = float(x)
+                if math.isfinite(f):
+                    nums.append(f)
             elif isinstance(x, str):
+                if "_" in x:
+                    continue
                 s = x.strip().replace("$", "").replace(",", "")
                 try:
-                    nums.append(float(s))
+                    f = float(s)
+                    if math.isfinite(f):
+                        nums.append(f)
                 except ValueError:
                     pass
         return nums
+
+    def _to_scalar_number(self, val: Any) -> Optional[float]:
+        """Convert a scalar argument (or 1-cell range) to finite float, coercing blank/empty to 0.0."""
+        if isinstance(val, (list, tuple)):
+            flat = self._flatten_values(val)
+            if len(flat) != 1:
+                return None
+            val = flat[0]
+        if val is None or val is _BLANK or val == "":
+            return 0.0
+        if isinstance(val, bool):
+            return 1.0 if val else 0.0
+        if isinstance(val, (int, float)):
+            f = float(val)
+            return f if math.isfinite(f) else None
+        if isinstance(val, str):
+            if "_" in val:
+                return None
+            s = val.strip().replace("$", "").replace(",", "")
+            if not s:
+                return 0.0
+            try:
+                f = float(s)
+                return f if math.isfinite(f) else None
+            except ValueError:
+                return None
+        return None
+
+    def _safe_pow(self, base: float, exp: float) -> Union[float, str]:
+        """Safely compute base ** exp with Excel error handling for complex/overflow/div0."""
+        if not (math.isfinite(base) and math.isfinite(exp)):
+            return self.ERROR_VALUE
+        if abs(exp) > self.MAX_EXPONENT or (abs(base) > 1e50 and abs(exp) > 10):
+            return self.ERROR_VALUE
+        if base == 0.0 and exp < 0.0:
+            return self.ERROR_DIV_ZERO
+        try:
+            res = base ** exp
+        except ZeroDivisionError:
+            return self.ERROR_DIV_ZERO
+        except (OverflowError, ValueError):
+            return self.ERROR_VALUE
+        if isinstance(res, complex):
+            return self.ERROR_VALUE
+        f_res = float(res)
+        if not math.isfinite(f_res):
+            return self.ERROR_VALUE
+        return f_res
+
+    def _decimal_round_mode(self, val: Any, digits: Any, rounding_mode: str) -> Union[float, str]:
+        """Round val away from / toward zero using decimal.Decimal quantization."""
+        err = self._find_first_error((val, digits))
+        if err is not None:
+            return err
+        num = self._to_scalar_number(val)
+        d_num = self._to_scalar_number(digits)
+        if num is None or d_num is None:
+            return self.ERROR_VALUE
+        d = int(d_num)
+        if abs(d) > 300:
+            return self.ERROR_VALUE
+        try:
+            dec_val = decimal.Decimal(str(num))
+            quant = decimal.Decimal(f"1e{-d}")
+            rounded = dec_val.quantize(quant, rounding=rounding_mode)
+            f_res = float(rounded)
+            return f_res if math.isfinite(f_res) else self.ERROR_VALUE
+        except Exception:
+            return self.ERROR_VALUE
 
     # -------------------------------------------------------------------------
     # Built-in Formula Functions
     # -------------------------------------------------------------------------
 
-    def _fn_sum(self, *args) -> float:
+    def _fn_sum(self, *args) -> Union[float, str]:
+        err = self._find_first_error(args)
+        if err is not None:
+            return err
         nums = self._to_numbers(args)
         return sum(nums)
 
     def _fn_average(self, *args) -> Union[float, str]:
+        err = self._find_first_error(args)
+        if err is not None:
+            return err
         nums = self._to_numbers(args)
         if not nums:
             return self.ERROR_DIV_ZERO
         return sum(nums) / len(nums)
 
     def _fn_round(self, val: Any, digits: Any = 0) -> Union[float, str]:
+        err = self._find_first_error((val, digits))
+        if err is not None:
+            return err
+        num = self._to_scalar_number(val)
+        d_num = self._to_scalar_number(digits)
+        if num is None or d_num is None:
+            return self.ERROR_VALUE
         try:
-            num = float(self._to_numbers(val)[0])
-            d = int(float(self._to_numbers(digits)[0])) if self._to_numbers(digits) else 0
+            d = int(d_num)
             rounded = round(num, d)
+            if not math.isfinite(rounded):
+                return self.ERROR_VALUE
             return int(rounded) if d == 0 else rounded
         except Exception:
             return self.ERROR_VALUE
 
     def _fn_roundup(self, val: Any, digits: Any = 0) -> Union[float, str]:
-        try:
-            num = float(self._to_numbers(val)[0])
-            d = int(float(self._to_numbers(digits)[0])) if self._to_numbers(digits) else 0
-            factor = 10 ** d
-            return math.ceil(num * factor) / factor
-        except Exception:
-            return self.ERROR_VALUE
+        return self._decimal_round_mode(val, digits, decimal.ROUND_UP)
 
     def _fn_rounddown(self, val: Any, digits: Any = 0) -> Union[float, str]:
-        try:
-            num = float(self._to_numbers(val)[0])
-            d = int(float(self._to_numbers(digits)[0])) if self._to_numbers(digits) else 0
-            factor = 10 ** d
-            return math.floor(num * factor) / factor
-        except Exception:
-            return self.ERROR_VALUE
+        return self._decimal_round_mode(val, digits, decimal.ROUND_DOWN)
 
     def _fn_min(self, *args) -> Union[float, str]:
+        err = self._find_first_error(args)
+        if err is not None:
+            return err
         nums = self._to_numbers(args)
         return min(nums) if nums else 0.0
 
     def _fn_max(self, *args) -> Union[float, str]:
+        err = self._find_first_error(args)
+        if err is not None:
+            return err
         nums = self._to_numbers(args)
         return max(nums) if nums else 0.0
 
@@ -665,56 +913,70 @@ class FormulaEngine:
         return sum(1 for x in flat if x is not None and str(x).strip() != "")
 
     def _fn_abs(self, val: Any) -> Union[float, str]:
-        try:
-            return abs(float(self._to_numbers(val)[0]))
-        except Exception:
+        err = self._find_first_error(val)
+        if err is not None:
+            return err
+        num = self._to_scalar_number(val)
+        if num is None:
             return self.ERROR_VALUE
+        return abs(num)
 
     def _fn_sqrt(self, val: Any) -> Union[float, str]:
-        try:
-            num = float(self._to_numbers(val)[0])
-            if num < 0:
-                return self.ERROR_VALUE
-            return math.sqrt(num)
-        except Exception:
+        err = self._find_first_error(val)
+        if err is not None:
+            return err
+        num = self._to_scalar_number(val)
+        if num is None or num < 0:
             return self.ERROR_VALUE
+        return math.sqrt(num)
 
     def _fn_power(self, base: Any, exp: Any) -> Union[float, str]:
-        try:
-            b = float(self._to_numbers(base)[0])
-            e = float(self._to_numbers(exp)[0])
-            if abs(e) > self.MAX_EXPONENT or (abs(b) > 1e50 and abs(e) > 10):
-                return self.ERROR_VALUE
-            return b ** e
-        except Exception:
+        err = self._find_first_error((base, exp))
+        if err is not None:
+            return err
+        b = self._to_scalar_number(base)
+        e = self._to_scalar_number(exp)
+        if b is None or e is None:
             return self.ERROR_VALUE
+        return self._safe_pow(b, e)
 
     def _fn_mod(self, x: Any, y: Any) -> Union[float, str]:
-        try:
-            a = float(self._to_numbers(x)[0])
-            b = float(self._to_numbers(y)[0])
-            if b == 0:
-                return self.ERROR_DIV_ZERO
-            return a % b
-        except Exception:
+        err = self._find_first_error((x, y))
+        if err is not None:
+            return err
+        a = self._to_scalar_number(x)
+        b = self._to_scalar_number(y)
+        if a is None or b is None:
             return self.ERROR_VALUE
+        if b == 0:
+            return self.ERROR_DIV_ZERO
+        return a % b
 
     def _fn_int(self, val: Any) -> Union[int, str]:
-        try:
-            return int(float(self._to_numbers(val)[0]))
-        except Exception:
+        err = self._find_first_error(val)
+        if err is not None:
+            return err
+        num = self._to_scalar_number(val)
+        if num is None:
             return self.ERROR_VALUE
+        return int(num)
 
-    def _fn_product(self, *args) -> float:
+    def _fn_product(self, *args) -> Union[float, str]:
+        err = self._find_first_error(args)
+        if err is not None:
+            return err
         nums = self._to_numbers(args)
         if not nums:
             return 0.0
         p = 1.0
         for n in nums:
             p *= n
-        return p
+        return p if math.isfinite(p) else self.ERROR_VALUE
 
     def _fn_median(self, *args) -> Union[float, str]:
+        err = self._find_first_error(args)
+        if err is not None:
+            return err
         nums = sorted(self._to_numbers(args))
         n = len(nums)
         if n == 0:
@@ -723,6 +985,9 @@ class FormulaEngine:
         return (nums[mid - 1] + nums[mid]) / 2.0 if n % 2 == 0 else nums[mid]
 
     def _fn_stdev(self, *args) -> Union[float, str]:
+        err = self._find_first_error(args)
+        if err is not None:
+            return err
         nums = self._to_numbers(args)
         if len(nums) < 2:
             return self.ERROR_DIV_ZERO
@@ -731,6 +996,9 @@ class FormulaEngine:
         return math.sqrt(variance)
 
     def _fn_var(self, *args) -> Union[float, str]:
+        err = self._find_first_error(args)
+        if err is not None:
+            return err
         nums = self._to_numbers(args)
         if len(nums) < 2:
             return self.ERROR_DIV_ZERO
@@ -757,13 +1025,17 @@ class FormulaEngine:
         if val is None or val is _BLANK or val == "" or isinstance(val, bool):
             return None
         if isinstance(val, (int, float)):
-            return float(val)
+            f = float(val)
+            return f if math.isfinite(f) else None
         if isinstance(val, str):
+            if "_" in val:
+                return None
             s = val.strip().replace("$", "").replace(",", "")
             if not s:
                 return None
             try:
-                return float(s)
+                f = float(s)
+                return f if math.isfinite(f) else None
             except ValueError:
                 return None
         return None
@@ -817,35 +1089,40 @@ class FormulaEngine:
 
     def _matches_criteria(self, cv: Any, criteria: Any) -> bool:
         """Evaluate Excel COUNTIF/SUMIF/AVERAGEIF/COUNTIFS/SUMIFS criterion against cell value."""
+        if isinstance(criteria, bool):
+            return self._values_equal_excel(cv, criteria, allow_wildcards=False)
         crit_str = "" if criteria is None or criteria is _BLANK else str(criteria).strip()
         try:
-            if crit_str.startswith(">="):
-                t_num = self._try_parse_number(crit_str[2:].strip())
-                c_num = self._try_parse_number(cv)
-                if t_num is not None and c_num is not None:
-                    return c_num >= t_num
-                return str(cv).lower() >= crit_str[2:].strip().lower()
-            if crit_str.startswith("<="):
-                t_num = self._try_parse_number(crit_str[2:].strip())
-                c_num = self._try_parse_number(cv)
-                if t_num is not None and c_num is not None:
-                    return c_num <= t_num
-                return str(cv).lower() <= crit_str[2:].strip().lower()
+            for op in (">=", "<=", ">", "<"):
+                if crit_str.startswith(op):
+                    if cv is None or cv is _BLANK or cv == "" or isinstance(cv, bool):
+                        return False
+                    rhs = crit_str[len(op):].strip()
+                    t_num = self._try_parse_number(rhs)
+                    c_num = self._try_parse_number(cv)
+                    if t_num is not None:
+                        if c_num is None:
+                            return False
+                        if op == ">=":
+                            return c_num >= t_num
+                        if op == "<=":
+                            return c_num <= t_num
+                        if op == ">":
+                            return c_num > t_num
+                        return c_num < t_num
+                    if c_num is not None:
+                        return False
+                    cs, rs = str(cv).lower(), rhs.lower()
+                    if op == ">=":
+                        return cs >= rs
+                    if op == "<=":
+                        return cs <= rs
+                    if op == ">":
+                        return cs > rs
+                    return cs < rs
             if crit_str.startswith("<>"):
                 rhs = crit_str[2:].strip()
                 return not self._values_equal_excel(cv, rhs, allow_wildcards=True)
-            if crit_str.startswith(">"):
-                t_num = self._try_parse_number(crit_str[1:].strip())
-                c_num = self._try_parse_number(cv)
-                if t_num is not None and c_num is not None:
-                    return c_num > t_num
-                return str(cv).lower() > crit_str[1:].strip().lower()
-            if crit_str.startswith("<"):
-                t_num = self._try_parse_number(crit_str[1:].strip())
-                c_num = self._try_parse_number(cv)
-                if t_num is not None and c_num is not None:
-                    return c_num < t_num
-                return str(cv).lower() < crit_str[1:].strip().lower()
             if crit_str.startswith("="):
                 rhs = crit_str[1:].strip()
                 return self._values_equal_excel(cv, rhs, allow_wildcards=True)
@@ -857,7 +1134,7 @@ class FormulaEngine:
         return t_val if self._is_truthy(cond) else f_val
 
     def _fn_iferror(self, val: Any, alt_val: Any = "") -> Any:
-        if isinstance(val, str) and val.startswith("#"):
+        if isinstance(val, str) and val in self._ALL_ERRORS:
             return alt_val
         return val
 
@@ -870,7 +1147,7 @@ class FormulaEngine:
         return val is _BLANK or val == ""
 
     def _fn_iserror(self, val: Any) -> bool:
-        return isinstance(val, str) and val.startswith("#")
+        return isinstance(val, str) and val in self._ALL_ERRORS
 
     def _fn_isna(self, val: Any) -> bool:
         return val == self.ERROR_NA
@@ -879,7 +1156,7 @@ class FormulaEngine:
         return isinstance(val, (int, float)) and not isinstance(val, bool)
 
     def _fn_istext(self, val: Any) -> bool:
-        return isinstance(val, str) and not val.startswith("#")
+        return isinstance(val, str) and val not in self._ALL_ERRORS
 
     def _fn_sumif(self, criteria_range: Any, criteria: Any, sum_range: Any = None) -> float:
         c_vals = self._flatten_values(criteria_range)
@@ -1010,6 +1287,9 @@ class FormulaEngine:
 
     def _fn_sparkline(self, *args) -> str:
         """Render inline Unicode block sparklines from a numeric range (e.g. ▂▄▆█▃)."""
+        err = self._find_first_error(args)
+        if err is not None:
+            return err
         nums = self._to_numbers(args)
         if not nums:
             return ""
@@ -1065,7 +1345,7 @@ class FormulaEngine:
         l_num = self._try_parse_number(lookup_val)
         best_row = None
         for row in matrix:
-            if not row or row[0] == "":
+            if not row or row[0] == "" or row[0] is _BLANK:
                 continue
             r_num = self._try_parse_number(row[0])
             if l_num is not None and r_num is not None:
@@ -1226,9 +1506,9 @@ class FormulaEngine:
     def set_cell(self, row: int, col: int, raw_value: str):
         """Set raw cell value or formula."""
         raw_str = str(raw_value) if raw_value is not None else ""
+        self.computed_values.clear()
         if raw_str == "":
             self.raw_cells.pop((row, col), None)
-            self.computed_values.pop((row, col), None)
         else:
             self.raw_cells[(row, col)] = raw_str
 
@@ -1243,8 +1523,18 @@ class FormulaEngine:
         return self.evaluate_cell(row, col)
 
     def evaluate_cell(self, row: int, col: int) -> Any:
-        """Recursively evaluate cell, detecting circular references."""
-        raw = self.raw_cells.get((row, col), "")
+        """Recursively evaluate cell, detecting circular references and memoizing results."""
+        # Circular reference check MUST precede cache lookup
+        if (row, col) in self._eval_stack:
+            return self.ERROR_CIRC
+
+        if (row, col) in self.computed_values:
+            return self.computed_values[(row, col)]
+
+        if (row, col) not in self.raw_cells:
+            return ""
+
+        raw = self.raw_cells[(row, col)]
         raw_str = str(raw) if raw is not None else ""
         if raw_str.startswith("'"):
             # Excel-style explicit text escape, e.g. '= literal text
@@ -1254,32 +1544,35 @@ class FormulaEngine:
         if not raw_str or not raw_str.startswith("="):
             # Literal constant
             if raw_str == "":
-                self.computed_values[(row, col)] = ""
                 return ""
-            try:
-                # If numeric string, store as float/int
-                if "." in raw_str:
-                    val = float(raw_str)
-                else:
-                    val = int(raw_str)
-            except ValueError:
-                val = raw
+            val: Any = raw
+            if "_" not in raw_str:
+                try:
+                    # Parse integer, decimal, or finite scientific notation (e.g. 1e5)
+                    if "." in raw_str or "e" in raw_str.lower():
+                        parsed = float(raw_str)
+                        if math.isfinite(parsed):
+                            val = parsed
+                    else:
+                        val = int(raw_str)
+                except ValueError:
+                    val = raw
             self.computed_values[(row, col)] = val
             return val
-
-        # Circular reference check
-        if (row, col) in self._eval_stack:
-            return self.ERROR_CIRC
 
         self._eval_stack.add((row, col))
         try:
             computed = self._eval_formula(raw_str[1:], row, col)
-        except Exception as e:
+        except Exception:
             computed = self.ERROR_GENERIC
         finally:
             self._eval_stack.discard((row, col))
 
-        self.computed_values[(row, col)] = computed
+        if computed is _BLANK:
+            computed = ""
+        # Avoid poisoning computed_values with #CIRC! while outer cells remain on _eval_stack
+        if not (computed == self.ERROR_CIRC and self._eval_stack):
+            self.computed_values[(row, col)] = computed
         return computed
 
     def recalculate_all(self):
@@ -1332,7 +1625,10 @@ class FormulaEngine:
         for r in range(min_r, max_r + 1):
             row_vals = []
             for c in range(min_c, max_c + 1):
-                v = self.evaluate_cell(r, c)
+                if (r, c) not in self.raw_cells:
+                    v: Any = _BLANK
+                else:
+                    v = self.evaluate_cell(r, c)
                 row_vals.append(v)
                 flat_vals.append(v)
             matrix.append(row_vals)
@@ -1401,11 +1697,13 @@ class FormulaEngine:
 
         elif isinstance(node, ast.Name):
             name_upper = node.id.upper()
+            if name_upper in self._AST_ERROR_TOKENS:
+                return self._AST_ERROR_TOKENS[name_upper]
             cell_pos = parse_cell_ref(node.id)
             if cell_pos is not None:
-                val = self.evaluate_cell(cell_pos[0], cell_pos[1])
-                if val == "" and cell_pos not in self.raw_cells:
+                if cell_pos not in self.raw_cells:
                     return _BLANK
+                val = self.evaluate_cell(cell_pos[0], cell_pos[1])
                 return val
             if name_upper == "TRUE":
                 return True
@@ -1427,35 +1725,42 @@ class FormulaEngine:
                 r_str = "" if right is None or right is _BLANK else str(right)
                 return l_str + r_str
 
-            try:
-                l_num = 0.0 if (left is _BLANK or left == "") else float(left)
-                r_num = 0.0 if (right is _BLANK or right == "") else float(right)
-            except (ValueError, TypeError):
+            l_num = self._to_scalar_number(left)
+            r_num = self._to_scalar_number(right)
+            if l_num is None or r_num is None:
                 if isinstance(node.op, ast.Add):
                     ls = "" if left is _BLANK or left is None else str(left)
                     rs = "" if right is _BLANK or right is None else str(right)
                     return ls + rs
                 return self.ERROR_VALUE
 
-            if isinstance(node.op, ast.Add):
-                return l_num + r_num
-            elif isinstance(node.op, ast.Sub):
-                return l_num - r_num
-            elif isinstance(node.op, ast.Mult):
-                return l_num * r_num
-            elif isinstance(node.op, ast.Div):
-                if r_num == 0:
-                    return self.ERROR_DIV_ZERO
-                return l_num / r_num
-            elif isinstance(node.op, ast.Pow):
-                if abs(r_num) > self.MAX_EXPONENT or (abs(l_num) > 1e50 and abs(r_num) > 10):
-                    return self.ERROR_VALUE
-                return l_num ** r_num
-            elif isinstance(node.op, ast.Mod):
-                if r_num == 0:
-                    return self.ERROR_DIV_ZERO
-                return l_num % r_num
-            return self.ERROR_VALUE
+            res: Any = None
+            try:
+                if isinstance(node.op, ast.Add):
+                    res = l_num + r_num
+                elif isinstance(node.op, ast.Sub):
+                    res = l_num - r_num
+                elif isinstance(node.op, ast.Mult):
+                    res = l_num * r_num
+                elif isinstance(node.op, ast.Div):
+                    if r_num == 0:
+                        return self.ERROR_DIV_ZERO
+                    res = l_num / r_num
+                elif isinstance(node.op, ast.Pow):
+                    return self._safe_pow(l_num, r_num)
+                elif isinstance(node.op, ast.Mod):
+                    if r_num == 0:
+                        return self.ERROR_DIV_ZERO
+                    res = l_num % r_num
+            except ZeroDivisionError:
+                return self.ERROR_DIV_ZERO
+            except (OverflowError, ValueError):
+                return self.ERROR_VALUE
+            if res is None:
+                return self.ERROR_VALUE
+            if isinstance(res, float) and not math.isfinite(res):
+                return self.ERROR_VALUE
+            return res
 
         elif isinstance(node, ast.UnaryOp):
             operand = self._eval_ast_node(node.operand, cur_r, cur_c)
@@ -1463,9 +1768,8 @@ class FormulaEngine:
                 return operand
             if isinstance(node.op, ast.Not):
                 return not self._is_truthy(operand)
-            try:
-                num = 0.0 if (operand is _BLANK or operand == "") else float(operand)
-            except (ValueError, TypeError):
+            num = self._to_scalar_number(operand)
+            if num is None:
                 return self.ERROR_VALUE
             if isinstance(node.op, ast.USub):
                 return -num
@@ -1517,8 +1821,11 @@ class FormulaEngine:
                         c2 = col_letter_to_index(c2_str)
                     except Exception:
                         return self.ERROR_REF
-                    max_r = max((r for (r, _c) in self.raw_cells.keys()), default=0)
-                    return self._build_cell_range(0, max_r, min(c1, c2), max(c1, c2))
+                    min_c, max_c = min(c1, c2), max(c1, c2)
+                    if min_c < 0 or max_c >= MAX_SHEET_COLS:
+                        return self.ERROR_REF
+                    max_r = max((r for (r, c) in self.raw_cells.keys() if min_c <= c <= max_c), default=0)
+                    return self._build_cell_range(0, max_r, min_c, max_c)
 
                 if func_name == "_ROWRANGE_":
                     if len(node.args) < 2:
@@ -1528,8 +1835,11 @@ class FormulaEngine:
                         r2 = int(self._eval_ast_node(node.args[1], cur_r, cur_c)) - 1
                     except Exception:
                         return self.ERROR_REF
-                    max_c = max((c for (_r, c) in self.raw_cells.keys()), default=0)
-                    return self._build_cell_range(min(r1, r2), max(r1, r2), 0, max_c)
+                    min_r, max_r = min(r1, r2), max(r1, r2)
+                    if min_r < 0 or max_r >= MAX_SHEET_ROWS:
+                        return self.ERROR_REF
+                    max_c = max((c for (r, c) in self.raw_cells.keys() if min_r <= r <= max_r), default=0)
+                    return self._build_cell_range(min_r, max_r, 0, max_c)
 
                 # Short-circuit control flow & type inspection functions
                 if func_name == "IF":
@@ -1550,7 +1860,7 @@ class FormulaEngine:
                     if len(node.args) < 2:
                         return self.ERROR_VALUE
                     primary = self._eval_ast_node(node.args[0], cur_r, cur_c)
-                    if isinstance(primary, str) and primary.startswith("#"):
+                    if isinstance(primary, str) and primary in self._ALL_ERRORS:
                         fallback = self._eval_ast_node(node.args[1], cur_r, cur_c)
                         return "" if fallback is _BLANK else fallback
                     return "" if primary is _BLANK else primary
@@ -1574,7 +1884,7 @@ class FormulaEngine:
                     if not node.args:
                         return self.ERROR_VALUE
                     val = self._eval_ast_node(node.args[0], cur_r, cur_c)
-                    return isinstance(val, str) and val.startswith("#")
+                    return isinstance(val, str) and val in self._ALL_ERRORS
 
                 if func_name == "ISNA":
                     if not node.args:
@@ -1592,7 +1902,7 @@ class FormulaEngine:
                     if not node.args:
                         return self.ERROR_VALUE
                     val = self._eval_ast_node(node.args[0], cur_r, cur_c)
-                    return isinstance(val, str) and not val.startswith("#")
+                    return isinstance(val, str) and val not in self._ALL_ERRORS
 
                 if func_name in ("AND", "OR"):
                     if not node.args:
@@ -1869,26 +2179,27 @@ class SpreadsheetGrid(tk.Canvas):
         base_h = self.DEFAULT_ROW_HEIGHT
         default_wrap = getattr(self.tab_owner, "default_wrap", False)
 
-        # Dynamic expansion for wrapped cells
+        # Dynamic expansion for wrapped cells (including sheet-wide default_wrap)
         max_req_h = base_h
-        for (r, c), st in self.engine.cell_styles.items():
-            if r == row and (st.get("wrap", False) or default_wrap):
-                raw = self.engine.get_raw(r, c)
-                if raw:
-                    w = self.get_col_width(c)
-                    val = self.engine.get_value(r, c)
-                    txt = str(val) if (val != "" and val is not None) else str(raw)
-                    if txt:
-                        font_obj = self._get_font("Segoe UI", max(7, min(24, int(9 * self.zoom_factor))), "normal")
-                        avail_w = max(24, w - 12)
-                        lines_count = 0
-                        for para in txt.split("\n"):
-                            p_w = font_obj.measure(para)
-                            lines_count += max(1, math.ceil(p_w / avail_w))
-                        line_h = font_obj.metrics("linespace")
-                        req_h = max(base_h, lines_count * line_h + 8)
-                        if req_h > max_req_h:
-                            max_req_h = min(320, req_h)
+        for (r, c), raw in self.engine.raw_cells.items():
+            if r != row or not raw:
+                continue
+            st = self.engine.cell_styles.get((r, c), {})
+            if default_wrap or st.get("wrap", False):
+                w = self.get_col_width(c)
+                val = self.engine.get_value(r, c)
+                txt = str(val) if (val != "" and val is not None) else str(raw)
+                if txt:
+                    font_obj = self._get_font("Segoe UI", max(7, min(24, int(9 * self.zoom_factor))), "normal")
+                    avail_w = max(24, w - 12)
+                    lines_count = 0
+                    for para in txt.split("\n"):
+                        p_w = font_obj.measure(para)
+                        lines_count += max(1, math.ceil(p_w / avail_w))
+                    line_h = font_obj.metrics("linespace")
+                    req_h = max(base_h, lines_count * line_h + 8)
+                    if req_h > max_req_h:
+                        max_req_h = min(320, req_h)
         return max(16, int(max_req_h * self.zoom_factor if max_req_h == base_h else max_req_h))
 
     def set_row_height(self, row: int, height: int):
@@ -1968,7 +2279,7 @@ class SpreadsheetGrid(tk.Canvas):
                     try:
                         self._last_vx0 = vx0
                         self._last_vy0 = vy0
-                        if self.freeze_top_row and self.active_cell[0] == 0:
+                        if self.freeze_top_row and min(self.sel_start[0], self.sel_end[0]) == 0:
                             self._draw_selection_layers(r_c0, r_c1, r_r0, r_r1)
                         self._draw_floating_headers_and_corner(vx0, vy0, vx1, vy1, r_c0, r_c1, r_r0, r_r1)
                         if self.is_editing and self.editor_entry:
@@ -2052,7 +2363,7 @@ class SpreadsheetGrid(tk.Canvas):
     def _do_redraw(self):
         if self.is_editing and self.find_withtag("editor_win"):
             self.delete(
-                "grid", "cell_text", "cell_bg", "frozen_row",
+                "grid", "cell_text", "cell_bg", "frozen_row", "frozen_hdr",
                 "header_row", "header_col", "corner", "sel_overlay",
                 "hdr_overlay", "formula_ref_hl"
             )
@@ -2114,7 +2425,7 @@ class SpreadsheetGrid(tk.Canvas):
                     f_slant = "italic" if is_italic else "roman"
                     font_obj = self._get_font(f_family, f_size, f_weight, f_slant, int(is_underline))
 
-                    if isinstance(val, str) and val.startswith("#"):
+                    if isinstance(val, str) and val in FormulaEngine._ALL_ERRORS:
                         fg_color = "#dc2626"
                     else:
                         fg_color = _normalize_hex_color(st.get("fg")) or "#000000"
@@ -2184,6 +2495,12 @@ class SpreadsheetGrid(tk.Canvas):
                             font=font_obj, fill=fg_color, tags="cell_text"
                         )
 
+        # Enforce strict base layer z-order: cell_bg < grid < cell_text
+        if self.find_withtag("cell_bg") and self.find_withtag("grid"):
+            self.tag_lower("cell_bg", "grid")
+        if self.find_withtag("cell_text") and self.find_withtag("grid"):
+            self.tag_raise("cell_text", "grid")
+
         # 2. Selection Layers & Floating Headers / Frozen Row / Corner Box
         self._draw_selection_layers(start_col, end_col, start_row, end_row)
         self._draw_floating_headers_and_corner(vx0, vy0, vx1, vy1, start_col, end_col, start_row, end_row)
@@ -2202,7 +2519,7 @@ class SpreadsheetGrid(tk.Canvas):
         end_row: int,
     ):
         """Render or reposition floating column/row headers, frozen top row, corner, and header highlights."""
-        self.delete("frozen_row", "header_row", "header_col", "corner", "hdr_overlay")
+        self.delete("frozen_row", "frozen_hdr", "header_row", "header_col", "corner", "hdr_overlay")
         f_size = max(7, min(24, int(9 * self.zoom_factor)))
 
         # Freeze Top Row (Pinned Header Row 1)
@@ -2238,7 +2555,7 @@ class SpreadsheetGrid(tk.Canvas):
                             "italic" if is_italic else "roman",
                             int(is_underline),
                         )
-                        fg_col = "#dc2626" if (isinstance(val, str) and val.startswith("#")) else (_normalize_hex_color(st.get("fg")) or "#1e1b4b")
+                        fg_col = "#dc2626" if (isinstance(val, str) and val in FormulaEngine._ALL_ERRORS) else (_normalize_hex_color(st.get("fg")) or "#1e1b4b")
                         single_txt = txt.replace("\r\n", " ").replace("\n", " ")
                         avail_px = max(10, w - 10)
                         if f_obj.measure(single_txt) <= avail_px:
@@ -2334,12 +2651,12 @@ class SpreadsheetGrid(tk.Canvas):
             frozen_y1 = frozen_y0 + frozen_h
             self.create_rectangle(
                 hdr_x0, frozen_y0, hdr_x1, frozen_y1,
-                fill="#ede9fe", outline=self._grid_line_color, width=1, tags="corner"
+                fill="#ede9fe", outline=self._grid_line_color, width=1, tags="frozen_hdr"
             )
             self.create_text(
                 hdr_x0 + self.header_col_width // 2, frozen_y0 + frozen_h // 2,
                 text="1", font=("Segoe UI", f_size, "bold"),
-                fill=self._accent_color, tags="corner"
+                fill=self._accent_color, tags="frozen_hdr"
             )
 
         # Top-Left Corner Box
@@ -2354,11 +2671,19 @@ class SpreadsheetGrid(tk.Canvas):
             fill="#a78bfa", outline="", tags="corner"
         )
 
-        # Ensure active selection outlines remain below newly created headers/corner
-        for hdr_tag in ("frozen_row", "header_row", "header_col", "corner"):
+        # Ensure active selection outlines remain below newly created headers/corner,
+        # while frozen Row 0 selection outlines stay above frozen_row and below headers/corner.
+        for hdr_tag in ("frozen_row", "frozen_hdr", "header_row", "header_col", "corner"):
             if self.find_withtag(hdr_tag) and self.find_withtag("sel_fg"):
                 self.tag_lower("sel_fg", hdr_tag)
                 break
+        if self.find_withtag("frozen_sel_fg"):
+            if self.find_withtag("frozen_row"):
+                self.tag_raise("frozen_sel_fg", "frozen_row")
+            for hdr_tag in ("frozen_hdr", "header_row", "header_col", "corner"):
+                if self.find_withtag(hdr_tag):
+                    self.tag_lower("frozen_sel_fg", hdr_tag)
+                    break
 
         self._draw_header_highlights(start_col, end_col, start_row, end_row)
         if self.find_withtag("editor_win"):
@@ -2418,6 +2743,8 @@ class SpreadsheetGrid(tk.Canvas):
             # Lower sel_bg below grid and cell_text, while keeping cell_bg beneath sel_bg
             if self.find_withtag("grid"):
                 self.tag_lower("sel_bg", "grid")
+            elif self.find_withtag("cell_text"):
+                self.tag_lower("sel_bg", "cell_text")
             else:
                 self.tag_lower("sel_bg")
             if self.find_withtag("cell_bg"):
@@ -2457,30 +2784,44 @@ class SpreadsheetGrid(tk.Canvas):
             tags=("sel_overlay", "sel_fg")
         )
 
-        # If Row 0 is active cell and frozen row is pinned while scrolled down:
-        if self.freeze_top_row and vy0 > 0 and ac_r == 0:
+        # If Row 0 is active cell or multi-cell selection is pinned in frozen row while scrolled down:
+        if self.freeze_top_row and vy0 > 0:
             frozen_y0 = vy0 + self.header_row_height
             frozen_y1 = frozen_y0 + self.get_row_height(0)
-            self.create_rectangle(
-                ac_x, frozen_y0, ac_x + ac_w, frozen_y1,
-                fill="", outline=self._accent_color, width=2,
-                tags=("sel_overlay", "sel_fg")
-            )
+            if (max_sr > min_sr or max_sc > min_sc) and min_sr == 0 and max_sr == 0:
+                self.create_rectangle(
+                    sel_x1, frozen_y0, sel_x2, frozen_y1,
+                    fill="", outline=self._selection_border, width=1.5,
+                    tags=("sel_overlay", "frozen_sel_fg")
+                )
+            if ac_r == 0:
+                self.create_rectangle(
+                    ac_x, frozen_y0, ac_x + ac_w, frozen_y1,
+                    fill="", outline=self._accent_color, width=2,
+                    tags=("sel_overlay", "frozen_sel_fg")
+                )
 
-        # Fill handle square
-        fh_x = sel_x2
-        fh_y = sel_y2
+        # Fill handle square (using frozen-aware bounding box)
+        _fh_x0, _fh_y0, fh_x, fh_y = self._get_selection_bbox_canvas()
+        fh_tag = "frozen_sel_fg" if (self.freeze_top_row and vy0 > 0 and max_sr == 0) else "sel_fg"
         self.create_rectangle(
             fh_x - 4, fh_y - 4, fh_x + 2, fh_y + 2,
             fill=self._accent_color, outline="#ffffff", width=1,
-            tags=("sel_overlay", "sel_fg")
+            tags=("sel_overlay", fh_tag)
         )
 
-        # Lower sel_fg below floating headers and corner box
-        for hdr_tag in ("frozen_row", "header_row", "header_col", "corner"):
+        # Lower sel_fg below floating headers and corner box; keep frozen_sel_fg above frozen_row
+        for hdr_tag in ("frozen_row", "frozen_hdr", "header_row", "header_col", "corner"):
             if self.find_withtag(hdr_tag):
                 self.tag_lower("sel_fg", hdr_tag)
                 break
+        if self.find_withtag("frozen_sel_fg"):
+            if self.find_withtag("frozen_row"):
+                self.tag_raise("frozen_sel_fg", "frozen_row")
+            for hdr_tag in ("frozen_hdr", "header_row", "header_col", "corner"):
+                if self.find_withtag(hdr_tag):
+                    self.tag_lower("frozen_sel_fg", hdr_tag)
+                    break
 
     def _draw_header_highlights(self, start_col: int, end_col: int, start_row: int, end_row: int):
         """Draw active column and row header highlights tagged 'hdr_overlay'."""
@@ -2588,21 +2929,17 @@ class SpreadsheetGrid(tk.Canvas):
         if val is None:
             return ""
         fmt = self.engine.cell_styles.get((row, col), {}).get("format", "general")
-        if isinstance(val, float):
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
             if fmt == "fixed2":
                 return f"{val:,.2f}"
-            elif fmt == "currency":
-                return f"${val:,.2f}"
-            elif fmt == "percent":
-                return f"{val * 100:.1f}%"
-            elif val.is_integer():
-                return str(int(val))
-            return f"{val:.4f}".rstrip("0").rstrip(".")
-        elif isinstance(val, int) and not isinstance(val, bool):
             if fmt == "currency":
                 return f"${val:,.2f}"
-            elif fmt == "fixed2":
-                return f"{val:,.2f}"
+            if fmt == "percent":
+                return f"{val * 100:.1f}%"
+            if isinstance(val, float):
+                if val.is_integer():
+                    return str(int(val))
+                return f"{val:.4f}".rstrip("0").rstrip(".")
             return str(val)
         return str(val)
 
@@ -2787,15 +3124,18 @@ class SpreadsheetGrid(tk.Canvas):
             return
         cx = self.canvasx(event.x)
         cy = self.canvasy(event.y)
+        vx0 = self.canvasx(0)
+        vy0 = self.canvasy(0)
+        in_corner = (cx <= vx0 + self.header_col_width and cy <= vy0 + self.header_row_height)
 
         # 1. Fill-handle or bottom fill edge hover
-        if self._is_on_fill_handle(cx, cy) or self._is_on_selection_bottom_edge(cx, cy):
+        if not in_corner and (self._is_on_fill_handle(cx, cy) or self._is_on_selection_bottom_edge(cx, cy)):
             self.config(cursor="crosshair")
             self._cancel_hover_tooltip()
             return
 
         # 2. Column divider hover
-        if cy <= self.canvasy(0) + self.header_row_height:
+        if not in_corner and cy <= vy0 + self.header_row_height and cx > vx0 + self.header_col_width:
             col = self._get_divider_col_at_x(cx)
             if col is not None:
                 self.config(cursor="sb_h_double_arrow")
@@ -2803,7 +3143,7 @@ class SpreadsheetGrid(tk.Canvas):
                 return
 
         # 3. Row divider hover
-        if cx <= self.canvasx(0) + self.header_col_width:
+        if not in_corner and cx <= vx0 + self.header_col_width and cy > vy0 + self.header_row_height:
             row = self._get_divider_row_at_y(cy)
             if row is not None:
                 self.config(cursor="sb_v_double_arrow")
@@ -2813,6 +3153,9 @@ class SpreadsheetGrid(tk.Canvas):
         self.config(cursor="")
 
         # 4. Schedule cell hover inspector tooltip
+        if in_corner or cx < vx0 + self.header_col_width or cy < vy0 + self.header_row_height:
+            self._cancel_hover_tooltip()
+            return
         r = self.canvas_y_to_row(cy)
         c = self.x_to_col(int(cx))
         if r >= 0 and c >= 0 and not self.is_editing:
@@ -2919,8 +3262,7 @@ class SpreadsheetGrid(tk.Canvas):
             return False
         if isinstance(self.editor_entry, tk.Text):
             txt = self.editor_entry.get("1.0", "end-1c")
-            pos = self.editor_entry.index(tk.INSERT)
-            prefix = txt.rstrip()
+            prefix = self.editor_entry.get("1.0", tk.INSERT).rstrip()
         else:
             txt = self.editor_entry.get()
             pos = self.editor_entry.index(tk.INSERT)
@@ -2936,10 +3278,13 @@ class SpreadsheetGrid(tk.Canvas):
         self._cancel_hover_tooltip()
         cx = self.canvasx(event.x)
         cy = self.canvasy(event.y)
+        vx0 = self.canvasx(0)
+        vy0 = self.canvasy(0)
+        in_corner = (cx <= vx0 + self.header_col_width and cy <= vy0 + self.header_row_height)
 
         # 1. Fill handle / bottom fill edge click
         (min_r, min_c), (max_r, max_c) = self.get_selected_range()
-        if self._is_on_fill_handle(cx, cy) or self._is_on_selection_bottom_edge(cx, cy):
+        if not in_corner and (self._is_on_fill_handle(cx, cy) or self._is_on_selection_bottom_edge(cx, cy)):
             if self.is_editing:
                 self.commit_inline_edit()
             self.is_dragging_fill = True
@@ -2949,16 +3294,16 @@ class SpreadsheetGrid(tk.Canvas):
             return
 
         # 2. Column divider drag
-        divider_col = self._get_divider_col_at_x(cx)
-        if cy <= self.canvasy(0) + self.header_row_height and divider_col is not None:
+        divider_col = None if in_corner else self._get_divider_col_at_x(cx)
+        if not in_corner and cy <= vy0 + self.header_row_height and cx > vx0 + self.header_col_width and divider_col is not None:
             self.resizing_col = divider_col
             self.resize_start_x = event.x
             self.resize_start_w = self.get_col_width(divider_col)
             return
 
         # 3. Row divider drag
-        divider_row = self._get_divider_row_at_y(cy)
-        if cx <= self.canvasx(0) + self.header_col_width and divider_row is not None:
+        divider_row = None if in_corner else self._get_divider_row_at_y(cy)
+        if not in_corner and cx <= vx0 + self.header_col_width and cy > vy0 + self.header_row_height and divider_row is not None:
             self.resizing_row = divider_row
             self.resize_start_y = event.y
             self.resize_start_h = self.get_row_height(divider_row)
@@ -2967,7 +3312,7 @@ class SpreadsheetGrid(tk.Canvas):
         # 4. Point-and-click formula reference insertion
         row = self.canvas_y_to_row(cy)
         col = self.x_to_col(int(cx))
-        if self._is_expecting_formula_ref() and row >= 0 and col >= 0:
+        if not in_corner and cx >= vx0 + self.header_col_width and cy >= vy0 + self.header_row_height and self._is_expecting_formula_ref() and row >= 0 and col >= 0:
             self.is_dragging_ref = True
             self.ref_start_cell = (row, col)
             if isinstance(self.editor_entry, tk.Text):
@@ -2986,14 +3331,15 @@ class SpreadsheetGrid(tk.Canvas):
         # Commit existing inline edit if open
         if self.is_editing:
             self.commit_inline_edit()
+        self.delete("formula_ref_hl")
 
         # Click on Top-Left Corner -> Select All
-        if cx < self.header_col_width and cy < self.canvasy(0) + self.header_row_height:
+        if cx < vx0 + self.header_col_width and cy < vy0 + self.header_row_height:
             self.select_all_cells()
             return
 
         # Click on Column Header -> Select Columns (with Shift drag/click support)
-        if cy < self.canvasy(0) + self.header_row_height:
+        if cy < vy0 + self.header_row_height:
             col = self.x_to_col(int(cx))
             if col >= 0:
                 self.select_mode = "col"
@@ -3009,7 +3355,7 @@ class SpreadsheetGrid(tk.Canvas):
             return
 
         # Click on Row Header -> Select Rows (with Shift drag/click support)
-        if cx < self.header_col_width:
+        if cx < vx0 + self.header_col_width:
             row = self.canvas_y_to_row(cy)
             if row >= 0:
                 self.select_mode = "row"
@@ -3041,7 +3387,7 @@ class SpreadsheetGrid(tk.Canvas):
         if self.resizing_col is not None:
             dx = event.x - self.resize_start_x
             new_w = max(35, self.resize_start_w + dx)
-            self.col_widths[self.resizing_col] = new_w
+            self.col_widths[self.resizing_col] = max(30, int(new_w / self.zoom_factor))
             self.recompute_bounds()
             self.redraw()
             return
@@ -3049,7 +3395,7 @@ class SpreadsheetGrid(tk.Canvas):
         if self.resizing_row is not None:
             dy = event.y - self.resize_start_y
             new_h = max(16, self.resize_start_h + dy)
-            self.row_heights[self.resizing_row] = new_h
+            self.row_heights[self.resizing_row] = max(16, int(new_h / self.zoom_factor))
             self.recompute_bounds()
             self.redraw()
             return
@@ -3218,15 +3564,21 @@ class SpreadsheetGrid(tk.Canvas):
         if tgt_r > max_r:
             h = max_r - min_r + 1
             for c in range(min_c, max_c + 1):
+                raws = [self.engine.get_raw(r, c) for r in range(min_r, max_r + 1)]
+                has_formula = any(isinstance(s, str) and s.startswith("=") for s in raws)
                 vals = [self.engine.get_value(r, c) for r in range(min_r, max_r + 1)]
                 num_vals = []
                 for v in vals:
-                    try:
-                        num_vals.append(float(v) if v != "" and v is not None else None)
-                    except (ValueError, TypeError):
+                    if isinstance(v, bool):
                         num_vals.append(None)
+                    else:
+                        try:
+                            fv = float(v) if v != "" and v is not None else None
+                            num_vals.append(fv if fv is not None and math.isfinite(fv) else None)
+                        except (ValueError, TypeError):
+                            num_vals.append(None)
 
-                is_numeric_series = len(num_vals) >= 2 and all(v is not None for v in num_vals)
+                is_numeric_series = (not has_formula) and len(num_vals) >= 2 and all(v is not None for v in num_vals)
                 if is_numeric_series:
                     step = (num_vals[-1] - num_vals[0]) / (len(num_vals) - 1)
                     for r in range(max_r + 1, tgt_r + 1):
@@ -3251,15 +3603,21 @@ class SpreadsheetGrid(tk.Canvas):
         elif tgt_c > max_c:
             w = max_c - min_c + 1
             for r in range(min_r, max_r + 1):
+                raws = [self.engine.get_raw(r, c) for c in range(min_c, max_c + 1)]
+                has_formula = any(isinstance(s, str) and s.startswith("=") for s in raws)
                 vals = [self.engine.get_value(r, c) for c in range(min_c, max_c + 1)]
                 num_vals = []
                 for v in vals:
-                    try:
-                        num_vals.append(float(v) if v != "" and v is not None else None)
-                    except (ValueError, TypeError):
+                    if isinstance(v, bool):
                         num_vals.append(None)
+                    else:
+                        try:
+                            fv = float(v) if v != "" and v is not None else None
+                            num_vals.append(fv if fv is not None and math.isfinite(fv) else None)
+                        except (ValueError, TypeError):
+                            num_vals.append(None)
 
-                is_numeric_series = len(num_vals) >= 2 and all(v is not None for v in num_vals)
+                is_numeric_series = (not has_formula) and len(num_vals) >= 2 and all(v is not None for v in num_vals)
                 if is_numeric_series:
                     step = (num_vals[-1] - num_vals[0]) / (len(num_vals) - 1)
                     for c in range(max_c + 1, tgt_c + 1):
@@ -3458,9 +3816,12 @@ class SpreadsheetGrid(tk.Canvas):
     def _on_double_click(self, event):
         cx = self.canvasx(event.x)
         cy = self.canvasy(event.y)
+        vx0 = self.canvasx(0)
+        vy0 = self.canvasy(0)
+        in_corner = (cx <= vx0 + self.header_col_width and cy <= vy0 + self.header_row_height)
 
         # 0. Fill handle or selection bottom edge double-click -> auto-fill down column
-        if self._is_on_fill_handle(cx, cy) or self._is_on_selection_bottom_edge(cx, cy):
+        if not in_corner and (self._is_on_fill_handle(cx, cy) or self._is_on_selection_bottom_edge(cx, cy)):
             if self.is_editing:
                 self.commit_inline_edit()
             self.is_dragging_fill = False
@@ -3471,15 +3832,18 @@ class SpreadsheetGrid(tk.Canvas):
             return "break"
 
         # Double click column divider -> auto-fit column width
-        divider_col = self._get_divider_col_at_x(cx)
-        if cy <= self.canvasy(0) + self.header_row_height and divider_col is not None:
+        divider_col = None if in_corner else self._get_divider_col_at_x(cx)
+        if not in_corner and cy <= vy0 + self.header_row_height and cx > vx0 + self.header_col_width and divider_col is not None:
             self._autofit_column_width(divider_col)
             return
 
         # Double click row divider -> auto-fit row height
-        divider_row = self._get_divider_row_at_y(cy)
-        if cx <= self.canvasx(0) + self.header_col_width and divider_row is not None:
+        divider_row = None if in_corner else self._get_divider_row_at_y(cy)
+        if not in_corner and cx <= vx0 + self.header_col_width and cy > vy0 + self.header_row_height and divider_row is not None:
             self._autofit_row_height(divider_row)
+            return
+
+        if in_corner or cx < vx0 + self.header_col_width or cy < vy0 + self.header_row_height:
             return
 
         row = self.canvas_y_to_row(cy)
@@ -3498,7 +3862,9 @@ class SpreadsheetGrid(tk.Canvas):
             if val != "" and val is not None:
                 max_chars = max(max_chars, len(str(val)))
         ideal_w = max(60, min(360, max_chars * 9 + 26))
-        self.set_col_width(col, ideal_w)
+        self.col_widths[col] = ideal_w
+        self.recompute_bounds()
+        self.redraw()
 
     def _autofit_row_height(self, row: int):
         """Auto-fit row height based on content or wrap lines."""
@@ -4051,7 +4417,7 @@ class SpreadsheetGrid(tk.Canvas):
                 fill="", outline=col_hex, width=2, dash=(4, 2), tags="formula_ref_hl"
             )
 
-        for m in re.finditer(r"\$?([A-Za-z]{1,3})\$?([0-9]+)(?::\$?([A-Za-z]{1,3})\$?([0-9]+))?", cleaned):
+        for m in re.finditer(r"(?<![A-Za-z0-9_])\$?([A-Za-z]{1,3})\$?([1-9][0-9]*)(?::\$?([A-Za-z]{1,3})\$?([1-9][0-9]*))?(?![A-Za-z0-9_(])", cleaned):
             try:
                 c1 = col_letter_to_index(m.group(1))
                 r1 = int(m.group(2)) - 1
@@ -4287,8 +4653,8 @@ class SpreadsheetGrid(tk.Canvas):
         elif action["type"] == "replace_sheet":
             self.engine.raw_cells = dict(action["old_raw"])
             self.engine.cell_styles = {k: dict(v) for k, v in action["old_styles"].items()}
-            self.recompute_bounds()
         self.engine.recalculate_all()
+        self.recompute_bounds()
         self.redraw()
         self._notify_select()
         if self.on_modified_cb:
@@ -4309,8 +4675,8 @@ class SpreadsheetGrid(tk.Canvas):
         elif action["type"] == "replace_sheet":
             self.engine.raw_cells = dict(action["new_raw"])
             self.engine.cell_styles = {k: dict(v) for k, v in action["new_styles"].items()}
-            self.recompute_bounds()
         self.engine.recalculate_all()
+        self.recompute_bounds()
         self.redraw()
         self._notify_select()
         if self.on_modified_cb:
@@ -4987,7 +5353,7 @@ class SpreadsheetTab(ttk.Frame):
         if not in_editor:
             if isinstance(raw_text, str) and raw_text.startswith("="):
                 val = self.engine.get_value(r, c)
-                if val is not None and not str(val).startswith("#") and val != "":
+                if val is not None and not (isinstance(val, str) and val in FormulaEngine._ALL_ERRORS) and val != "":
                     self.formula_preview_var.set(f"= {self.grid_widget._format_display_value(val, r, c)}")
                 else:
                     self.formula_preview_var.set("")
@@ -5037,7 +5403,7 @@ class SpreadsheetTab(ttk.Frame):
             try:
                 r, c = self.grid_widget.active_cell
                 prev_val = self.engine._eval_formula(txt[1:], r, c)
-                if prev_val is not None and not str(prev_val).startswith("#"):
+                if prev_val is not None and not (isinstance(prev_val, str) and prev_val in FormulaEngine._ALL_ERRORS):
                     fmt_val = self.grid_widget._format_display_value(prev_val, r, c)
                     self.formula_preview_var.set(f"= {fmt_val}")
                 else:
@@ -5096,12 +5462,15 @@ class SpreadsheetTab(ttk.Frame):
             formula = "=SUM()"
             target_r, target_c = r, c
 
+        old_val = self.engine.get_raw(target_r, target_c)
+        self.grid_widget._save_undo_state({"type": "set_cell", "r": target_r, "c": target_c, "old": old_val, "new": formula})
         self.engine.set_cell(target_r, target_c, formula)
         self.engine.recalculate_all()
         self.grid_widget.active_cell = (target_r, target_c)
         self.grid_widget.sel_start = (target_r, target_c)
         self.grid_widget.sel_end = (target_r, target_c)
         self.formula_var.set(formula)
+        self.grid_widget.recompute_bounds()
         self._on_grid_modified()
         self.grid_widget.redraw()
 
@@ -5127,173 +5496,81 @@ class SpreadsheetTab(ttk.Frame):
         self.formula_var.set(formula)
         self._on_formula_bar_submit(None)
 
-    def _insert_row_above(self):
-        r, _ = self.grid_widget.active_cell
-        old_raw = dict(self.engine.raw_cells)
-        old_styles = dict(self.engine.cell_styles)
+    def _structural_edit(self, axis: str, boundary: int, delta: int) -> None:
+        """Insert (delta > 0) or delete (delta < 0) rows/cols at *boundary*, adjusting every formula on the sheet."""
+        eng = self.engine
+        old_raw = dict(eng.raw_cells)
+        old_styles = self.grid_widget._snapshot_styles()
+        del_end = boundary + (-delta) - 1 if delta < 0 else None
+
+        def _map(coord):
+            r, c = coord
+            v = r if axis == "row" else c
+            if delta < 0:
+                if boundary <= v <= del_end:
+                    return None
+                nv = v + delta if v > del_end else v
+            else:
+                nv = v + delta if v >= boundary else v
+            return (nv, c) if axis == "row" else (r, nv)
+
         new_cells = {}
+        for coord, val in old_raw.items():
+            nc = _map(coord)
+            if nc is None:
+                continue
+            if isinstance(val, str) and val.startswith("="):
+                val = _adjust_formula_for_structural_edit(val, axis, boundary, delta)
+            new_cells[nc] = val
         new_styles = {}
-        for (row, col), val in list(self.engine.raw_cells.items()):
-            if row >= r:
-                shifted_val = shift_formula_references(val, 1, 0) if isinstance(val, str) and val.startswith("=") else val
-                new_cells[(row + 1, col)] = shifted_val
-            else:
-                new_cells[(row, col)] = val
-        for (row, col), st in list(self.engine.cell_styles.items()):
-            if row >= r:
-                new_styles[(row + 1, col)] = st
-            else:
-                new_styles[(row, col)] = st
-        self.grid_widget._save_undo_state({"type": "replace_sheet", "old_raw": old_raw, "old_styles": old_styles, "new_raw": new_cells, "new_styles": new_styles})
-        self.engine.raw_cells = new_cells
-        self.engine.cell_styles = new_styles
-        self.engine.recalculate_all()
+        for coord, st in old_styles.items():
+            nc = _map(coord)
+            if nc is not None:
+                new_styles[nc] = dict(st)
+
+        self.grid_widget._save_undo_state({
+            "type": "replace_sheet",
+            "old_raw": old_raw,
+            "old_styles": old_styles,
+            "new_raw": dict(new_cells),
+            "new_styles": {k: dict(v) for k, v in new_styles.items()},
+        })
+        eng.raw_cells = new_cells
+        eng.cell_styles = new_styles
+        eng.recalculate_all()
+        if delta < 0:
+            g = self.grid_widget
+            ar, ac = g.active_cell
+            g.active_cell = (max(0, boundary), ac) if axis == "row" else (ar, max(0, boundary))
+            g.sel_start = g.active_cell
+            g.sel_end = g.active_cell
         self.grid_widget.recompute_bounds()
         self._on_grid_modified()
         self.grid_widget.redraw()
+
+    def _insert_row_above(self):
+        r, _ = self.grid_widget.active_cell
+        self._structural_edit("row", r, 1)
 
     def _insert_row_below(self):
         r, _ = self.grid_widget.active_cell
-        target_r = r + 1
-        old_raw = dict(self.engine.raw_cells)
-        old_styles = dict(self.engine.cell_styles)
-        new_cells = {}
-        new_styles = {}
-        for (row, col), val in list(self.engine.raw_cells.items()):
-            if row >= target_r:
-                shifted_val = shift_formula_references(val, 1, 0) if isinstance(val, str) and val.startswith("=") else val
-                new_cells[(row + 1, col)] = shifted_val
-            else:
-                new_cells[(row, col)] = val
-        for (row, col), st in list(self.engine.cell_styles.items()):
-            if row >= target_r:
-                new_styles[(row + 1, col)] = st
-            else:
-                new_styles[(row, col)] = st
-        self.grid_widget._save_undo_state({"type": "replace_sheet", "old_raw": old_raw, "old_styles": old_styles, "new_raw": new_cells, "new_styles": new_styles})
-        self.engine.raw_cells = new_cells
-        self.engine.cell_styles = new_styles
-        self.engine.recalculate_all()
-        self.grid_widget.recompute_bounds()
-        self._on_grid_modified()
-        self.grid_widget.redraw()
+        self._structural_edit("row", r + 1, 1)
 
     def _delete_selected_rows(self):
         (min_r, _), (max_r, _) = self.grid_widget.get_selected_range()
-        del_count = max_r - min_r + 1
-        old_raw = dict(self.engine.raw_cells)
-        old_styles = dict(self.engine.cell_styles)
-        new_cells = {}
-        new_styles = {}
-        for (row, col), val in list(self.engine.raw_cells.items()):
-            if min_r <= row <= max_r:
-                continue
-            elif row > max_r:
-                shifted_val = shift_formula_references(val, -del_count, 0) if isinstance(val, str) and val.startswith("=") else val
-                new_cells[(row - del_count, col)] = shifted_val
-            else:
-                new_cells[(row, col)] = val
-        for (row, col), st in list(self.engine.cell_styles.items()):
-            if min_r <= row <= max_r:
-                continue
-            elif row > max_r:
-                new_styles[(row - del_count, col)] = st
-            else:
-                new_styles[(row, col)] = st
-        self.grid_widget._save_undo_state({"type": "replace_sheet", "old_raw": old_raw, "old_styles": old_styles, "new_raw": new_cells, "new_styles": new_styles})
-        self.engine.raw_cells = new_cells
-        self.engine.cell_styles = new_styles
-        self.engine.recalculate_all()
-        self.grid_widget.active_cell = (max(0, min_r), self.grid_widget.active_cell[1])
-        self.grid_widget.sel_start = self.grid_widget.active_cell
-        self.grid_widget.sel_end = self.grid_widget.active_cell
-        self.grid_widget.recompute_bounds()
-        self._on_grid_modified()
-        self.grid_widget.redraw()
+        self._structural_edit("row", min_r, -(max_r - min_r + 1))
 
     def _insert_col_left(self):
         _, c = self.grid_widget.active_cell
-        old_raw = dict(self.engine.raw_cells)
-        old_styles = dict(self.engine.cell_styles)
-        new_cells = {}
-        new_styles = {}
-        for (row, col), val in list(self.engine.raw_cells.items()):
-            if col >= c:
-                shifted_val = shift_formula_references(val, 0, 1) if isinstance(val, str) and val.startswith("=") else val
-                new_cells[(row, col + 1)] = shifted_val
-            else:
-                new_cells[(row, col)] = val
-        for (row, col), st in list(self.engine.cell_styles.items()):
-            if col >= c:
-                new_styles[(row, col + 1)] = st
-            else:
-                new_styles[(row, col)] = st
-        self.grid_widget._save_undo_state({"type": "replace_sheet", "old_raw": old_raw, "old_styles": old_styles, "new_raw": new_cells, "new_styles": new_styles})
-        self.engine.raw_cells = new_cells
-        self.engine.cell_styles = new_styles
-        self.engine.recalculate_all()
-        self.grid_widget.recompute_bounds()
-        self._on_grid_modified()
-        self.grid_widget.redraw()
+        self._structural_edit("col", c, 1)
 
     def _insert_col_right(self):
         _, c = self.grid_widget.active_cell
-        target_c = c + 1
-        old_raw = dict(self.engine.raw_cells)
-        old_styles = dict(self.engine.cell_styles)
-        new_cells = {}
-        new_styles = {}
-        for (row, col), val in list(self.engine.raw_cells.items()):
-            if col >= target_c:
-                shifted_val = shift_formula_references(val, 0, 1) if isinstance(val, str) and val.startswith("=") else val
-                new_cells[(row, col + 1)] = shifted_val
-            else:
-                new_cells[(row, col)] = val
-        for (row, col), st in list(self.engine.cell_styles.items()):
-            if col >= target_c:
-                new_styles[(row, col + 1)] = st
-            else:
-                new_styles[(row, col)] = st
-        self.grid_widget._save_undo_state({"type": "replace_sheet", "old_raw": old_raw, "old_styles": old_styles, "new_raw": new_cells, "new_styles": new_styles})
-        self.engine.raw_cells = new_cells
-        self.engine.cell_styles = new_styles
-        self.engine.recalculate_all()
-        self.grid_widget.recompute_bounds()
-        self._on_grid_modified()
-        self.grid_widget.redraw()
+        self._structural_edit("col", c + 1, 1)
 
     def _delete_selected_cols(self):
         (_, min_c), (_, max_c) = self.grid_widget.get_selected_range()
-        del_count = max_c - min_c + 1
-        old_raw = dict(self.engine.raw_cells)
-        old_styles = dict(self.engine.cell_styles)
-        new_cells = {}
-        new_styles = {}
-        for (row, col), val in list(self.engine.raw_cells.items()):
-            if min_c <= col <= max_c:
-                continue
-            elif col > max_c:
-                shifted_val = shift_formula_references(val, 0, -del_count) if isinstance(val, str) and val.startswith("=") else val
-                new_cells[(row, col - del_count)] = shifted_val
-            else:
-                new_cells[(row, col)] = val
-        for (row, col), st in list(self.engine.cell_styles.items()):
-            if min_c <= col <= max_c:
-                continue
-            elif col > max_c:
-                new_styles[(row, col - del_count)] = st
-            else:
-                new_styles[(row, col)] = st
-        self.grid_widget._save_undo_state({"type": "replace_sheet", "old_raw": old_raw, "old_styles": old_styles, "new_raw": new_cells, "new_styles": new_styles})
-        self.engine.raw_cells = new_cells
-        self.engine.cell_styles = new_styles
-        self.engine.recalculate_all()
-        self.grid_widget.active_cell = (self.grid_widget.active_cell[0], max(0, min_c))
-        self.grid_widget.sel_start = self.grid_widget.active_cell
-        self.grid_widget.sel_end = self.grid_widget.active_cell
-        self.grid_widget.recompute_bounds()
-        self._on_grid_modified()
-        self.grid_widget.redraw()
+        self._structural_edit("col", min_c, -(max_c - min_c + 1))
 
     def toggle_bold_selection(self):
         """Toggle bold formatting on selected cells."""
@@ -5524,20 +5801,22 @@ class SpreadsheetTab(ttk.Frame):
 
         def _sort_key(item):
             v = item[1]
-            if v is None or v == "":
-                return (2, 0, "")
             try:
+                if isinstance(v, bool):
+                    return (1, 0, "true" if v else "false")
                 num = float(v)
                 return (0, num, "")
             except (ValueError, TypeError):
                 return (1, 0, str(v).lower())
 
-        rows_sorted = sorted(rows_data, key=_sort_key, reverse=not ascending)
+        non_blank = [it for it in rows_data if it[1] is not None and it[1] != ""]
+        blank_rows = [it for it in rows_data if it[1] is None or it[1] == ""]
+        rows_sorted = sorted(non_blank, key=_sort_key, reverse=not ascending) + blank_rows
 
         old_raw = dict(self.engine.raw_cells)
-        old_styles = dict(self.engine.cell_styles)
+        old_styles = self.grid_widget._snapshot_styles()
         new_cells = dict(self.engine.raw_cells)
-        new_styles = dict(self.engine.cell_styles)
+        new_styles = self.grid_widget._snapshot_styles()
 
         for target_idx, (orig_r, _, raw_map, style_map) in enumerate(rows_sorted):
             target_r = first_data_r + target_idx
@@ -5548,16 +5827,19 @@ class SpreadsheetTab(ttk.Frame):
                     shifted_val = shift_formula_references(raw_val, dr, 0)
                 else:
                     shifted_val = raw_val
-                new_cells[(target_r, c)] = shifted_val
+                if shifted_val == "" or shifted_val is None:
+                    new_cells.pop((target_r, c), None)
+                else:
+                    new_cells[(target_r, c)] = shifted_val
                 if c in style_map and style_map[c]:
-                    new_styles[(target_r, c)] = style_map[c]
+                    new_styles[(target_r, c)] = dict(style_map[c])
                 else:
                     new_styles.pop((target_r, c), None)
 
         self.grid_widget._save_undo_state({
             "type": "replace_sheet",
             "old_raw": old_raw, "old_styles": old_styles,
-            "new_raw": new_cells, "new_styles": new_styles
+            "new_raw": dict(new_cells), "new_styles": {k: dict(v) for k, v in new_styles.items()},
         })
         self.engine.raw_cells = new_cells
         self.engine.cell_styles = new_styles
@@ -5854,11 +6136,30 @@ class SpreadsheetTab(ttk.Frame):
         }
         return json.dumps(data, indent=2)
 
-    def set_content(self, content_str: str):
-        """Restore sheet state from JSON or CSV string."""
+    def _reset_sheet_state(self) -> None:
+        """Clear cells, styles, geometry, freeze/wrap flags, and undo history before loading new content."""
+        self.engine.raw_cells.clear()
+        self.engine.cell_styles.clear()
+        self.grid_widget.col_widths = {}
+        self.grid_widget.row_heights = {}
+        self.grid_widget.freeze_top_row = False
+        self.default_wrap = False
+        self.grid_widget._undo_stack.clear()
+        self.grid_widget._redo_stack.clear()
+        if hasattr(self, "b_freeze"):
+            self.b_freeze.config(text="❄ Freeze")
+        if hasattr(self, "b_wrap"):
+            self.b_wrap.config(text="↵ Wrap")
+
+    def set_content(self, content_str: str, delimiter: Optional[str] = None):
+        """Restore sheet state from JSON or CSV/TSV string (explicit *delimiter* overrides auto-detection)."""
         if not content_str.strip():
+            self._reset_sheet_state()
+            self.engine.recalculate_all()
+            self.grid_widget.recompute_bounds()
+            self.grid_widget.redraw()
             return
-        if content_str.strip().startswith("{"):
+        if delimiter is None and content_str.strip().startswith("{"):
             try:
                 data = json.loads(content_str)
                 if isinstance(data, dict) and data.get("type") == "spreadsheet":
@@ -5882,11 +6183,17 @@ class SpreadsheetTab(ttk.Frame):
                     self.grid_widget.recompute_bounds()
                     self.grid_widget.redraw()
                     return
+            except json.JSONDecodeError as exc:
+                if '"type"' in content_str and "spreadsheet" in content_str:
+                    raise ValueError(f"Corrupt spreadsheet JSON: {exc}") from exc
             except Exception:
                 pass
 
-        self.engine.raw_cells.clear()
-        delim = "\t" if "\t" in content_str and (content_str.count("\t") >= content_str.count(",")) else ","
+        self._reset_sheet_state()
+        if delimiter is not None:
+            delim = delimiter
+        else:
+            delim = "\t" if "\t" in content_str and (content_str.count("\t") >= content_str.count(",")) else ","
         reader = csv.reader(io.StringIO(content_str), delimiter=delim)
         for r, row in enumerate(reader):
             for c, val in enumerate(row):
@@ -5970,8 +6277,8 @@ class SpreadsheetPatchParser:
         r"```(?:csv|tsv|markdown|table)?[^\n]*\r?\n(.*?)(?:\r?\n[ \t]*```|```$)",
         re.DOTALL | re.IGNORECASE
     )
-    _RANGE_LINE_RE = re.compile(r"^\s*(?:[-*•]\s+)?(?:SET\s+)?([A-Za-z]+[0-9]+):([A-Za-z]+[0-9]+)\s*[:=]\s*(.+)$", re.IGNORECASE)
-    _LINE_RE = re.compile(r"^\s*(?:[-*•]\s+)?(?:SET\s+)?([A-Za-z]+[0-9]+)\s*[:=]\s*(.+)$", re.IGNORECASE)
+    _RANGE_LINE_RE = re.compile(r"^\s*(?:[-*•]\s+)?(?:SET\s+)?([A-Za-z]{1,3}[1-9][0-9]*):([A-Za-z]{1,3}[1-9][0-9]*)\s*[:=]\s*(.+)$", re.IGNORECASE)
+    _LINE_RE = re.compile(r"^\s*(?:[-*•]\s+)?(?:SET\s+)?([A-Za-z]{1,3}[1-9][0-9]*)\s*[:=]\s*(.+)$", re.IGNORECASE)
 
     @classmethod
     def _find_specific_blocks(cls, text: str) -> List[str]:
@@ -6386,6 +6693,29 @@ def _extract_xlsx_rgb(color_obj) -> Optional[str]:
     return None
 
 
+_XLSX_NUMBER_RE = re.compile(r"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$")
+
+
+def _xlsx_value_from_raw(raw: Any) -> Any:
+    """Convert raw cell text to a native Excel value (numbers numeric, formulas preserved, leading ' = explicit text)."""
+    if not isinstance(raw, str):
+        return raw
+    if raw.startswith("="):
+        return raw
+    if raw.startswith("'"):
+        return raw[1:]
+    if _XLSX_NUMBER_RE.match(raw.strip()):
+        try:
+            txt = raw.strip()
+            if re.fullmatch(r"-?(0|[1-9][0-9]*)", txt):
+                return int(txt)
+            val = float(txt)
+            return val if math.isfinite(val) else raw
+        except ValueError:
+            return raw
+    return raw
+
+
 def open_spreadsheet_file(filepath: str, tab: SpreadsheetTab) -> bool:
     """Load an existing file (.csv, .tsv, .xlsx, .mdsheet) into SpreadsheetTab."""
     if not os.path.exists(filepath):
@@ -6394,11 +6724,11 @@ def open_spreadsheet_file(filepath: str, tab: SpreadsheetTab) -> bool:
     ext = os.path.splitext(filepath)[1].lower()
 
     if ext == ".xlsx" and OPENPYXL_AVAILABLE:
+        wb = None
         try:
             wb = openpyxl.load_workbook(filepath, data_only=False)
             sheet = wb.active
-            tab.engine.raw_cells.clear()
-            tab.engine.cell_styles.clear()
+            tab._reset_sheet_state()
             for r_idx, row in enumerate(sheet.iter_rows(values_only=False)):
                 for c_idx, cell in enumerate(row):
                     if cell.value is not None:
@@ -6446,12 +6776,18 @@ def open_spreadsheet_file(filepath: str, tab: SpreadsheetTab) -> bool:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open Excel file:\n{e}", parent=tab)
             return False
+        finally:
+            if wb is not None:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
 
     elif ext in (".csv", ".tsv"):
         try:
             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
-            tab.set_content(content)
+            tab.set_content(content, delimiter="\t" if ext == ".tsv" else ",")
             tab.file_path = filepath
             tab.is_modified = False
             return True
@@ -6488,7 +6824,7 @@ def save_spreadsheet_file(tab: SpreadsheetTab, filepath: str) -> bool:
             for r, c in sorted(all_coords):
                 ws_cell = ws.cell(row=r + 1, column=c + 1)
                 if (r, c) in tab.engine.raw_cells:
-                    ws_cell.value = tab.engine.raw_cells[(r, c)]
+                    ws_cell.value = _xlsx_value_from_raw(tab.engine.raw_cells[(r, c)])
                 st = tab.engine.cell_styles.get((r, c), {})
                 if not st:
                     continue

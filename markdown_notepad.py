@@ -275,6 +275,225 @@ def _calc_line_spacing_px(px_size: int, line_spacing: Any) -> Tuple[int, int, in
     return (max(1, round(px * 0.12)), max(2, round(px * 0.18)), max(4, round(px * 0.35)))
 
 
+def _normalize_hex_color(val: Optional[str]) -> Optional[str]:
+    """Normalize a #rgb or #rrggbb hex color string to lowercase #rrggbb, or return None."""
+    if not val or not isinstance(val, str):
+        return None
+    m = re.match(r'^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$', val.strip())
+    if not m:
+        return None
+    h = m.group(1).lower()
+    if len(h) == 3:
+        h = ''.join(ch * 2 for ch in h)
+    return f'#{h}'
+
+
+_DOC_FONT_PALETTE = [
+    ("Black", "#000000"),
+    ("Charcoal", "#333333"),
+    ("Slate", "#64748b"),
+    ("Dark Red", "#991b1b"),
+    ("Crimson Red", "#dc2626"),
+    ("Burnt Orange", "#ea580c"),
+    ("Amber", "#d97706"),
+    ("Gold", "#ca8a04"),
+    ("Forest Green", "#15803d"),
+    ("Emerald", "#059669"),
+    ("Teal", "#0d9488"),
+    ("Royal Blue", "#2563eb"),
+    ("Navy", "#1e3a8a"),
+    ("Indigo", "#4f46e5"),
+    ("Violet", "#7c3aed"),
+    ("Magenta", "#c026d3"),
+    ("Rose", "#e11d48"),
+    ("Brown", "#78350f"),
+    ("Olive", "#65a30d"),
+    ("Cyan", "#0891b2"),
+]
+
+_COLOR_SPAN_RE = re.compile(
+    r'<span\s+style=["\']color\s*:\s*(#[0-9a-fA-F]{3,6})\s*;?["\']\s*>(.*?)</span>',
+    re.IGNORECASE,
+)
+_COLOR_OPEN_TAG_RE = re.compile(
+    r'^<span\s+style=["\']color\s*:\s*(#[0-9a-fA-F]{3,6})\s*;?["\']\s*>',
+    re.IGNORECASE,
+)
+_COLOR_ANY_OPEN_RE = re.compile(
+    r'<span\s+style=["\']color\s*:\s*#[0-9a-fA-F]{3,6}\s*;?["\']\s*>',
+    re.IGNORECASE,
+)
+_COLOR_CLOSE_RE = re.compile(r'</span>', re.IGNORECASE)
+
+
+def _atomic_text_replace(editor: tk.Text, start_idx: str, end_idx: str, new_text: str):
+    """Replace text in *editor* as a single atomic undoable operation."""
+    orig_auto = editor.cget('autoseparators')
+    editor.config(autoseparators=False)
+    try:
+        editor.edit_separator()
+        editor.delete(start_idx, end_idx)
+        if new_text:
+            editor.insert(start_idx, new_text)
+        editor.edit_separator()
+    finally:
+        editor.config(autoseparators=orig_auto)
+
+
+def _is_widget_descendant(widget: Optional[tk.Misc], ancestor: Optional[tk.Misc]) -> bool:
+    """Return True if *widget* is *ancestor* or any descendant of *ancestor*."""
+    if widget is None or ancestor is None:
+        return False
+    cur = widget
+    while cur is not None:
+        if cur is ancestor:
+            return True
+        cur = getattr(cur, 'master', None)
+    return False
+
+
+class _DocColorPalettePopup(tk.Toplevel):
+    """Borderless floating font color swatch picker anchored to a toolbar or mini-toolbar button."""
+
+    def __init__(self, master, anchor_widget, on_select, on_close=None, initial_color="#dc2626"):
+        super().__init__(master)
+        self.anchor_widget = anchor_widget
+        self.on_select = on_select
+        self.on_close = on_close
+        self.initial_color = _normalize_hex_color(initial_color) or "#dc2626"
+        self._focus_job = None
+        self._choosing_custom = False
+        self._closed = False
+
+        self.wm_overrideredirect(True)
+        try:
+            self.attributes("-topmost", True)
+        except Exception:
+            pass
+        self.configure(bg="#4c1d95", padx=1, pady=1)
+
+        outer = tk.Frame(self, bg="#faf5ff", padx=6, pady=6)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        auto_btn = tk.Button(
+            outer, text="Automatic (Default)", font=(SANS_FONT or "Segoe UI", 8),
+            bg="#ede9fe", fg="#2e1065", activebackground="#ddd6fe",
+            relief=tk.FLAT, bd=0, padx=6, pady=3, cursor="hand2", takefocus=0,
+            command=lambda: self._pick(None),
+        )
+        auto_btn.pack(fill=tk.X, pady=(0, 5))
+
+        grid = tk.Frame(outer, bg="#faf5ff")
+        grid.pack()
+        cols = 5
+        for idx, (name, hex_c) in enumerate(_DOC_FONT_PALETTE):
+            r, c = divmod(idx, cols)
+            sw = tk.Button(
+                grid, bg=hex_c, activebackground=hex_c,
+                width=2, height=1, relief=tk.SOLID, bd=1,
+                cursor="hand2", takefocus=0,
+                command=lambda hc=hex_c: self._pick(hc),
+            )
+            sw.grid(row=r, column=c, padx=2, pady=2)
+            ToolTip(sw, f"{name} ({hex_c})", delay=300)
+
+        more_btn = tk.Button(
+            outer, text="More Colors...", font=(SANS_FONT or "Segoe UI", 8),
+            bg="#ede9fe", fg="#2e1065", activebackground="#ddd6fe",
+            relief=tk.FLAT, bd=0, padx=6, pady=3, cursor="hand2", takefocus=0,
+            command=self._choose_custom,
+        )
+        more_btn.pack(fill=tk.X, pady=(5, 0))
+
+        self.update_idletasks()
+        win_w = self.winfo_reqwidth()
+        win_h = self.winfo_reqheight()
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        try:
+            ax = anchor_widget.winfo_rootx()
+            ay = anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 2
+        except Exception:
+            ax, ay = 100, 100
+        tx = max(8, min(screen_w - win_w - 8, ax))
+        ty = ay
+        if ty + win_h > screen_h - 8:
+            try:
+                ty = max(8, anchor_widget.winfo_rooty() - win_h - 2)
+            except Exception:
+                ty = max(8, screen_h - win_h - 8)
+        self.geometry(f"+{tx}+{ty}")
+
+        self.bind("<Escape>", lambda e: self.close())
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.focus_set()
+
+    def _pick(self, hex_c: Optional[str]):
+        cb = self.on_select
+        self.close(invoke_on_close=False)
+        if cb:
+            cb(hex_c)
+
+    def _choose_custom(self):
+        self._choosing_custom = True
+        try:
+            parent_win = self.anchor_widget.winfo_toplevel()
+            res = colorchooser.askcolor(color=self.initial_color, title="Choose Font Color", parent=parent_win)
+        finally:
+            self._choosing_custom = False
+        if res and res[1]:
+            norm = _normalize_hex_color(res[1])
+            if norm:
+                self._pick(norm)
+                return
+        self.close()
+
+    def _on_focus_out(self, event=None):
+        if self._choosing_custom or self._closed:
+            return
+        if self._focus_job:
+            try:
+                self.after_cancel(self._focus_job)
+            except Exception:
+                pass
+        self._focus_job = self.after(120, self._check_focus)
+
+    def _check_focus(self):
+        self._focus_job = None
+        if self._choosing_custom or self._closed:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+            focused = self.focus_get()
+            if _is_widget_descendant(focused, self):
+                return
+        except Exception:
+            pass
+        self.close()
+
+    def close(self, invoke_on_close: bool = True):
+        if self._closed:
+            return
+        self._closed = True
+        if self._focus_job:
+            try:
+                self.after_cancel(self._focus_job)
+            except Exception:
+                pass
+            self._focus_job = None
+        try:
+            if self.winfo_exists():
+                self.destroy()
+        except Exception:
+            pass
+        if invoke_on_close and self.on_close:
+            try:
+                self.on_close()
+            except Exception:
+                pass
+
+
 # =============================================================================
 # UI Components
 # =============================================================================
@@ -376,25 +595,77 @@ class ToolTip:
 class FloatingMiniToolbar:
     """
     Floating Word-style mini selection toolbar that appears above selected text.
-    Provides fast inline formatting (Bold, Italic, Highlight, Code, Link, Ask AI).
+    Provides fast inline formatting (Bold, Italic, Highlight, Code, Link, Font Color, Ask AI).
     """
     def __init__(self, tab):
         self.tab = tab
         self.editor = tab.source_editor
         self.window = None
         self._check_job = None
-        
+        self._hide_job = None
+        self._color_popup = None
+
+        self.editor.bind("<ButtonPress-1>", lambda e: self.hide(), add=True)
+        self.editor.bind("<MouseWheel>", lambda e: self.hide(), add=True)
         self.editor.bind("<ButtonRelease-1>", self._on_mouse_release, add=True)
         self.editor.bind("<KeyPress>", self._on_key_press, add=True)
-        self.editor.bind("<FocusOut>", lambda e: self.hide(), add=True)
+        self.editor.bind("<FocusOut>", self._on_editor_focus_out, add=True)
 
     def _on_mouse_release(self, event=None):
         if self._check_job:
-            self.editor.after_cancel(self._check_job)
+            try:
+                self.editor.after_cancel(self._check_job)
+            except Exception:
+                pass
         self._check_job = self.editor.after(120, self._check_and_show)
 
     def _on_key_press(self, event=None):
         self.hide()
+
+    def _on_editor_focus_out(self, event=None):
+        if self._hide_job:
+            try:
+                self.editor.after_cancel(self._hide_job)
+            except Exception:
+                pass
+        self._hide_job = self.editor.after(120, self._hide_if_unfocused)
+
+    def _hide_if_unfocused(self):
+        self._hide_job = None
+        if not self.window or not self.window.winfo_exists():
+            return
+        try:
+            focused = self.editor.focus_get()
+        except Exception:
+            focused = None
+        if focused is self.editor or _is_widget_descendant(focused, self.window):
+            return
+        cp = getattr(self, '_color_popup', None)
+        if cp is not None:
+            try:
+                if cp.winfo_exists() and (
+                    _is_widget_descendant(focused, cp) or getattr(cp, '_choosing_custom', False)
+                ):
+                    return
+            except Exception:
+                pass
+        self.hide()
+
+    def _position_window(self, win, bx, by, bh):
+        win.update_idletasks()
+        win_w = win.winfo_reqwidth()
+        win_h = win.winfo_reqheight() or 32
+        screen_w = self.editor.winfo_screenwidth()
+        screen_h = self.editor.winfo_screenheight()
+        root_x = self.editor.winfo_rootx() + bx
+        raw_y = self.editor.winfo_rooty() + by - 36
+        if raw_y < 10:
+            target_y = self.editor.winfo_rooty() + by + bh + 6
+        else:
+            target_y = raw_y
+        target_y = max(10, min(screen_h - win_h - 8, target_y))
+        target_x = max(8, min(screen_w - win_w - 8, root_x - (win_w // 4)))
+        win.geometry(f"+{target_x}+{target_y}")
 
     def _check_and_show(self):
         self._check_job = None
@@ -402,31 +673,29 @@ class FloatingMiniToolbar:
             if not self.editor.tag_ranges(tk.SEL):
                 self.hide()
                 return
-            
+
             sel_text = self.editor.get(tk.SEL_FIRST, tk.SEL_LAST)
             if not sel_text or len(sel_text.strip()) == 0:
                 self.hide()
                 return
-            
+
             bbox = self.editor.bbox(tk.SEL_FIRST)
             if not bbox:
                 return
-            
+
             bx, by, bw, bh = bbox
-            root_x = self.editor.winfo_rootx() + bx
-            root_y = self.editor.winfo_rooty() + by - 36
-            
+
             if self.window and self.window.winfo_exists():
-                self.window.geometry(f"+{max(10, root_x)}+{max(10, root_y)}")
+                self._position_window(self.window, bx, by, bh)
                 return
-            
+
             self.window = win = tk.Toplevel(self.editor)
             win.wm_overrideredirect(True)
             win.configure(bg="#3b1d6e", padx=2, pady=2)
-            
+
             frame = tk.Frame(win, bg="#f3effa", bd=1, relief=tk.SOLID)
             frame.pack(fill=tk.BOTH, expand=True)
-            
+
             def _wrap_fmt(prefix, suffix):
                 try:
                     notepad = self.editor.winfo_toplevel()
@@ -434,16 +703,22 @@ class FloatingMiniToolbar:
                         notepad._insert_format(prefix, suffix)
                 finally:
                     self.hide()
+                    try:
+                        self.editor.focus_set()
+                    except Exception:
+                        pass
 
             def _ask_ai():
                 try:
                     notepad = self.editor.winfo_toplevel()
-                    if hasattr(notepad, '_on_ask_ai_selection'):
-                        notepad._on_ask_ai_selection()
-                    elif hasattr(notepad, 'ai_sidebar') and notepad.ai_sidebar:
-                        if not getattr(notepad, 'ai_sidebar_visible', False):
-                            notepad._toggle_ai_sidebar()
-                        notepad.ai_sidebar.set_input_text(f"Explain or improve this text:\n\n{sel_text}")
+                    if hasattr(notepad, '_transfer_to_chat'):
+                        notepad._transfer_to_chat(self.editor)
+                        sb = getattr(notepad, 'ai_sidebar', None)
+                        if sb is not None and hasattr(sb, 'input_text'):
+                            try:
+                                sb.input_text.focus_set()
+                            except Exception:
+                                pass
                 finally:
                     self.hide()
 
@@ -453,23 +728,72 @@ class FloatingMiniToolbar:
                 ("🖍", lambda: _wrap_fmt("==", "=="), "Highlight (Ctrl+Shift+H)"),
                 ("`", lambda: _wrap_fmt("`", "`"), "Inline Code (Ctrl+`)"),
                 ("🔗", lambda: _wrap_fmt("[", "](url)"), "Insert Link (Ctrl+K)"),
-                ("💬 AI", _ask_ai, "Ask AI about this selection"),
             ]
-            
+
             for text, cmd, tip in btn_defs:
                 b = tk.Button(
-                    frame, text=text, command=cmd, font=(SANS_FONT, 9, "bold" if text in ("𝐁", "💬 AI") else "normal"),
+                    frame, text=text, command=cmd, font=(SANS_FONT, 9, "bold" if text == "𝐁" else "normal"),
                     bg="#f3effa", fg="#2e1065", activebackground="#ede9fe", activeforeground="#4c1d95",
-                    relief=tk.FLAT, bd=0, padx=5, pady=2, cursor="hand2"
+                    relief=tk.FLAT, bd=0, padx=5, pady=2, cursor="hand2", takefocus=0
                 )
                 b.pack(side=tk.LEFT, padx=1, pady=1)
                 ToolTip(b, tip, delay=250)
-            
-            win.update_idletasks()
-            win_w = win.winfo_reqwidth()
-            target_x = max(10, root_x - (win_w // 4))
-            target_y = max(10, root_y)
-            win.geometry(f"+{target_x}+{target_y}")
+
+            color_btn = tk.Button(
+                frame, text="A", font=(SANS_FONT, 9, "bold"),
+                bg="#f3effa", fg="#dc2626", activebackground="#ede9fe", activeforeground="#4c1d95",
+                relief=tk.FLAT, bd=0, padx=5, pady=2, cursor="hand2", takefocus=0
+            )
+            color_btn.pack(side=tk.LEFT, padx=1, pady=1)
+            ToolTip(color_btn, "Font Color for selected text", delay=250)
+
+            def _open_color_picker():
+                notepad = self.editor.winfo_toplevel()
+                if not hasattr(notepad, 'set_document_font_color'):
+                    return
+                if self._color_popup and self._color_popup.winfo_exists():
+                    self._color_popup.close(invoke_on_close=False)
+                    self._color_popup = None
+                    return
+
+                def _on_pick(hex_c):
+                    self._color_popup = None
+                    try:
+                        notepad.set_document_font_color(hex_c)
+                    finally:
+                        self.hide()
+                        try:
+                            self.editor.focus_set()
+                        except Exception:
+                            pass
+
+                def _on_close():
+                    self._color_popup = None
+                    try:
+                        if self.editor.winfo_exists():
+                            self.editor.focus_set()
+                    except Exception:
+                        pass
+
+                self._color_popup = _DocColorPalettePopup(
+                    self.editor,
+                    anchor_widget=color_btn,
+                    on_select=_on_pick,
+                    on_close=_on_close,
+                    initial_color=getattr(notepad, '_last_doc_font_color', '#dc2626'),
+                )
+
+            color_btn.config(command=_open_color_picker)
+
+            ai_btn = tk.Button(
+                frame, text="💬 AI", command=_ask_ai, font=(SANS_FONT, 9, "bold"),
+                bg="#f3effa", fg="#2e1065", activebackground="#ede9fe", activeforeground="#4c1d95",
+                relief=tk.FLAT, bd=0, padx=5, pady=2, cursor="hand2", takefocus=0
+            )
+            ai_btn.pack(side=tk.LEFT, padx=1, pady=1)
+            ToolTip(ai_btn, "Ask AI about this selection", delay=250)
+
+            self._position_window(win, bx, by, bh)
         except Exception:
             pass
 
@@ -480,6 +804,18 @@ class FloatingMiniToolbar:
             except Exception:
                 pass
             self._check_job = None
+        if self._hide_job:
+            try:
+                self.editor.after_cancel(self._hide_job)
+            except Exception:
+                pass
+            self._hide_job = None
+        if self._color_popup:
+            try:
+                self._color_popup.close(invoke_on_close=False)
+            except Exception:
+                pass
+            self._color_popup = None
         if self.window:
             try:
                 self.window.destroy()
@@ -1822,11 +2158,14 @@ class VisualTableWidget(tk.Frame):
 
         self.cell_entries = []
         self._cell_vars = []
+        self._cell_orig_display = {}
 
         # Header row
         header_row_entries = []
         for col_idx, h in enumerate(self.headers):
-            h_var = tk.StringVar(value=_clean_for_display(h))
+            disp_val = _clean_for_display(h)
+            self._cell_orig_display[(0, col_idx)] = disp_val
+            h_var = tk.StringVar(value=disp_val)
             self._cell_vars.append((0, col_idx, h_var))
             entry = tk.Entry(
                 self.table_body, textvariable=h_var, font=head_font,
@@ -1848,7 +2187,9 @@ class VisualTableWidget(tk.Frame):
             c_bg = self.row_alt_bg if (row_idx % 2 == 1) else self.row_bg
             row_entries = []
             for col_idx, cell in enumerate(row):
-                cell_var = tk.StringVar(value=_clean_for_display(cell))
+                disp_val = _clean_for_display(cell)
+                self._cell_orig_display[(row_idx + 1, col_idx)] = disp_val
+                cell_var = tk.StringVar(value=disp_val)
                 self._cell_vars.append((row_idx + 1, col_idx, cell_var))
                 entry = tk.Entry(
                     self.table_body, textvariable=cell_var, font=cell_font,
@@ -1892,7 +2233,10 @@ class VisualTableWidget(tk.Frame):
                 _make_nav(r, c)
 
     def _sync(self):
-        lines = ["| " + " | ".join(h.replace('|', r'\|') for h in self.headers) + " |"]
+        def _esc_pipe(s: str) -> str:
+            return re.sub(r'(?<!\\)\|', r'\\|', s)
+
+        lines = ["| " + " | ".join(_esc_pipe(h) for h in self.headers) + " |"]
         seps = []
         for al in self.col_alignments:
             if al == 'center': seps.append(':---:')
@@ -1900,7 +2244,7 @@ class VisualTableWidget(tk.Frame):
             else: seps.append(':---')
         lines.append("| " + " | ".join(seps) + " |")
         for row in self.data_rows:
-            lines.append("| " + " | ".join(c.replace('|', r'\|') for c in row) + " |")
+            lines.append("| " + " | ".join(_esc_pipe(c) for c in row) + " |")
 
         formatted, _ = format_markdown_table_lines(lines)
         old_str = "\n".join(self.raw_table_lines)
@@ -1913,30 +2257,41 @@ class VisualTableWidget(tk.Frame):
     def _flush_all_cells(self):
         """Synchronize any in-progress cell entry edits into headers/data_rows and canonical markdown."""
         changed = False
+        orig_map = getattr(self, '_cell_orig_display', {})
         for r, c, var in getattr(self, '_cell_vars', []):
-            clean_val = var.get().strip().replace('|', r'\|')
+            raw_val = var.get()
+            if (r, c) in orig_map and raw_val == orig_map[(r, c)]:
+                continue
+            clean_val = raw_val.strip()
             if r == 0:
                 if c < len(self.headers) and self.headers[c] != clean_val:
                     self.headers[c] = clean_val
+                    orig_map[(r, c)] = raw_val
                     changed = True
             else:
                 d_idx = r - 1
                 if 0 <= d_idx < len(self.data_rows) and c < len(self.data_rows[d_idx]) and self.data_rows[d_idx][c] != clean_val:
                     self.data_rows[d_idx][c] = clean_val
+                    orig_map[(r, c)] = raw_val
                     changed = True
         if changed:
             self._sync()
 
     def _on_cell_commit(self, r, c, val):
-        clean_val = val.strip().replace('|', r'\|')
+        orig_map = getattr(self, '_cell_orig_display', {})
+        if (r, c) in orig_map and val == orig_map[(r, c)]:
+            return
+        clean_val = val.strip()
         if r == 0:
             if c < len(self.headers) and self.headers[c] != clean_val:
                 self.headers[c] = clean_val
+                orig_map[(r, c)] = val
                 self._sync()
         else:
             d_idx = r - 1
             if 0 <= d_idx < len(self.data_rows) and c < len(self.data_rows[d_idx]) and self.data_rows[d_idx][c] != clean_val:
                 self.data_rows[d_idx][c] = clean_val
+                orig_map[(r, c)] = val
                 self._sync()
 
     def insert_row(self, insert_idx):
@@ -2428,19 +2783,21 @@ class MarkdownVisualWidget(tk.Frame):
             self.text_widget.config(state=tk.DISABLED)
             self._restore_yview()
     
-    # Inline markdown pattern: captures bold, italic, highlight, code, math, footnotes, anchors, links in order
+    # Inline markdown pattern: captures bold, italic, highlight, color span, code, math, footnotes, anchors, links in order
     _INLINE_RE = re.compile(
         r'(\*\*|__)(?P<bold>.+?)\1'        # **bold** or __bold__
         r'|(?<!\*)\*(?!\*)(?P<italic>.+?)(?<!\*)\*(?!\*)'  # *italic*
         r'|(?<!_)_(?!_)(?P<italic2>.+?)(?<!_)_(?!_)'       # _italic_
         r'|==(?P<highlight>[^=\n]+)=='     # ==highlight==
         r'|<mark>(?P<mark_text>.*?)</mark>' # <mark>highlight</mark>
+        r'|<span\s+style=["\']color\s*:\s*(?P<span_color>#[0-9a-fA-F]{3,6})\s*;?["\']\s*>(?P<span_text>.*?)</span>'
         r'|`(?P<code>[^`]+)`'              # `code`
         r'|(?<!\$)\$(?!\$)(?P<math_inline>[^$\n]+?)(?<!\$)\$(?!\$)' # $math$
         r'|\[\^(?P<footnote_ref>[^\]\n]+)\]' # [^1]
         r'|\[@(?:anchor|def):\s*(?P<anchor_name>[^\]\n]+)\]' # [@anchor: point]
         r'|\[@(?!(?:anchor|def):)(?P<ref_name>[^\]\n]+)\]'   # [@point]
-        r'|\[(?P<link_label>[^\]]+)\]\((?P<link_url>[^\)]+)\)' # [label](url)
+        r'|\[(?P<link_label>[^\]]+)\]\((?P<link_url>[^\)]+)\)', # [label](url)
+        re.IGNORECASE,
     )
 
     def _insert_inline(self, text, base_tags=()):
@@ -2467,6 +2824,16 @@ class MarkdownVisualWidget(tk.Frame):
                 tw.insert(tk.END, m.group('highlight'), base_tags + ('highlight',) if base_tags else 'highlight')
             elif m.group('mark_text') is not None:
                 tw.insert(tk.END, m.group('mark_text'), base_tags + ('highlight',) if base_tags else 'highlight')
+            elif m.group('span_color') is not None:
+                norm_c = _normalize_hex_color(m.group('span_color'))
+                inner = m.group('span_text') or ''
+                if norm_c:
+                    ctag = f"color_{norm_c}"
+                    tw.tag_configure(ctag, foreground=norm_c)
+                    tw.tag_raise(ctag)
+                    self._insert_inline(inner, base_tags + (ctag,))
+                else:
+                    self._insert_inline(inner, base_tags)
             elif m.group('code') is not None:
                 tw.insert(tk.END, m.group('code'), base_tags + ('code',) if base_tags else 'code')
             elif m.group('math_inline') is not None:
@@ -3269,8 +3636,28 @@ class MarkdownVisualWidget(tk.Frame):
             line_end = tw.index(f"{mark_name} lineend+1c")
             tw.tag_add("flash_target", line_start, line_end)
             tw.tag_raise("flash_target")
-            self.after(1200, lambda: tw.tag_remove("flash_target", "1.0", tk.END))
+            self.after(1200, lambda w=tw: w.winfo_exists() and w.tag_remove("flash_target", "1.0", tk.END))
         except tk.TclError:
+            pass
+
+    def cleanup(self):
+        """Cancel pending jobs, close tooltips, and clear image caches."""
+        for attr in ('_render_job', '_rerender_job'):
+            job = getattr(self, attr, None)
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        try:
+            self._hide_footnote_tooltip()
+        except Exception:
+            pass
+        try:
+            self.embedded_images.clear()
+            self.image_handler.clear_caches()
+        except Exception:
             pass
 
     def _open_external_link(self, url: str):
@@ -3335,6 +3722,7 @@ class DocumentTab(ttk.Frame):
         # Document state
         self.tab_type = "document"
         self.file_path = None
+        self.source_file_path = None
         self.is_modified = False
         self.current_mode = "visual"
         self.word_wrap = True
@@ -3345,6 +3733,7 @@ class DocumentTab(ttk.Frame):
         self._last_active_line = None
         self._target_counts = {}
         self._nav_history = []
+        self._color_tags = set()
         
         desk_bg = theme.get('desk_bg', '#d9dce1')
         
@@ -3409,6 +3798,8 @@ class DocumentTab(ttk.Frame):
             self.source_editor.bind("<ISO_Left_Tab>", self._on_source_shift_tab)
         except tk.TclError:
             pass
+        self.source_editor.bind("<BackSpace>", self._on_visual_backspace)
+        self.source_editor.bind("<Delete>", self._on_visual_delete)
         self._last_embedded_sig = None
         self._mini_toolbar = FloatingMiniToolbar(self)
 
@@ -3469,6 +3860,11 @@ class DocumentTab(ttk.Frame):
     def clear_embedded_widgets(self):
         """Remove any embedded visual table/figure widgets from source_editor without polluting undo stack."""
         if not getattr(self, '_embedded_windows', None):
+            try:
+                self.source_editor.tag_remove("syn_block_elide", "1.0", tk.END)
+            except tk.TclError:
+                pass
+            self._last_embedded_sig = None
             return
         prev_undo = self.source_editor.cget('undo')
         self.source_editor.config(undo=False)
@@ -3485,8 +3881,39 @@ class DocumentTab(ttk.Frame):
                     pass
             self._embedded_windows.clear()
             self._last_embedded_sig = None
+            try:
+                self.source_editor.tag_remove("syn_block_elide", "1.0", tk.END)
+            except tk.TclError:
+                pass
         finally:
             self.source_editor.config(undo=prev_undo)
+
+    def cleanup(self):
+        """Cancel pending timers, hide floating popups/toolbars, and release embedded resources."""
+        if getattr(self, '_ac_job', None):
+            try:
+                self.after_cancel(self._ac_job)
+            except Exception:
+                pass
+            self._ac_job = None
+        try:
+            self._close_autocomplete()
+        except Exception:
+            pass
+        if getattr(self, '_mini_toolbar', None):
+            try:
+                self._mini_toolbar.hide()
+            except Exception:
+                pass
+        try:
+            self.clear_embedded_widgets()
+        except Exception:
+            pass
+        if getattr(self, 'visual_viewer', None) and hasattr(self.visual_viewer, 'cleanup'):
+            try:
+                self.visual_viewer.cleanup()
+            except Exception:
+                pass
 
     def _on_embedded_block_edit(self, old_text, new_text):
         """Handle cell edits, structural changes, or figure edits from embedded widgets."""
@@ -3495,8 +3922,7 @@ class DocumentTab(ttk.Frame):
             pos = self.source_editor.search(old_text, "1.0", tk.END, elide=True)
             if pos:
                 end_pos = f"{pos} + {len(old_text)}c"
-                self.source_editor.delete(pos, end_pos)
-                self.source_editor.insert(pos, new_text)
+                _atomic_text_replace(self.source_editor, pos, end_pos, new_text)
                 new_end_pos = f"{pos} + {len(new_text)}c"
                 self.source_editor.tag_add("syn_block_elide", pos, new_end_pos)
                 self.is_modified = True
@@ -3518,15 +3944,28 @@ class DocumentTab(ttk.Frame):
         font_family = self.theme.get('visual_font') or VISUAL_FONT or SANS_FONT
         font_size = self.theme.get('visual_font_size', 11)
         content_w = getattr(self.source_page, 'content_width', 600)
+        base_path = getattr(self.visual_viewer, 'base_path', None)
 
         # Build candidate signature of blocks to render
         candidate_blocks = []
         in_tbl = False
         cur_tbl = []
         tbl_start = 0
+        in_code_block = False
 
         for lineno, line in enumerate(lines, start=1):
             stripped = line.strip()
+            if stripped.startswith('```'):
+                if in_tbl:
+                    if any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl) for tl in cur_tbl):
+                        candidate_blocks.append(('table', tbl_start, lineno - 1, tuple(cur_tbl)))
+                    in_tbl = False
+                    cur_tbl = []
+                in_code_block = not in_code_block
+                continue
+            if in_code_block:
+                continue
+
             if stripped.startswith('|') and stripped.endswith('|'):
                 if not in_tbl:
                     in_tbl = True
@@ -3541,15 +3980,33 @@ class DocumentTab(ttk.Frame):
                     in_tbl = False
                     cur_tbl = []
 
-            m_img = re.match(r'^\s*(!\[([^\]]*)\]\(([^)]+)\))\s*$', line)
-            if m_img and not in_tbl:
-                candidate_blocks.append(('image', lineno, m_img.group(1), m_img.group(2), m_img.group(3)))
+            if not in_tbl:
+                m_img = re.match(r'^\s*(!\[([^\]]*)\]\(([^)]+)\))\s*$', line)
+                if m_img:
+                    raw_match, alt_meta, img_path = m_img.group(1), m_img.group(2), m_img.group(3)
+                    if img_path.startswith('data:image/'):
+                        m_b64 = ImageHandler.BASE64_IMAGE_PATTERN.match(raw_match)
+                        if m_b64 and self.visual_viewer.image_handler._validate_base64(m_b64.group(3)):
+                            candidate_blocks.append(('image', lineno, raw_match, 'base64', m_b64.group(1), m_b64.group(2), m_b64.group(3)))
+                    else:
+                        candidate_blocks.append(('image', lineno, raw_match, 'file', alt_meta, img_path, ''))
+                else:
+                    m_html = re.match(r'^\s*(<img\s+[^>]*src=["\']([^"\']+)["\'][^>]*>)\s*$', line, re.IGNORECASE)
+                    if m_html and not m_html.group(2).startswith('data:'):
+                        candidate_blocks.append(('image', lineno, m_html.group(1), 'html', m_html.group(1), m_html.group(2), ''))
 
         if in_tbl and any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl) for tl in cur_tbl):
             candidate_blocks.append(('table', tbl_start, len(lines), tuple(cur_tbl)))
 
-        new_sig = (tuple(candidate_blocks), dark, font_family, font_size, content_w)
+        new_sig = (tuple(candidate_blocks), dark, font_family, font_size, content_w, base_path)
         if getattr(self, '_last_embedded_sig', None) == new_sig:
+            for blk in candidate_blocks:
+                if blk[0] == 'table':
+                    _, s_line, e_line, _ = blk
+                    self.source_editor.tag_add("syn_block_elide", f"{s_line}.1", f"{e_line}.end")
+                elif blk[0] == 'image':
+                    lineno = blk[1]
+                    self.source_editor.tag_add("syn_block_elide", f"{lineno}.1", f"{lineno}.end")
             return
 
         self._updating_from_widget = True
@@ -3574,11 +4031,38 @@ class DocumentTab(ttk.Frame):
                     self.source_editor.window_create(f"{s_line}.0", window=tbl_widget)
                     self._embedded_windows.append(tbl_widget)
                 elif blk[0] == 'image':
-                    _, lineno, raw_match, alt_meta, img_path = blk
-                    img_info = self.visual_viewer.image_handler._parse_extended_alt(alt_meta)
-                    img_info['path'] = img_path
-                    img_info['type'] = 'file'
-                    img_info['full_match'] = raw_match
+                    _, lineno, raw_match, kind, alt_or_tag, path_or_mime, b64_data = blk
+                    ih = self.visual_viewer.image_handler
+                    if kind == 'base64':
+                        img_info = ih._parse_extended_alt(alt_or_tag)
+                        img_info.update({
+                            'type': 'base64',
+                            'mime': path_or_mime,
+                            'data': b64_data,
+                            'full_match': raw_match,
+                        })
+                    elif kind == 'html':
+                        wm = ImageHandler.WIDTH_PATTERN.search(alt_or_tag)
+                        hm = ImageHandler.HEIGHT_PATTERN.search(alt_or_tag)
+                        am = re.search(r'alt\s*=\s*["\']([^"\']*)["\']', alt_or_tag, re.IGNORECASE)
+                        img_info = {
+                            'alt': am.group(1) if am else '',
+                            'width': int(wm.group(1)) if wm else None,
+                            'height': int(hm.group(1)) if hm else None,
+                            'align': 'center',
+                            'caption': None,
+                            'type': 'file',
+                            'path': path_or_mime,
+                            'full_match': raw_match,
+                            'is_html': True,
+                        }
+                    else:
+                        img_info = ih._parse_extended_alt(alt_or_tag)
+                        img_info.update({
+                            'path': path_or_mime,
+                            'type': 'file',
+                            'full_match': raw_match,
+                        })
 
                     self.source_editor.tag_add("syn_block_elide", f"{lineno}.0", f"{lineno}.end")
                     fig_widget = VisualFigureWidget(
@@ -3586,7 +4070,7 @@ class DocumentTab(ttk.Frame):
                         on_change_callback=self._on_embedded_block_edit,
                         raw_match=raw_match,
                         img_info=img_info,
-                        image_handler=self.visual_viewer.image_handler,
+                        image_handler=ih,
                         is_dark=dark,
                         visual_font=font_family,
                         visual_font_size=font_size,
@@ -3601,8 +4085,19 @@ class DocumentTab(ttk.Frame):
             self.source_editor.edit_modified(False)
             self._updating_from_widget = False
 
+    def _is_in_fenced_code_block(self, lineno: int) -> bool:
+        """Return True if 1-based *lineno* is a fence line or inside a fenced ``` code block."""
+        in_code = False
+        for ln in range(1, max(1, lineno) + 1):
+            txt = self.source_editor.get(f"{ln}.0", f"{ln}.end").strip()
+            if txt.startswith('```'):
+                if ln == lineno:
+                    return True
+                in_code = not in_code
+        return in_code
+
     def _update_active_line_elision(self, event=None):
-        """Reveal syntax delimiters on the active cursor line and elide them on other lines in visual mode."""
+        """Reveal syn_delimiter on the active cursor line and elide it on other lines in visual mode."""
         if self.current_mode != "visual":
             return
         try:
@@ -3611,38 +4106,21 @@ class DocumentTab(ttk.Frame):
                 old_line = getattr(self, '_last_active_line', None)
                 self._last_active_line = curr_line
                 if old_line:
-                    line_start = f'{old_line}.0'
-                    line_end = f'{old_line}.end'
-                    line_text = self.source_editor.get(line_start, line_end)
-                    m_al = _ALIGN_SINGLE_RE.match(line_text)
-                    scan_text = m_al.group(3) if m_al else line_text
-                    col_off = m_al.start(3) if m_al else 0
+                    old_num = int(old_line)
+                    if not self._is_in_fenced_code_block(old_num):
+                        line_start = f'{old_line}.0'
+                        line_end = f'{old_line}.end'
+                        line_text = self.source_editor.get(line_start, line_end)
+                        m_al = _ALIGN_SINGLE_RE.match(line_text)
+                        scan_text = m_al.group(3) if m_al else line_text
+                        col_off = m_al.start(3) if m_al else 0
 
-                    h_m = re.match(r'^(#{1,6}\s+)', scan_text)
-                    if h_m:
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off}', f'{old_line}.{col_off + len(h_m.group(1))}')
-                    bq_m = re.match(r'^(>\s?)', scan_text)
-                    if bq_m:
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off}', f'{old_line}.{col_off + len(bq_m.group(1))}')
-                    for m in re.finditer(r'(\*\*\*|___)(.+?)\1', scan_text):
-                        p_len = len(m.group(1))
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start()}', f'{old_line}.{col_off + m.start() + p_len}')
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.end() - p_len}', f'{old_line}.{col_off + m.end()}')
-                    for m in re.finditer(r'(?<!\*)\*\*([^\*\n]+?)\*\*(?!\*)', scan_text):
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start()}', f'{old_line}.{col_off + m.start() + 2}')
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.end() - 2}', f'{old_line}.{col_off + m.end()}')
-                    for m in re.finditer(r'(?<!\*)\*([^\*\n]+?)\*(?!\*)', scan_text):
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start()}', f'{old_line}.{col_off + m.start() + 1}')
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.end() - 1}', f'{old_line}.{col_off + m.end()}')
-                    for m in re.finditer(r'==([^=\n]+)==', scan_text):
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start()}', f'{old_line}.{col_off + m.start() + 2}')
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.end() - 2}', f'{old_line}.{col_off + m.end()}')
-                    for m in re.finditer(r'`([^`\n]+)`', scan_text):
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start()}', f'{old_line}.{col_off + m.start() + 1}')
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.end() - 1}', f'{old_line}.{col_off + m.end()}')
-                    for m in re.finditer(r'(?<!!)(\[)([^\]\n]+)(\])\(([^\)\n]+)\)', scan_text):
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start(1)}', f'{old_line}.{col_off + m.end(1)}')
-                        self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start(3)}', f'{old_line}.{col_off + m.end(4)}')
+                        bq_m = re.match(r'^(>\s?)', scan_text)
+                        if bq_m:
+                            self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off}', f'{old_line}.{col_off + len(bq_m.group(1))}')
+                        for m in re.finditer(r'`([^`\n]+)`', scan_text):
+                            self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.start()}', f'{old_line}.{col_off + m.start() + 1}')
+                            self.source_editor.tag_add('syn_delimiter', f'{old_line}.{col_off + m.end() - 1}', f'{old_line}.{col_off + m.end()}')
 
                 self.source_editor.tag_remove('syn_delimiter', f'{curr_line}.0', f'{curr_line}.end')
         except Exception:
@@ -3669,12 +4147,10 @@ class DocumentTab(ttk.Frame):
                 pos = self.source_editor.search(old_text, "1.0", tk.END, elide=True)
                 if pos:
                     end_pos = f"{pos} + {len(old_text)}c"
-                    self.source_editor.delete(pos, end_pos)
-                    self.source_editor.insert(pos, new_text)
+                    _atomic_text_replace(self.source_editor, pos, end_pos, new_text)
                 else:
                     updated = curr.replace(old_text, new_text, 1)
-                    self.source_editor.delete("1.0", tk.END)
-                    self.source_editor.insert("1.0", updated)
+                    _atomic_text_replace(self.source_editor, "1.0", tk.END, updated)
                 self.is_modified = True
                 if self.on_modified:
                     self.on_modified()
@@ -3692,6 +4168,8 @@ class DocumentTab(ttk.Frame):
         """Get display title for tab"""
         if self.file_path:
             return os.path.basename(self.file_path)
+        if getattr(self, 'source_file_path', None):
+            return os.path.basename(self.source_file_path)
         return "Untitled"
 
     def get_content(self):
@@ -3707,8 +4185,7 @@ class DocumentTab(ttk.Frame):
     def set_content(self, content):
         """Set document content and refresh visual viewer if active"""
         self.clear_embedded_widgets()
-        self.source_editor.delete(1.0, tk.END)
-        self.source_editor.insert(1.0, content)
+        _atomic_text_replace(self.source_editor, "1.0", tk.END, content)
         self.source_editor.edit_modified(False)
         self.is_modified = False
         self._apply_syntax_highlighting()
@@ -3784,41 +4261,15 @@ class DocumentTab(ttk.Frame):
             code_bg, code_fg = '#f0f0f0', '#c7254e'
             hl_bg, hl_fg = '#fef08a', '#1a1a1a'
 
-        # Delimiters and block elision tags
-        editor.tag_configure('syn_delimiter', elide=is_visual, foreground='#94a3b8' if dark else '#94a3b8')
+        # Delimiters, permanent formatting elision, and block elision tags
+        editor.tag_configure('syn_delimiter', elide=is_visual, foreground='#94a3b8')
+        editor.tag_configure('syn_fmt_elide', elide=is_visual, foreground='#94a3b8')
         editor.tag_configure('syn_block_elide', elide=is_visual)
+        editor.tag_configure('syn_align_tag', elide=is_visual, foreground='#94a3b8')
 
-        # Headers
-        h_font = font_family if is_visual else (self.theme.get('source_font') or MONO_FONT)
-        editor.tag_configure('syn_h1', font=(h_font, px(sz + (10 if is_visual else 8)), 'bold'),
-                             foreground=heads[0], spacing1=8 if is_visual else 1, spacing3=4 if is_visual else 1)
-        editor.tag_configure('syn_h2', font=(h_font, px(sz + (7 if is_visual else 5)), 'bold'),
-                             foreground=heads[1], spacing1=6 if is_visual else 1, spacing3=3 if is_visual else 1)
-        editor.tag_configure('syn_h3', font=(h_font, px(sz + (4 if is_visual else 3)), 'bold'),
-                             foreground=heads[2], spacing1=4 if is_visual else 1, spacing3=2 if is_visual else 1)
-        editor.tag_configure('syn_h4', font=(h_font, px(sz + (2 if is_visual else 1)), 'bold'),
-                             foreground=heads[3], spacing1=3 if is_visual else 1, spacing3=2 if is_visual else 1)
-
-        # Inline styles
+        # 1. Block-level tags configured BEFORE inline/heading tags so inline formatting wins inside blocks
         b_font = font_family
-        editor.tag_configure('syn_bold', font=(b_font, px(sz), 'bold'), foreground=bold_fg)
-        editor.tag_configure('syn_italic', font=(b_font, px(sz), 'italic'), foreground=italic_fg)
-        editor.tag_configure('syn_bold_italic', font=(b_font, px(sz), 'bold italic'), foreground=bold_fg)
-        editor.tag_configure('syn_highlight', background=hl_bg, foreground=hl_fg)
-
         mono_font = self.theme.get('source_font') or MONO_FONT
-        editor.tag_configure('syn_code_inline', font=(mono_font, px(sz * 0.95)), background=code_bg, foreground=code_fg)
-        editor.tag_configure('syn_code_block', font=(mono_font, px(sz * 0.95)), background='#282c34', foreground='#abb2bf',
-                             lmargin1=int(20 * k96), lmargin2=int(20 * k96), rmargin=int(20 * k96),
-                             spacing1=4, spacing3=4)
-        editor.tag_configure('syn_link', foreground=link_fg, underline=True)
-        anc_fg = '#c084fc' if dark else '#7c3aed'
-        editor.tag_configure('syn_anchor', foreground=anc_fg, font=(b_font, px(sz), 'bold'), underline=True)
-        editor.tag_configure('syn_footnote', foreground='#38bdf8' if dark else '#0284c7', font=(b_font, px(sz), 'bold'))
-        math_font = "Cambria Math" if os.name == "nt" else font_family
-        editor.tag_configure('syn_math', foreground='#5eead4' if dark else '#0f766e', background=code_bg, font=(math_font, px(sz), 'italic'))
-        editor.tag_configure('syn_flash', background=hl_bg, foreground=hl_fg)
-
         bq_font = self.theme.get('blockquote_font') or b_font
         bq_size_val = self.theme.get('blockquote_size')
         try:
@@ -3849,26 +4300,77 @@ class DocumentTab(ttk.Frame):
         if bq_bg:
             bq_kwargs['background'] = bq_bg
         editor.tag_configure('syn_blockquote', **bq_kwargs)
+        editor.tag_configure('syn_code_block', font=(mono_font, px(sz * 0.95)), background='#282c34', foreground='#abb2bf',
+                             lmargin1=int(20 * k96), lmargin2=int(20 * k96), rmargin=int(20 * k96),
+                             spacing1=4, spacing3=4)
         editor.tag_configure('syn_list_marker', font=(b_font, px(sz), 'bold'), foreground=link_fg)
         editor.tag_configure('syn_hr', foreground=hr_fg)
 
-        # Alignment marker elision & paragraph alignment tags
-        editor.tag_configure('syn_align_tag', elide=is_visual, foreground='#94a3b8')
+        # Alignment tags raised after block tags
         editor.tag_configure('syn_align_left', justify='left')
         editor.tag_configure('syn_align_center', justify='center')
         editor.tag_configure('syn_align_right', justify='right')
         for _atag in ('syn_align_left', 'syn_align_center', 'syn_align_right'):
             editor.tag_raise(_atag)
 
+        # 2. Heading tags (and bold-italic heading variants)
+        h_font = font_family if is_visual else (self.theme.get('source_font') or MONO_FONT)
+        h_specs = (
+            ('syn_h1', 'syn_h1_italic', 10 if is_visual else 8, 8 if is_visual else 1, 4 if is_visual else 1, heads[0]),
+            ('syn_h2', 'syn_h2_italic', 7 if is_visual else 5, 6 if is_visual else 1, 3 if is_visual else 1, heads[1]),
+            ('syn_h3', 'syn_h3_italic', 4 if is_visual else 3, 4 if is_visual else 1, 2 if is_visual else 1, heads[2]),
+            ('syn_h4', 'syn_h4_italic', 2 if is_visual else 1, 3 if is_visual else 1, 2 if is_visual else 1, heads[3]),
+        )
+        for h_tag, hi_tag, delta, sp1, sp3, h_col in h_specs:
+            editor.tag_configure(h_tag, font=(h_font, px(sz + delta), 'bold'),
+                                 foreground=h_col, spacing1=sp1, spacing3=sp3)
+            editor.tag_configure(hi_tag, font=(h_font, px(sz + delta), 'bold italic'),
+                                 foreground=h_col, spacing1=sp1, spacing3=sp3)
+
+        # 3. Inline styles (in Visual Mode, leave foreground empty so text/heading/font-color shines through)
+        editor.tag_configure('syn_bold', font=(b_font, px(sz), 'bold'),
+                             foreground='' if is_visual else bold_fg)
+        editor.tag_configure('syn_italic', font=(b_font, px(sz), 'italic'),
+                             foreground='' if is_visual else italic_fg)
+        editor.tag_configure('syn_bold_italic', font=(b_font, px(sz), 'bold italic'),
+                             foreground='' if is_visual else bold_fg)
+        editor.tag_configure('syn_highlight', background=hl_bg, foreground=hl_fg)
+        editor.tag_configure('syn_code_inline', font=(mono_font, px(sz * 0.95)), background=code_bg, foreground=code_fg)
+        editor.tag_configure('syn_link', foreground=link_fg, underline=True)
+        anc_fg = '#c084fc' if dark else '#7c3aed'
+        editor.tag_configure('syn_anchor', foreground=anc_fg, font=(b_font, px(sz), 'bold'), underline=True)
+        editor.tag_configure('syn_footnote', foreground='#38bdf8' if dark else '#0284c7', font=(b_font, px(sz), 'bold'))
+        math_font = "Cambria Math" if os.name == "nt" else font_family
+        editor.tag_configure('syn_math', foreground='#5eead4' if dark else '#0f766e', background=code_bg, font=(math_font, px(sz), 'italic'))
+        editor.tag_configure('syn_flash', background=hl_bg, foreground=hl_fg)
+
+        # Raise active font color tags above inline/heading/blockquote tags, and keep sel on top
+        for ctag in getattr(self, '_color_tags', ()):
+            try:
+                editor.tag_raise(ctag)
+            except tk.TclError:
+                pass
+        editor.tag_raise('sel')
+
     def _apply_syntax_highlighting(self):
         """Apply markdown syntax highlighting and visual elision/widgets to the source editor."""
         editor = self.source_editor
-        for tag in ('syn_h1', 'syn_h2', 'syn_h3', 'syn_h4', 'syn_bold', 'syn_italic',
-                    'syn_bold_italic', 'syn_highlight', 'syn_code_inline', 'syn_code_block',
-                    'syn_link', 'syn_anchor', 'syn_footnote', 'syn_math', 'syn_flash',
-                    'syn_blockquote', 'syn_list_marker', 'syn_hr', 'syn_delimiter', 'syn_block_elide',
-                    'syn_align_left', 'syn_align_center', 'syn_align_right', 'syn_align_tag'):
+        # NOTE: Do NOT remove 'syn_block_elide' here; _render_embedded_blocks owns it.
+        tags_to_clear = [
+            'syn_h1', 'syn_h2', 'syn_h3', 'syn_h4',
+            'syn_h1_italic', 'syn_h2_italic', 'syn_h3_italic', 'syn_h4_italic',
+            'syn_bold', 'syn_italic', 'syn_bold_italic', 'syn_highlight',
+            'syn_code_inline', 'syn_code_block', 'syn_link', 'syn_anchor',
+            'syn_footnote', 'syn_math', 'syn_flash', 'syn_blockquote',
+            'syn_list_marker', 'syn_hr', 'syn_delimiter', 'syn_fmt_elide',
+            'syn_align_left', 'syn_align_center', 'syn_align_right', 'syn_align_tag',
+        ]
+        tags_to_clear.extend(list(getattr(self, '_color_tags', ())))
+        for tag in tags_to_clear:
             editor.tag_remove(tag, '1.0', tk.END)
+
+        def _overlaps(s: int, e: int, spans: List[Tuple[int, int]]) -> bool:
+            return any(s < se and ss < e for ss, se in spans)
 
         content = editor.get('1.0', tk.END)
         lines = content.split('\n')
@@ -3877,7 +4379,7 @@ class DocumentTab(ttk.Frame):
 
         for lineno, line in enumerate(lines, start=1):
             line_start = f'{lineno}.0'
-            line_end   = f'{lineno}.end'
+            line_end = f'{lineno}.end'
 
             if line.strip().startswith('```'):
                 in_code_block = not in_code_block
@@ -3917,11 +4419,12 @@ class DocumentTab(ttk.Frame):
                 scan_start = line_start
                 scan_end = line_end
 
+            h_lvl = None
             h_match = re.match(r'^(#{1,6}\s+)(.*)$', scan_line)
             if h_match:
                 pfx_len = len(h_match.group(1))
                 h_lvl = min(len(h_match.group(1).strip()), 4)
-                editor.tag_add('syn_delimiter', scan_start, f'{lineno}.{col_off + pfx_len}')
+                editor.tag_add('syn_fmt_elide', scan_start, f'{lineno}.{col_off + pfx_len}')
                 editor.tag_add(f'syn_h{h_lvl}', f'{lineno}.{col_off + pfx_len}', scan_end)
             elif scan_line.strip() in ('---', '***', '___'):
                 editor.tag_add('syn_hr', scan_start, scan_end)
@@ -3936,47 +4439,281 @@ class DocumentTab(ttk.Frame):
                 if m:
                     editor.tag_add('syn_list_marker', scan_start, f'{lineno}.{col_off + m.end()}')
 
-            for m in re.finditer(r'(\*\*\*|___)(.+?)\1', scan_line):
-                p_len = len(m.group(1))
-                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + p_len}')
-                editor.tag_add('syn_bold_italic', f'{lineno}.{col_off + m.start() + p_len}', f'{lineno}.{col_off + m.end() - p_len}')
-                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.end() - p_len}', f'{lineno}.{col_off + m.end()}')
-            for m in re.finditer(r'(?<!\*)\*\*([^\*\n]+?)\*\*(?!\*)', scan_line):
-                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + 2}')
-                editor.tag_add('syn_bold', f'{lineno}.{col_off + m.start() + 2}', f'{lineno}.{col_off + m.end() - 2}')
-                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.end() - 2}', f'{lineno}.{col_off + m.end()}')
-            for m in re.finditer(r'(?<!\*)\*([^\*\n]+?)\*(?!\*)', scan_line):
-                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + 1}')
-                editor.tag_add('syn_italic', f'{lineno}.{col_off + m.start() + 1}', f'{lineno}.{col_off + m.end() - 1}')
-                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.end() - 1}', f'{lineno}.{col_off + m.end()}')
-            for m in re.finditer(r'==([^=\n]+)==', scan_line):
-                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + 2}')
-                editor.tag_add('syn_highlight', f'{lineno}.{col_off + m.start() + 2}', f'{lineno}.{col_off + m.end() - 2}')
-                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.end() - 2}', f'{lineno}.{col_off + m.end()}')
+            # Detect inline backtick code spans first so other inline patterns skip inside them
+            code_spans: List[Tuple[int, int]] = []
             for m in re.finditer(r'`([^`\n]+)`', scan_line):
+                code_spans.append((m.start(), m.end()))
                 editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + 1}')
                 editor.tag_add('syn_code_inline', f'{lineno}.{col_off + m.start() + 1}', f'{lineno}.{col_off + m.end() - 1}')
                 editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.end() - 1}', f'{lineno}.{col_off + m.end()}')
+
+            bi_spans: List[Tuple[int, int]] = []
+            for m in re.finditer(r'(\*\*\*|___)(.+?)\1', scan_line):
+                if _overlaps(m.start(), m.end(), code_spans):
+                    continue
+                bi_spans.append((m.start(), m.end()))
+                p_len = len(m.group(1))
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + p_len}')
+                bi_tag = f'syn_h{h_lvl}_italic' if h_lvl else 'syn_bold_italic'
+                editor.tag_add(bi_tag, f'{lineno}.{col_off + m.start() + p_len}', f'{lineno}.{col_off + m.end() - p_len}')
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.end() - p_len}', f'{lineno}.{col_off + m.end()}')
+
+            bold_spans: List[Tuple[int, int]] = []
+            for pat in (r'(?<!\*)\*\*([^\*\n]+?)\*\*(?!\*)', r'(?<![\w_])__([^_\n]+?)__(?![\w_])'):
+                for m in re.finditer(pat, scan_line):
+                    if _overlaps(m.start(), m.end(), code_spans) or _overlaps(m.start(), m.end(), bi_spans):
+                        continue
+                    editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + 2}')
+                    bold_spans.append((m.start() + 2, m.end() - 2))
+                    if not h_lvl:
+                        editor.tag_add('syn_bold', f'{lineno}.{col_off + m.start() + 2}', f'{lineno}.{col_off + m.end() - 2}')
+                    editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.end() - 2}', f'{lineno}.{col_off + m.end()}')
+
+            italic_spans: List[Tuple[int, int]] = []
+            for pat in (r'(?<!\*)\*([^\*\n]+?)\*(?!\*)', r'(?<![\w_])_([^_\n]+?)_(?![\w_])'):
+                for m in re.finditer(pat, scan_line):
+                    if _overlaps(m.start(), m.end(), code_spans) or _overlaps(m.start(), m.end(), bi_spans):
+                        continue
+                    editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + 1}')
+                    italic_spans.append((m.start() + 1, m.end() - 1))
+                    it_tag = f'syn_h{h_lvl}_italic' if h_lvl else 'syn_italic'
+                    editor.tag_add(it_tag, f'{lineno}.{col_off + m.start() + 1}', f'{lineno}.{col_off + m.end() - 1}')
+                    editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.end() - 1}', f'{lineno}.{col_off + m.end()}')
+
+            if not h_lvl and bold_spans and italic_spans:
+                for bs, be in bold_spans:
+                    for is_, ie in italic_spans:
+                        os_ = max(bs, is_)
+                        oe_ = min(be, ie)
+                        if os_ < oe_:
+                            editor.tag_add('syn_bold_italic', f'{lineno}.{col_off + os_}', f'{lineno}.{col_off + oe_}')
+
+            for m in re.finditer(r'==([^=\n]+)==', scan_line):
+                if _overlaps(m.start(), m.end(), code_spans):
+                    continue
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + 2}')
+                editor.tag_add('syn_highlight', f'{lineno}.{col_off + m.start() + 2}', f'{lineno}.{col_off + m.end() - 2}')
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.end() - 2}', f'{lineno}.{col_off + m.end()}')
+
+            for m in re.finditer(r'<mark>(.*?)</mark>', scan_line, re.IGNORECASE):
+                if _overlaps(m.start(), m.end(), code_spans):
+                    continue
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start(1)}')
+                editor.tag_add('syn_highlight', f'{lineno}.{col_off + m.start(1)}', f'{lineno}.{col_off + m.end(1)}')
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.end(1)}', f'{lineno}.{col_off + m.end()}')
+
+            for m in _COLOR_SPAN_RE.finditer(scan_line):
+                if _overlaps(m.start(), m.end(), code_spans):
+                    continue
+                norm_hex = _normalize_hex_color(m.group(1))
+                if not norm_hex:
+                    continue
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start(2)}')
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.end(2)}', f'{lineno}.{col_off + m.end()}')
+                ctag = f'syn_color_{norm_hex}'
+                if ctag not in self._color_tags:
+                    self._color_tags.add(ctag)
+                    editor.tag_configure(ctag, foreground=norm_hex)
+                editor.tag_raise(ctag)
+                editor.tag_add(ctag, f'{lineno}.{col_off + m.start(2)}', f'{lineno}.{col_off + m.end(2)}')
+
             for m in re.finditer(r'\$\$(.+?)\$\$|(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)', scan_line):
+                if _overlaps(m.start(), m.end(), code_spans):
+                    continue
                 editor.tag_add('syn_math', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.end()}')
             for m in re.finditer(r'\[\^([^\]\n]+)\]', scan_line):
+                if _overlaps(m.start(), m.end(), code_spans):
+                    continue
                 editor.tag_add('syn_footnote', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.end()}')
             for m in re.finditer(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', scan_line):
+                if _overlaps(m.start(), m.end(), code_spans):
+                    continue
                 editor.tag_add('syn_anchor', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.end()}')
             for m in re.finditer(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', scan_line):
+                if _overlaps(m.start(), m.end(), code_spans):
+                    continue
                 editor.tag_add('syn_link', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.end()}')
             for m in re.finditer(r'(?<!!)(\[)([^\]\n]+)(\])\(([^\)\n]+)\)', scan_line):
-                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start(1)}', f'{lineno}.{col_off + m.end(1)}')
+                if _overlaps(m.start(), m.end(), code_spans):
+                    continue
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.start(1)}', f'{lineno}.{col_off + m.end(1)}')
                 editor.tag_add('syn_link', f'{lineno}.{col_off + m.start(2)}', f'{lineno}.{col_off + m.end(2)}')
-                editor.tag_add('syn_delimiter', f'{lineno}.{col_off + m.start(3)}', f'{lineno}.{col_off + m.end(4)}')
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.start(3)}', f'{lineno}.{col_off + m.end()}')
+
+        editor.tag_raise('sel')
 
         if self.current_mode == "visual":
             try:
                 curr_line = editor.index(tk.INSERT).split('.')[0]
                 editor.tag_remove('syn_delimiter', f'{curr_line}.0', f'{curr_line}.end')
+                self._last_active_line = curr_line
             except Exception:
                 pass
             self._render_embedded_blocks()
+
+    @staticmethod
+    def _prune_empty_inline_markers_in_text(line_text: str, cur_col: int) -> Tuple[str, int]:
+        """Remove empty inline marker wrappers from *line_text* and adjust *cur_col*."""
+        empty_pats = (
+            re.compile(r'<span\s+style=["\']color\s*:\s*#[0-9a-fA-F]{3,6}\s*;?["\']\s*></span>', re.IGNORECASE),
+            re.compile(r'<mark></mark>', re.IGNORECASE),
+            re.compile(r'===='),
+            re.compile(r'(?<!\*)\*\*\*\*\*\*(?!\*)'),
+            re.compile(r'(?<!\*)\*\*\*\*(?!\*)'),
+            re.compile(r'(?<!_)______(?!_)'),
+            re.compile(r'(?<!_)____(?!_)'),
+            re.compile(r'(?<!!)\[\]\([^)\n]+\)'),
+        )
+        changed = True
+        while changed:
+            changed = False
+            for pat in empty_pats:
+                m = pat.search(line_text)
+                if m:
+                    ms, me = m.start(), m.end()
+                    line_text = line_text[:ms] + line_text[me:]
+                    if cur_col >= me:
+                        cur_col -= (me - ms)
+                    elif cur_col > ms:
+                        cur_col = ms
+                    changed = True
+                    break
+        return line_text, max(0, min(len(line_text), cur_col))
+
+    def _delete_visible_char_and_prune(self, lineno: int, vis_col: int, target_col_after: int):
+        """Delete character at *vis_col* on *lineno*, collapse empty single-char wrappers, and prune."""
+        editor = self.source_editor
+        line_text = editor.get(f"{lineno}.0", f"{lineno}.end")
+        if vis_col < 0 or vis_col >= len(line_text):
+            return
+        # Check if vis_col is the sole char inside a single-* or single-_ italic wrapper
+        collapse_single = False
+        if 0 < vis_col < len(line_text) - 1:
+            ch_l = line_text[vis_col - 1]
+            ch_r = line_text[vis_col + 1]
+            if ch_l in ('*', '_') and ch_r == ch_l:
+                tags_l = editor.tag_names(f"{lineno}.{vis_col - 1}")
+                tags_r = editor.tag_names(f"{lineno}.{vis_col + 1}")
+                if 'syn_fmt_elide' in tags_l and 'syn_fmt_elide' in tags_r:
+                    left_ok = (vis_col - 2 < 0 or line_text[vis_col - 2] != ch_l)
+                    right_ok = (vis_col + 2 >= len(line_text) or line_text[vis_col + 2] != ch_l)
+                    if left_ok and right_ok:
+                        collapse_single = True
+
+        if collapse_single:
+            new_line = line_text[:vis_col - 1] + line_text[vis_col + 2:]
+            adj_col = target_col_after
+            if adj_col >= vis_col + 2:
+                adj_col -= 3
+            elif adj_col > vis_col - 1:
+                adj_col = vis_col - 1
+        else:
+            new_line = line_text[:vis_col] + line_text[vis_col + 1:]
+            adj_col = target_col_after - 1 if target_col_after > vis_col else target_col_after
+
+        new_line, adj_col = self._prune_empty_inline_markers_in_text(new_line, adj_col)
+        _atomic_text_replace(editor, f"{lineno}.0", f"{lineno}.end", new_line)
+        editor.mark_set(tk.INSERT, f"{lineno}.{max(0, min(len(new_line), adj_col))}")
+        self.is_modified = True
+        if self.on_modified:
+            self.on_modified()
+        self._apply_syntax_highlighting()
+        top = self.winfo_toplevel()
+        if hasattr(top, '_refresh_active_visual_view'):
+            top._refresh_active_visual_view()
+
+    def _on_visual_backspace(self, event=None):
+        """Boundary-safe BackSpace in Visual Mode that skips elided markers and prunes empty wrappers."""
+        if self.current_mode != "visual":
+            return None
+        editor = self.source_editor
+        try:
+            if editor.tag_ranges(tk.SEL):
+                return None
+            ins = editor.index(tk.INSERT)
+            lineno, col = map(int, ins.split('.'))
+        except Exception:
+            return None
+        if self._is_in_fenced_code_block(lineno):
+            return None
+
+        line_text = editor.get(f"{lineno}.0", f"{lineno}.end")
+        m_al = _ALIGN_SINGLE_RE.match(line_text)
+        col_off = m_al.start(3) if m_al else 0
+        scan_text = m_al.group(3) if m_al else line_text
+
+        # Demote heading if cursor sits immediately after elided '# ' prefix
+        h_m = re.match(r'^(#{1,6}\s+)', scan_text)
+        if h_m and col == col_off + len(h_m.group(1)):
+            _atomic_text_replace(editor, f"{lineno}.{col_off}", f"{lineno}.{col}", "")
+            editor.mark_set(tk.INSERT, f"{lineno}.{col_off}")
+            self.is_modified = True
+            if self.on_modified:
+                self.on_modified()
+            self._apply_syntax_highlighting()
+            top = self.winfo_toplevel()
+            if hasattr(top, '_refresh_active_visual_view'):
+                top._refresh_active_visual_view()
+            return "break"
+
+        if col <= 0:
+            return None
+
+        prev_tags = editor.tag_names(f"{lineno}.{col - 1}")
+        if 'syn_fmt_elide' in prev_tags:
+            c = col - 1
+            while c >= 0 and 'syn_fmt_elide' in editor.tag_names(f"{lineno}.{c}"):
+                c -= 1
+            if c < 0:
+                return None
+            self._delete_visible_char_and_prune(lineno, c, c + 1)
+            return "break"
+
+        # If cursor is right before a closing elided marker (e.g. **X|**), delete X and prune dead wrapper
+        if col < len(line_text) and 'syn_fmt_elide' in editor.tag_names(f"{lineno}.{col}"):
+            if 'syn_align_tag' not in prev_tags:
+                self._delete_visible_char_and_prune(lineno, col - 1, col)
+                return "break"
+
+        return None
+
+    def _on_visual_delete(self, event=None):
+        """Boundary-safe Delete in Visual Mode that skips elided markers and prunes empty wrappers."""
+        if self.current_mode != "visual":
+            return None
+        editor = self.source_editor
+        try:
+            if editor.tag_ranges(tk.SEL):
+                return None
+            ins = editor.index(tk.INSERT)
+            lineno, col = map(int, ins.split('.'))
+        except Exception:
+            return None
+        if self._is_in_fenced_code_block(lineno):
+            return None
+
+        line_text = editor.get(f"{lineno}.0", f"{lineno}.end")
+        line_len = len(line_text)
+        if col >= line_len:
+            return None
+
+        cur_tags = editor.tag_names(f"{lineno}.{col}")
+        if 'syn_fmt_elide' in cur_tags:
+            c = col
+            while c < line_len and 'syn_fmt_elide' in editor.tag_names(f"{lineno}.{c}"):
+                c += 1
+            if c >= line_len:
+                return None
+            self._delete_visible_char_and_prune(lineno, c, col)
+            return "break"
+
+        # If cursor sits immediately before the last visible char inside an inline wrapper (e.g. **|X**), prune on delete
+        if col > 0 and 'syn_fmt_elide' in editor.tag_names(f"{lineno}.{col - 1}"):
+            if col + 1 < line_len and 'syn_fmt_elide' in editor.tag_names(f"{lineno}.{col + 1}"):
+                self._delete_visible_char_and_prune(lineno, col, col)
+                return "break"
+
+        return None
 
     def _find_all_ref_occurrences(self, content: str, ref_norm: str) -> list:
         """Find all unified cross-reference, anchor, internal link, and heading occurrences for *ref_norm* in document order.
@@ -4059,7 +4796,7 @@ class DocumentTab(ttk.Frame):
         line_end = editor.index(f"{idx_str} lineend+1c")
         editor.tag_remove('syn_flash', '1.0', tk.END)
         editor.tag_add('syn_flash', line_start, line_end)
-        self.after(900, lambda: editor.tag_remove('syn_flash', '1.0', tk.END))
+        self.after(900, lambda w=editor: w.winfo_exists() and w.tag_remove('syn_flash', '1.0', tk.END))
 
     def _jump_to_source_occurrence(self, occurrences: list, cur_line: int, cur_col: int, reverse: bool, label: str, is_footnote: bool = False):
         """Cycle to the next (or previous if *reverse*) occurrence and update status."""
@@ -5032,18 +5769,22 @@ class DockedFindReplaceBar(ttk.Frame):
         widget.tag_configure("find_active", background=active_bg, foreground=active_fg)
         widget.tag_raise("find_match")
         widget.tag_raise("find_active")
+        try:
+            widget.tag_raise("sel")
+        except tk.TclError:
+            pass
 
     def clear_highlights(self):
-        tab = self.notepad.current_tab
-        if not tab or getattr(tab, 'tab_type', 'document') == 'spreadsheet':
-            return
-        for w in (getattr(tab, 'source_editor', None), getattr(getattr(tab, 'visual_viewer', None), 'text_widget', None)):
-            if w:
-                try:
-                    w.tag_remove("find_match", "1.0", tk.END)
-                    w.tag_remove("find_active", "1.0", tk.END)
-                except Exception:
-                    pass
+        for tab in getattr(self.notepad, 'tabs', ()):
+            if getattr(tab, 'tab_type', 'document') == 'spreadsheet':
+                continue
+            for w in (getattr(tab, 'source_editor', None), getattr(getattr(tab, 'visual_viewer', None), 'text_widget', None)):
+                if w:
+                    try:
+                        w.tag_remove("find_match", "1.0", tk.END)
+                        w.tag_remove("find_active", "1.0", tk.END)
+                    except Exception:
+                        pass
 
     def show(self, replace_mode=False):
         if not self.is_visible:
@@ -5132,13 +5873,27 @@ class DockedFindReplaceBar(ttk.Frame):
         self._ensure_highlight_tags(w)
         content = w.get("1.0", "end-1c")
 
-        # Map character offsets to line.column so embedded widgets never shift search ranges
+        # Map character offsets to line.column, adjusting for embedded windows and skipping elided spans in Visual Mode
         lines = content.split('\n')
         line_starts = []
         offset = 0
         for ln in lines:
             line_starts.append(offset)
             offset += len(ln) + 1
+
+        win_cols_by_line: Dict[int, List[int]] = {}
+        for win in getattr(tab, '_embedded_windows', ()):
+            try:
+                w_idx = w.index(str(win))
+                wl, wc = map(int, w_idx.split('.'))
+                win_cols_by_line.setdefault(wl, []).append(wc)
+            except Exception:
+                pass
+        for wc_list in win_cols_by_line.values():
+            wc_list.sort()
+
+        is_visual = (getattr(tab, 'current_mode', 'source') == 'visual')
+        elide_tags = {'syn_fmt_elide', 'syn_align_tag', 'syn_block_elide', 'syn_delimiter'}
 
         for m in compiled.finditer(content):
             if m.start() == m.end():
@@ -5147,8 +5902,20 @@ class DockedFindReplaceBar(ttk.Frame):
             e_line_idx = bisect.bisect_right(line_starts, max(m.start(), m.end() - 1)) - 1
             s_col = m.start() - line_starts[s_line_idx]
             e_col = m.end() - line_starts[e_line_idx]
-            s_idx = f"{s_line_idx + 1}.{s_col}"
-            e_idx = f"{e_line_idx + 1}.{e_col}"
+            s_ln = s_line_idx + 1
+            e_ln = e_line_idx + 1
+            if s_ln in win_cols_by_line and '\ufffc' not in lines[s_line_idx]:
+                s_col += sum(1 for wc in win_cols_by_line[s_ln] if wc <= s_col)
+            if e_ln in win_cols_by_line and '\ufffc' not in lines[e_line_idx]:
+                e_col += sum(1 for wc in win_cols_by_line[e_ln] if wc <= e_col)
+            s_idx = f"{s_ln}.{s_col}"
+            e_idx = f"{e_ln}.{e_col}"
+            if is_visual:
+                try:
+                    if (elide_tags & set(w.tag_names(s_idx))) or any(w.tag_nextrange(et, s_idx, e_idx) for et in elide_tags):
+                        continue
+                except tk.TclError:
+                    pass
             self._matches.append((s_idx, e_idx))
             w.tag_add("find_match", s_idx, e_idx)
 
@@ -5238,11 +6005,18 @@ class DockedFindReplaceBar(ttk.Frame):
         if not editor:
             return "break"
         s_idx, e_idx = self._matches[self._active_idx]
-        editor.delete(s_idx, e_idx)
-        editor.insert(s_idx, rep_text)
+        matched_str = editor.get(s_idx, e_idx)
+        actual_rep = rep_text
+        if self.regex_var.get():
+            try:
+                actual_rep = compiled.sub(rep_text, matched_str, count=1)
+            except re.error:
+                actual_rep = rep_text
+        _atomic_text_replace(editor, s_idx, e_idx, actual_rep)
         tab.is_modified = True
         self.notepad._update_tab_title(tab)
-        self.notepad._schedule_syntax_highlight()
+        tab._apply_syntax_highlighting()
+        self.notepad._refresh_active_visual_view()
         self._on_query_change()
         return "break"
 
@@ -5398,6 +6172,8 @@ class MarkdownNotepad(tk.Tk):
         )
         self.source_view_var = tk.BooleanVar(value=False)
         self.mode_var = tk.StringVar(value="visual")
+        self._last_doc_font_color = "#dc2626"
+        self._doc_font_color_popup = None
         self._setup_ui()
         self._init_tts_listeners()
         self._setup_bindings()
@@ -5763,6 +6539,19 @@ class MarkdownNotepad(tk.Tk):
         format_menu.add_command(label="Italic", command=lambda: self._insert_format("*", "*"), accelerator="Ctrl+I")
         format_menu.add_command(label="Highlight", command=lambda: self._insert_format("==", "=="), accelerator="Ctrl+Shift+H")
         format_menu.add_command(label="Inline Code", command=lambda: self._insert_format("`", "`"), accelerator="Ctrl+`")
+
+        font_color_menu = tk.Menu(format_menu, tearoff=0)
+        font_color_menu.add_command(label="Automatic (Default)", command=lambda: self.set_document_font_color(None))
+        font_color_menu.add_separator()
+        for _cname, _chex in _DOC_FONT_PALETTE:
+            font_color_menu.add_command(
+                label=f"{_cname} ({_chex})",
+                command=lambda hc=_chex: self.set_document_font_color(hc),
+            )
+        font_color_menu.add_separator()
+        font_color_menu.add_command(label="More Colors...", command=self._choose_document_font_color)
+        format_menu.add_cascade(label="Font Color", menu=font_color_menu)
+
         format_menu.add_separator()
 
         line_spacing_menu = tk.Menu(format_menu, tearoff=0)
@@ -5946,6 +6735,32 @@ class MarkdownNotepad(tk.Tk):
         add_format_button("\U0001f58d HL", lambda: self._insert_format("==", "=="), "Format selected text with a highlight marker (==text==) (Ctrl+Shift+H).")
         add_format_button("</>", lambda: self._insert_format("`", "`"), "Format selected text as inline code (`code`) (Ctrl+`).")
 
+        # Font Color split button (A + swatch bar + dropdown palette)
+        ribbon_bg = self.theme.get('ribbon_bg', '#f3effa')
+        self._doc_font_color_group = tk.Frame(btm, bg=ribbon_bg)
+        self._doc_font_color_group.pack(side=tk.LEFT, padx=2)
+        a_wrap = tk.Frame(self._doc_font_color_group, bg=ribbon_bg)
+        a_wrap.pack(side=tk.LEFT)
+        self._doc_font_apply_btn = tk.Button(
+            a_wrap, text="A", font=(SANS_FONT, 9, "bold"),
+            bg=ribbon_bg, fg="#1e1b4b", activebackground="#ede9fe",
+            relief=tk.FLAT, bd=0, padx=5, pady=0, cursor="hand2", takefocus=0,
+            command=lambda: self.set_document_font_color(self._last_doc_font_color),
+        )
+        self._doc_font_apply_btn.pack(side=tk.TOP, fill=tk.X)
+        self._doc_font_swatch = tk.Frame(a_wrap, bg=self._last_doc_font_color, height=3)
+        self._doc_font_swatch.pack(side=tk.TOP, fill=tk.X, padx=2)
+        self._doc_font_drop_btn = tk.Button(
+            self._doc_font_color_group, text="\u25be", font=(SANS_FONT, 8),
+            bg=ribbon_bg, fg="#1e1b4b", activebackground="#ede9fe",
+            relief=tk.FLAT, bd=0, padx=2, pady=2, cursor="hand2", takefocus=0,
+            command=self._open_ribbon_font_color_popup,
+        )
+        self._doc_font_drop_btn.pack(side=tk.LEFT, fill=tk.Y)
+        ToolTip(self._doc_font_apply_btn, "Apply the active font color to selected text.")
+        ToolTip(self._doc_font_drop_btn, "Choose a font color for selected text.")
+        self._format_buttons.extend([self._doc_font_apply_btn, self._doc_font_drop_btn])
+
         # Line Spacing (1 / 1.5 / 2) and Selected-Text Alignment (Left / Center / Right / None)
         ls_init = _normalize_line_spacing(self.theme.get('line_spacing', 1.0))
         self.line_spacing_mb = ttk.Menubutton(btm, text=f"\u2195 {ls_init:.1f} \u25be", style="Toolbar.TButton")
@@ -6068,7 +6883,7 @@ class MarkdownNotepad(tk.Tk):
         
         self.wrap_label = ttk.Label(self.status_bar, text="Wrap: On", style="Status.TLabel", cursor="hand2")
         self.wrap_label.pack(side=tk.RIGHT, padx=8)
-        self.wrap_label.bind("<Button-1>", lambda e: self.toggle_word_wrap())
+        self.wrap_label.bind("<Button-1>", lambda e: self._toggle_word_wrap())
         ToolTip(self.wrap_label, "Soft word wrap status. Click to toggle between visual line wrapping and unwrapped continuous lines.")
         
         # Word and character count
@@ -6102,12 +6917,12 @@ class MarkdownNotepad(tk.Tk):
     def _setup_bindings(self):
         """Setup keyboard bindings"""
         self.bind("<Control-F1>", lambda e: self._toggle_ribbon_collapse())
-        # Neutralize conflicting default Text class bindings (e.g. Ctrl+I inserting tab)
-        try:
-            self.unbind_class("Text", "<Control-Key-i>")
-            self.unbind_class("Text", "<Control-i>")
-        except Exception:
-            pass
+        # Neutralize conflicting default Text class bindings (Ctrl+I tab, Ctrl+H backspace, Ctrl+O open line)
+        for _seq in ("<Control-Key-i>", "<Control-i>", "<Control-Key-h>", "<Control-h>", "<Control-Key-o>", "<Control-o>"):
+            try:
+                self.unbind_class("Text", _seq)
+            except Exception:
+                pass
 
         self.bind("<Control-n>", lambda e: self.new_document_tab())
         self.bind("<Control-N>", lambda e: self.new_spreadsheet_tab())
@@ -6126,8 +6941,8 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-I>", lambda e: self.insert_image())  # Ctrl+Shift+I
         self.bind("<Control-w>", lambda e: self.close_tab())  # Close tab
         self.bind("<Control-W>", lambda e: self._toggle_word_wrap())  # Ctrl+Shift+W for word wrap
-        self.bind("<Control-T>", lambda e: self._toggle_typewriter_scrolling())  # Ctrl+Shift+T
-        self.bind("<Control-Shift-T>", lambda e: self._toggle_typewriter_scrolling())
+        self.bind("<Control-T>", lambda e: self._toggle_typewriter_shortcut())  # Ctrl+Shift+T
+        self.bind("<Control-Shift-T>", lambda e: self._toggle_typewriter_shortcut())
         self.bind("<Control-z>", self._doc_shortcut(self.undo))
         self.bind("<Control-y>", self._doc_shortcut(self.redo))
         self.bind("<Control-a>", self._doc_shortcut(self.select_all))
@@ -6214,20 +7029,22 @@ class MarkdownNotepad(tk.Tk):
     def _navigate_back(self):
         """Navigate back to previous jump location (Alt+Left) in source/visual mode."""
         tab = self.current_tab
-        if tab:
-            nav_hist = getattr(tab, '_nav_history', None)
-            if nav_hist:
-                prev_idx = nav_hist.pop()
-                try:
-                    editor = tab.source_editor
-                    editor.mark_set(tk.INSERT, prev_idx)
-                    editor.see(prev_idx)
-                    editor.focus_set()
-                    tab._flash_source_line(prev_idx)
-                    self._set_status("Returned to previous location")
-                    return "break"
-                except Exception:
-                    pass
+        if not tab or getattr(tab, 'tab_type', 'document') == 'spreadsheet':
+            return None
+        nav_hist = getattr(tab, '_nav_history', None)
+        if nav_hist and hasattr(tab, 'source_editor'):
+            prev_idx = nav_hist.pop()
+            try:
+                editor = tab.source_editor
+                editor.mark_set(tk.INSERT, prev_idx)
+                editor.see(prev_idx)
+                editor.focus_set()
+                tab._flash_source_line(prev_idx)
+                self._set_status("Returned to previous location")
+                return "break"
+            except Exception:
+                pass
+        if hasattr(tab, 'visual_viewer') and hasattr(tab.visual_viewer, 'navigate_back'):
             return tab.visual_viewer.navigate_back()
         return None
 
@@ -6282,12 +7099,15 @@ class MarkdownNotepad(tk.Tk):
                 for tab_state in state.tabs:
                     t_type = getattr(tab_state, 'tab_type', 'document')
                     if t_type == 'spreadsheet' and SPREADSHEET_AVAILABLE:
+                        tab_ref = []
                         tab = SpreadsheetTab(
                             self.notebook,
                             theme=self.theme,
-                            on_modified_callback=lambda: self._on_tab_modified(),
+                            on_modified_callback=lambda r=tab_ref: self._on_tab_modified(r[0] if r else None),
                             on_selection_change=self._schedule_position_update
                         )
+                        tab_ref.append(tab)
+                        tab.on_modified_callback = lambda t=tab: self._on_tab_modified(t)
                         tab.file_path = tab_state.file_path
                         tab.set_content(tab_state.content)
                         tab.is_modified = tab_state.is_modified
@@ -6299,66 +7119,71 @@ class MarkdownNotepad(tk.Tk):
                         self.tabs.append(tab)
                         continue
 
+                    tab_ref = []
                     tab = DocumentTab(
                         self.notebook,
                         theme=self.theme,
-                        on_modified_callback=lambda: self._on_tab_modified(),
+                        on_modified_callback=lambda r=tab_ref: self._on_tab_modified(r[0] if r else None),
                         on_content_change=lambda c: self._on_visual_edit(c)
                     )
-                    
-                    # Set tab properties
+                    tab_ref.append(tab)
+                    tab.on_modified = lambda t=tab: self._on_tab_modified(t)
+
+                    # Set base_path BEFORE set_content so images resolve on initial render
                     tab.file_path = tab_state.file_path
+                    if tab.file_path:
+                        tab.visual_viewer.set_base_path(os.path.dirname(tab.file_path))
                     tab.set_content(tab_state.content)
                     tab.is_modified = tab_state.is_modified
-                    tab.current_mode = tab_state.current_mode
                     tab.snapshots = list(getattr(tab_state, 'snapshots', []) or [])
-                    
+
                     # Add to notebook
                     tab_name = tab.get_display_name()
                     if tab.is_modified:
                         tab_name = f"*{tab_name}"
                     self.notebook.add(tab, text=tab_name)
                     self.tabs.append(tab)
-                    
+
                     # Setup bindings
                     self._setup_tab_bindings(tab)
                     tab.set_zoom(self.zoom_pct / 100.0)
-                    
+
                     # Restore cursor position
                     try:
                         tab.source_editor.mark_set(tk.INSERT, tab_state.cursor_position)
                         tab.source_editor.see(tab_state.cursor_position)
                     except:
                         pass
-                    
+
                     # Restore scroll position
                     try:
                         tab.source_editor.yview_moveto(tab_state.scroll_position)
                     except:
                         pass
-                    
-                    # Update visual viewer base path
-                    if tab.file_path:
-                        tab.visual_viewer.set_base_path(os.path.dirname(tab.file_path))
-                    
+
                     tab.visual_viewer.live_render_enabled = self.theme.get('live_render_enabled', True)
-                    
-                    # Show correct mode
-                    if tab_state.current_mode == "visual":
-                        tab.switch_mode("visual", self.theme)
+
+                    # Show correct mode (do not overwrite tab.current_mode beforehand)
+                    target_mode = "visual" if tab_state.current_mode == "visual" else "source"
+                    if tab.current_mode != target_mode:
+                        tab.switch_mode(target_mode, self.theme)
                     else:
-                        tab.switch_mode("source", self.theme)
-                
+                        tab.apply_theme(self.theme)
+
                 # Select the active tab
                 if state.active_tab_index < len(self.tabs):
                     self.notebook.select(self.tabs[state.active_tab_index])
                     self.current_tab = self.tabs[state.active_tab_index]
                 elif self.tabs:
                     self.current_tab = self.tabs[0]
-                
-                # Update cache checkbox
+
+                # Update cache checkbox and status displays
                 self.cache_var.set(state.caching_enabled)
-                
+                self._update_mode_display()
+                self._update_position()
+                self._update_word_count()
+                self._schedule_outline_update()
+
                 restored = True
                 self._set_status(f"Restored {len(self.tabs)} tab(s) from previous session")
         
@@ -6551,10 +7376,11 @@ class MarkdownNotepad(tk.Tk):
         if self.current_tab and self.current_tab.file_path:
             doc_id = self.current_tab.file_path
         elif self.current_tab:
-            # Use a hash of content for unsaved documents
+            # Use a deterministic MD5 hash of content for unsaved documents
             content = self.current_tab.get_content()
             if content:
-                doc_id = f"unsaved_{hash(content[:100])}"
+                digest = hashlib.md5(content[:100].encode('utf-8', errors='replace')).hexdigest()[:12]
+                doc_id = f"unsaved_{digest}"
         
         self.ai_sidebar.set_document_id(doc_id)
     
@@ -6662,6 +7488,18 @@ class MarkdownNotepad(tk.Tk):
             menu.add_command(label="Bold", command=lambda: self._insert_format("**", "**"), accelerator="Ctrl+B")
             menu.add_command(label="Italic", command=lambda: self._insert_format("*", "*"), accelerator="Ctrl+I")
             menu.add_command(label="Highlight", command=lambda: self._insert_format("==", "=="), accelerator="Ctrl+Shift+H")
+            if getattr(self.current_tab, 'tab_type', 'document') == 'document':
+                color_ctx = tk.Menu(menu, tearoff=0)
+                color_ctx.add_command(label="Automatic (Default)", command=lambda: self.set_document_font_color(None))
+                color_ctx.add_separator()
+                for _cname, _chex in _DOC_FONT_PALETTE:
+                    color_ctx.add_command(
+                        label=f"{_cname} ({_chex})",
+                        command=lambda hc=_chex: self.set_document_font_color(hc),
+                    )
+                color_ctx.add_separator()
+                color_ctx.add_command(label="More Colors...", command=self._choose_document_font_color)
+                menu.add_cascade(label="Font Color", menu=color_ctx)
 
         if self.current_tab and getattr(self.current_tab, 'tab_type', 'document') == 'document':
             align_ctx = tk.Menu(menu, tearoff=0)
@@ -6767,13 +7605,14 @@ class MarkdownNotepad(tk.Tk):
         
         # Open the diff panel
         if DIFF_PANEL_AVAILABLE:
+            orig_tab = self.current_tab
             DiffPanel(
                 self,
                 original_text=text,
                 start_index=start,
                 end_index=end,
                 action_name=action_name,
-                on_accept=self._apply_diff,
+                on_accept=lambda rep, s, e, orig, mode="replace", t=orig_tab: self._apply_diff(rep, s, e, orig, mode, target_tab=t),
                 llm_client=llm_client,
                 settings=ai_settings,
                 messages=messages,
@@ -6782,15 +7621,21 @@ class MarkdownNotepad(tk.Tk):
         else:
             messagebox.showwarning("Unavailable", "Diff panel module not found.")
 
-    def _apply_diff(self, replacement_text, start_index, end_index, original_text, apply_mode="replace"):
-        """Apply a diff replacement or insertion to the current document."""
-        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+    def _apply_diff(self, replacement_text, start_index, end_index, original_text, apply_mode="replace", target_tab=None):
+        """Apply a diff replacement or insertion to *target_tab* (defaults to current_tab)."""
+        tab = target_tab if target_tab is not None else self.current_tab
+        if not tab or getattr(tab, 'tab_type', 'document') == 'spreadsheet':
             return
-        
-        editor = self.current_tab.source_editor
-        if self.current_tab.current_mode == "visual":
-            self.current_tab.clear_embedded_widgets()
-        
+        try:
+            if not tab.winfo_exists():
+                return
+        except Exception:
+            return
+
+        editor = tab.source_editor
+        if tab.current_mode == "visual":
+            tab.clear_embedded_widgets()
+
         if apply_mode == "cursor":
             insert_pos = editor.index(tk.INSERT)
             editor.insert(insert_pos, replacement_text)
@@ -6801,8 +7646,7 @@ class MarkdownNotepad(tk.Tk):
             editor.insert(tk.END, prefix + replacement_text)
             action_desc = f"Appended to document ({len(replacement_text)} chars)"
         elif apply_mode == "full":
-            editor.delete('1.0', tk.END)
-            editor.insert('1.0', replacement_text)
+            _atomic_text_replace(editor, '1.0', tk.END, replacement_text)
             action_desc = f"Replaced entire document ({len(replacement_text)} chars)"
         else:
             # Default: replace target range
@@ -6815,28 +7659,31 @@ class MarkdownNotepad(tk.Tk):
             except tk.TclError:
                 messagebox.showwarning("Warning", "Could not locate the original text position.")
                 return
-            
+
             if original_text and current_text.rstrip('\n') != original_text.rstrip('\n'):
                 if not messagebox.askyesno("Text Changed",
                     "The original text has been modified since the suggestion was generated.\n\n"
                     "Apply the replacement anyway?"):
                     return
-            
-            editor.delete(start_idx, end_idx)
-            editor.insert(start_idx, replacement_text)
+
+            _atomic_text_replace(editor, start_idx, end_idx, replacement_text)
             action_desc = f"Applied edit ({len(replacement_text)} chars)"
-        
+
         # Mark as modified and refresh UI state
-        self.current_tab.is_modified = True
-        self._update_tab_title(self.current_tab)
-        self._schedule_syntax_highlight()
-        self._schedule_outline_update()
-        
+        tab.is_modified = True
+        self._update_tab_title(tab)
+        if tab is self.current_tab:
+            self._update_title()
+            self._schedule_syntax_highlight()
+            self._schedule_outline_update()
+        else:
+            tab._apply_syntax_highlighting()
+
         # Update visual viewer if in visual mode
-        if self.current_tab.current_mode == "visual":
-            content = self.current_tab.source_editor.get('1.0', tk.END).rstrip()
-            self.current_tab.visual_viewer.set_content(content)
-        
+        if tab.current_mode == "visual":
+            content = tab.source_editor.get('1.0', tk.END).rstrip()
+            tab.visual_viewer.set_content(content)
+
         self._set_status(action_desc)
 
     def _on_apply_edit_from_chat(self, original_text, replacement_text, start_index, end_index):
@@ -6892,17 +7739,18 @@ class MarkdownNotepad(tk.Tk):
                 end_index = tk.END
                 default_mode = "replace" if original_text.strip() else "cursor"
         
+        orig_tab = self.current_tab
         if not DIFF_PANEL_AVAILABLE:
-            self._apply_diff(replacement_text, start_index, end_index, original_text, default_mode)
+            self._apply_diff(replacement_text, start_index, end_index, original_text, default_mode, target_tab=orig_tab)
             return
-        
+
         panel = DiffPanel(
             self,
             original_text=original_text,
             start_index=start_index,
             end_index=end_index,
             action_name="Review & Apply from Chat",
-            on_accept=self._apply_diff,
+            on_accept=lambda rep, s, e, orig, mode="replace", t=orig_tab: self._apply_diff(rep, s, e, orig, mode, target_tab=t),
             theme=self.theme,
             default_apply_mode=default_mode,
         )
@@ -6910,17 +7758,18 @@ class MarkdownNotepad(tk.Tk):
 
     # === Document Snapshots (Checkpoints) Methods ===
 
-    def create_quick_snapshot(self, name: Optional[str] = None):
-        """Create a named snapshot checkpoint of the current document."""
-        if not self.current_tab:
+    def create_quick_snapshot(self, name: Optional[str] = None, tab=None):
+        """Create a named snapshot checkpoint of *tab* (defaults to current_tab)."""
+        target_tab = tab if tab is not None else self.current_tab
+        if not target_tab:
             return
         from datetime import datetime
-        content = self.current_tab.get_content()
+        content = target_tab.get_content()
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         short_time = datetime.now().strftime("%H:%M:%S")
-        if not hasattr(self.current_tab, 'snapshots') or self.current_tab.snapshots is None:
-            self.current_tab.snapshots = []
-        idx = len(self.current_tab.snapshots) + 1
+        if not hasattr(target_tab, 'snapshots') or target_tab.snapshots is None:
+            target_tab.snapshots = []
+        idx = len(target_tab.snapshots) + 1
         snap_name = name.strip() if (name and name.strip()) else f"Checkpoint #{idx} ({short_time})"
         word_count = len(content.split()) if content.strip() else 0
         snapshot = {
@@ -6929,7 +7778,7 @@ class MarkdownNotepad(tk.Tk):
             'content': content,
             'word_count': word_count,
         }
-        self.current_tab.snapshots.append(snapshot)
+        target_tab.snapshots.append(snapshot)
         if self.session_manager and self.session_manager.is_caching_enabled():
             self._save_session()
         self._set_status(f"Saved snapshot: '{snap_name}' ({word_count} words)")
@@ -6943,6 +7792,13 @@ class MarkdownNotepad(tk.Tk):
 
     # === Export Methods ===
 
+    def _export_base_path(self, tab) -> str:
+        vv_base = getattr(getattr(tab, 'visual_viewer', None), 'base_path', None)
+        if vv_base:
+            return vv_base
+        fpath = getattr(tab, 'file_path', None) or getattr(tab, 'source_file_path', None)
+        return os.path.dirname(fpath) if fpath else os.getcwd()
+
     def _export_pdf(self):
         """Export current document to PDF"""
         if not self.current_tab:
@@ -6952,11 +7808,12 @@ class MarkdownNotepad(tk.Tk):
                 "PDF export requires 'weasyprint' and 'markdown'.\n"
                 "Install with: pip install weasyprint markdown")
             return
-        
+
         default_name = "document.pdf"
-        if self.current_tab.file_path:
-            default_name = os.path.splitext(os.path.basename(self.current_tab.file_path))[0] + ".pdf"
-        
+        ref_path = self.current_tab.file_path or getattr(self.current_tab, 'source_file_path', None)
+        if ref_path:
+            default_name = os.path.splitext(os.path.basename(ref_path))[0] + ".pdf"
+
         filepath = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf")],
@@ -6964,14 +7821,20 @@ class MarkdownNotepad(tk.Tk):
         )
         if not filepath:
             return
-        
+
         self._set_status("Exporting to PDF...")
         self.update_idletasks()
-        
+
         try:
             content = self.current_tab.to_markdown_document() if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet' else self.current_tab.get_content()
-            base_path = os.path.dirname(self.current_tab.file_path) if self.current_tab.file_path else os.getcwd()
-            export_to_pdf(content, filepath, theme=self.theme, base_path=base_path)
+            base_path = self._export_base_path(self.current_tab)
+            _ps_map = {'Letter': 'letter', 'A4': 'A4', 'Narrow': '7in 11in', 'Wide': '10in 11in'}
+            _pm_map = {'Normal': '1in', 'Narrow': '0.5in', 'Wide': '1.5in'}
+            page_settings = {
+                'page_size': _ps_map.get(self.theme.get('page_size', 'Letter'), 'letter'),
+                'margin': _pm_map.get(self.theme.get('page_margin', 'Normal'), '1in'),
+            }
+            export_to_pdf(content, filepath, theme=self.theme, page_settings=page_settings, base_path=base_path)
             self._set_status(f"Exported to: {filepath}")
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export PDF:\n{e}")
@@ -6985,11 +7848,12 @@ class MarkdownNotepad(tk.Tk):
             messagebox.showwarning("Unavailable",
                 "HTML export requires 'markdown'.\nInstall with: pip install markdown")
             return
-        
+
         default_name = "document.html"
-        if self.current_tab.file_path:
-            default_name = os.path.splitext(os.path.basename(self.current_tab.file_path))[0] + ".html"
-        
+        ref_path = self.current_tab.file_path or getattr(self.current_tab, 'source_file_path', None)
+        if ref_path:
+            default_name = os.path.splitext(os.path.basename(ref_path))[0] + ".html"
+
         filepath = filedialog.asksaveasfilename(
             defaultextension=".html",
             filetypes=[("HTML files", "*.html *.htm")],
@@ -6997,10 +7861,10 @@ class MarkdownNotepad(tk.Tk):
         )
         if not filepath:
             return
-        
+
         try:
             content = self.current_tab.to_markdown_document() if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet' else self.current_tab.get_content()
-            base_path = os.path.dirname(self.current_tab.file_path) if self.current_tab.file_path else os.getcwd()
+            base_path = self._export_base_path(self.current_tab)
             export_to_html(content, filepath, theme=self.theme, base_path=base_path)
             self._set_status(f"Exported to: {filepath}")
         except Exception as e:
@@ -7015,11 +7879,12 @@ class MarkdownNotepad(tk.Tk):
             messagebox.showwarning("Unavailable",
                 "DOCX export requires 'python-docx'.\nInstall with: pip install python-docx")
             return
-        
+
         default_name = "document.docx"
-        if self.current_tab.file_path:
-            default_name = os.path.splitext(os.path.basename(self.current_tab.file_path))[0] + ".docx"
-        
+        ref_path = self.current_tab.file_path or getattr(self.current_tab, 'source_file_path', None)
+        if ref_path:
+            default_name = os.path.splitext(os.path.basename(ref_path))[0] + ".docx"
+
         filepath = filedialog.asksaveasfilename(
             defaultextension=".docx",
             filetypes=[("Word documents", "*.docx")],
@@ -7027,10 +7892,10 @@ class MarkdownNotepad(tk.Tk):
         )
         if not filepath:
             return
-        
+
         try:
             content = self.current_tab.to_markdown_document() if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet' else self.current_tab.get_content()
-            base_path = os.path.dirname(self.current_tab.file_path) if self.current_tab.file_path else os.getcwd()
+            base_path = self._export_base_path(self.current_tab)
             export_to_docx(content, filepath, theme=self.theme, base_path=base_path)
             self._set_status(f"Exported to: {filepath}")
         except Exception as e:
@@ -7049,12 +7914,15 @@ class MarkdownNotepad(tk.Tk):
             messagebox.showwarning("Unavailable", "Spreadsheet module could not be loaded.", parent=self)
             return None
 
+        tab_ref = []
         tab = SpreadsheetTab(
             self.notebook,
             theme=self.theme,
-            on_modified_callback=lambda: self._on_tab_modified(),
+            on_modified_callback=lambda r=tab_ref: self._on_tab_modified(r[0] if r else None),
             on_selection_change=self._schedule_position_update
         )
+        tab_ref.append(tab)
+        tab.on_modified_callback = lambda t=tab: self._on_tab_modified(t)
         if file_path:
             tab.file_path = file_path
         if content:
@@ -7127,43 +7995,47 @@ class MarkdownNotepad(tk.Tk):
 
     def new_tab(self, file_path=None, content=""):
         """Create a new tab"""
+        tab_ref = []
         tab = DocumentTab(
             self.notebook,
             theme=self.theme,
-            on_modified_callback=lambda: self._on_tab_modified(),
+            on_modified_callback=lambda r=tab_ref: self._on_tab_modified(r[0] if r else None),
             on_content_change=lambda c: self._on_visual_edit(c)
         )
-        
+        tab_ref.append(tab)
+        tab.on_modified = lambda t=tab: self._on_tab_modified(t)
+
         # Add to notebook
         tab_name = tab.get_display_name() if not file_path else os.path.basename(file_path)
         self.notebook.add(tab, text=tab_name)
         self.tabs.append(tab)
-        
-        # Set file path if provided
+
+        # Set file path and base_path BEFORE set_content so images resolve
         if file_path:
             tab.file_path = file_path
-        
+            tab.visual_viewer.set_base_path(os.path.dirname(file_path))
+
         # Set content if provided
         if content:
             tab.set_content(content)
-        
+
         # Setup bindings for this tab
         self._setup_tab_bindings(tab)
         tab.set_zoom(self.zoom_pct / 100.0)
         if not self.word_wrap:
             tab.set_wrap(False)
-        
+
         tab.visual_viewer.live_render_enabled = self.theme.get('live_render_enabled', True)
-        
+
         # Select the new tab
         self.notebook.select(tab)
         self.current_tab = tab
-        
+
         self._update_title()
         self._do_syntax_highlight()
         self._schedule_outline_update()
         return tab
-    
+
     def _setup_tab_bindings(self, tab):
         """Setup bindings for a specific tab"""
         # Mouse wheel zoom (text widgets and the desk around the page)
@@ -7172,11 +8044,11 @@ class MarkdownNotepad(tk.Tk):
         tab.source_page.on_zoom_wheel = self._on_ctrl_mousewheel
         tab.visual_viewer.page_view.on_zoom_wheel = self._on_ctrl_mousewheel
         tab.visual_viewer.on_zoom_wheel = self._on_ctrl_mousewheel
-        
+
         # Position & selection tracking (both source and visual modes)
-        tab.source_editor.bind("<KeyRelease>", self._schedule_position_update)
+        tab.source_editor.bind("<KeyRelease>", self._schedule_position_update, add='+')
         tab.source_editor.bind("<KeyRelease>", self._schedule_syntax_highlight, add='+')
-        tab.source_editor.bind("<ButtonRelease>", self._schedule_position_update)
+        tab.source_editor.bind("<ButtonRelease-1>", self._schedule_position_update, add='+')
         tab.source_editor.bind("<<Selection>>", self._schedule_position_update)
         tab.visual_viewer.text_widget.bind("<ButtonRelease>", self._schedule_position_update)
         tab.visual_viewer.text_widget.bind("<KeyRelease>", self._schedule_position_update)
@@ -7237,11 +8109,20 @@ class MarkdownNotepad(tk.Tk):
         
         # Get tab index
         tab_index = self.tabs.index(tab)
-        
-        # Remove from notebook
+
+        # Remove from notebook and clean up resources
         self.notebook.forget(tab)
         self.tabs.remove(tab)
-        
+        if hasattr(tab, 'cleanup'):
+            try:
+                tab.cleanup()
+            except Exception:
+                pass
+        try:
+            tab.destroy()
+        except Exception:
+            pass
+
         # If no tabs left, create new empty tab
         if not self.tabs:
             self.new_tab()
@@ -7249,7 +8130,7 @@ class MarkdownNotepad(tk.Tk):
             # Select adjacent tab
             new_index = min(tab_index, len(self.tabs) - 1)
             self.notebook.select(self.tabs[new_index])
-        
+
         self._update_title()
     
     def _on_tab_changed(self, event=None):
@@ -7283,12 +8164,14 @@ class MarkdownNotepad(tk.Tk):
         except:
             pass
     
-    def _on_tab_modified(self):
+    def _on_tab_modified(self, tab=None):
         """Called when any tab is modified"""
-        if self.current_tab:
+        target = tab if tab is not None else self.current_tab
+        if target:
             # Update tab title to show modified indicator
-            self._update_tab_title(self.current_tab)
-            self._update_title()
+            self._update_tab_title(target)
+            if target is self.current_tab:
+                self._update_title()
     
     def _update_tab_title(self, tab):
         """Update the tab title in the notebook"""
@@ -7484,6 +8367,12 @@ class MarkdownNotepad(tk.Tk):
         self.wrap_label.config(text=f"Wrap: {'On' if self.word_wrap else 'Off'}")
         status = "Word wrap enabled" if self.word_wrap else "Word wrap disabled (horizontal scroll)"
         self._set_status(status)
+
+    def _toggle_typewriter_shortcut(self):
+        """Flip typewriter_var and toggle typewriter scrolling for Ctrl+Shift+T."""
+        self.typewriter_var.set(not self.typewriter_var.get())
+        self._toggle_typewriter_scrolling()
+        return "break"
 
     def _toggle_typewriter_scrolling(self):
         """Toggle typewriter scrolling (keep cursor line vertically centered)"""
@@ -7827,7 +8716,8 @@ class MarkdownNotepad(tk.Tk):
 
         # Check if already open in a tab
         for tab in self.tabs:
-            if tab.file_path and os.path.normpath(tab.file_path) == filepath:
+            existing_p = tab.file_path or getattr(tab, 'source_file_path', None)
+            if existing_p and os.path.normpath(existing_p) == filepath:
                 self.notebook.select(tab)
                 self._set_status(f"File already open: {os.path.basename(filepath)}")
                 return
@@ -7849,11 +8739,12 @@ class MarkdownNotepad(tk.Tk):
             with open(filepath, 'r', encoding='utf-8') as f:
                 content = f.read()
 
-            tab = self.new_tab(file_path=filepath, content=content)
+            tab = self.new_tab(file_path=filepath)
+            tab.visual_viewer.set_base_path(os.path.dirname(filepath))
+            tab.set_content(content)
             tab.is_modified = False
             self._update_tab_title(tab)
             self._set_status(f"Opened: {filepath}")
-            tab.visual_viewer.set_base_path(os.path.dirname(filepath))
             self._add_to_recent_files(filepath)
         except UnicodeDecodeError:
             # Fallback to MarkItDown if available
@@ -7894,7 +8785,8 @@ class MarkdownNotepad(tk.Tk):
 
         # Check if already open in a tab
         for tab in self.tabs:
-            if tab.file_path and os.path.normpath(tab.file_path) == filepath:
+            existing_p = tab.file_path or getattr(tab, 'source_file_path', None)
+            if existing_p and os.path.normpath(existing_p) == filepath:
                 self.notebook.select(tab)
                 self._set_status(f"File already open: {os.path.basename(filepath)}")
                 return
@@ -7969,15 +8861,17 @@ class MarkdownNotepad(tk.Tk):
 
                 if msg_type == 'success':
                     content, extracted, out_dir, fpath = args
-                    tab = self.new_tab(file_path=fpath, content=content)
+                    ext_low = Path(fpath).suffix.lower()
+                    is_non_md = (ext_low in MARKITDOWN_DOCUMENT_EXTENSIONS) or (ext_low not in ('.md', '.markdown', '.txt'))
+                    tab = self.new_tab(file_path=None if is_non_md else fpath)
+                    if is_non_md:
+                        tab.source_file_path = fpath
+                    tab.visual_viewer.set_base_path(out_dir if out_dir else os.path.dirname(fpath))
+                    tab.set_content(content)
                     tab.is_modified = False
                     self._update_tab_title(tab)
-                    
-                    if out_dir:
-                        tab.visual_viewer.set_base_path(out_dir)
-                    else:
-                        tab.visual_viewer.set_base_path(os.path.dirname(fpath))
-                    
+                    self._update_title()
+
                     self._add_to_recent_files(fpath)
                     
                     img_count = len(extracted)
@@ -8019,6 +8913,8 @@ class MarkdownNotepad(tk.Tk):
                 return self.save_file_as()
             
         if self.current_tab.file_path:
+            if Path(self.current_tab.file_path).suffix.lower() in MARKITDOWN_DOCUMENT_EXTENSIONS:
+                return self.save_file_as()
             try:
                 content = self.current_tab.get_content()
                 with open(self.current_tab.file_path, 'w', encoding='utf-8') as f:
@@ -8068,11 +8964,17 @@ class MarkdownNotepad(tk.Tk):
             ("Text files", "*.txt"),
             ("All files", "*.*")
         ]
-        
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".md",
-            filetypes=filetypes
-        )
+
+        save_kwargs = {"defaultextension": ".md", "filetypes": filetypes}
+        ref_src = getattr(self.current_tab, 'source_file_path', None)
+        if not self.current_tab.file_path and ref_src:
+            save_kwargs["initialfile"] = Path(ref_src).stem + ".md"
+            save_kwargs["initialdir"] = os.path.dirname(ref_src)
+        elif self.current_tab.file_path and Path(self.current_tab.file_path).suffix.lower() in MARKITDOWN_DOCUMENT_EXTENSIONS:
+            save_kwargs["initialfile"] = Path(self.current_tab.file_path).stem + ".md"
+            save_kwargs["initialdir"] = os.path.dirname(self.current_tab.file_path)
+
+        filepath = filedialog.asksaveasfilename(**save_kwargs)
         
         if filepath:
             try:
@@ -8430,8 +9332,7 @@ class MarkdownNotepad(tk.Tk):
             return
 
         cleaned = clean_document(selected_text)
-        text_widget.delete(sel_start, sel_end)
-        text_widget.insert(sel_start, cleaned)
+        _atomic_text_replace(text_widget, sel_start, sel_end, cleaned)
         self.current_tab.is_modified = True
         self._update_tab_title(self.current_tab)
         self._schedule_syntax_highlight()
@@ -8456,34 +9357,38 @@ class MarkdownNotepad(tk.Tk):
             elif prefix == "*":
                 self.current_tab.toggle_italic_selection()
             return "break"
-        
+
         tab = self.current_tab
         editor = tab.source_editor
         p_len = len(prefix)
         s_len = len(suffix)
-        
+
         try:
             first = editor.index(tk.SEL_FIRST)
             last = editor.index(tk.SEL_LAST)
             selected = editor.get(first, last)
-            
+
             # Case A: Selection itself starts with prefix and ends with suffix (toggle off)
             is_wrapped_inside = False
-            if prefix == "*" and (selected.startswith("**") or selected.endswith("**")):
-                is_wrapped_inside = False
+            if prefix == "*":
+                if selected.startswith("***") and selected.endswith("***") and len(selected) > 6:
+                    is_wrapped_inside = True
+                elif (selected.startswith("**") or selected.endswith("**")):
+                    is_wrapped_inside = False
+                elif len(selected) >= p_len + s_len and selected.startswith(prefix) and selected.endswith(suffix):
+                    is_wrapped_inside = True
             elif len(selected) >= p_len + s_len and selected.startswith(prefix) and selected.endswith(suffix):
                 is_wrapped_inside = True
 
             if is_wrapped_inside:
                 inner = selected[p_len:-s_len]
-                editor.delete(first, last)
-                editor.insert(first, inner)
+                _atomic_text_replace(editor, first, last, inner)
                 new_last = f"{first}+{len(inner)}c"
                 editor.tag_add(tk.SEL, first, new_last)
                 editor.mark_set(tk.INSERT, new_last)
-                self.current_tab.is_modified = True
-                self._update_tab_title(self.current_tab)
-                self._schedule_syntax_highlight()
+                tab.is_modified = True
+                self._update_tab_title(tab)
+                tab._apply_syntax_highlighting()
                 self._refresh_active_visual_view()
                 return "break"
 
@@ -8493,37 +9398,38 @@ class MarkdownNotepad(tk.Tk):
             after = editor.get(last, f"{last}+{s_len}c")
             if before == prefix and after == suffix:
                 can_unwrap_outside = True
-                # Ensure single asterisk italic does not strip from bold (**)
-                if prefix == "*":
-                    char_before = editor.get(f"{first}-{p_len+1}c", f"{first}-{p_len}c")
-                    char_after = editor.get(f"{last}+{s_len}c", f"{last}+{s_len+1}c")
-                    if char_before == "*" or char_after == "*":
-                        can_unwrap_outside = False
+                if prefix in ("*", "**"):
+                    left_ctx = editor.get(f"{first} linestart", first)
+                    right_ctx = editor.get(last, f"{last} lineend")
+                    left_stars = len(left_ctx) - len(left_ctx.rstrip("*"))
+                    right_stars = len(right_ctx) - len(right_ctx.lstrip("*"))
+                    if prefix == "*":
+                        can_unwrap_outside = (left_stars in (1, 3) and right_stars in (1, 3))
+                    else:
+                        can_unwrap_outside = (left_stars >= 2 and right_stars >= 2)
 
             if can_unwrap_outside:
-                editor.delete(last, f"{last}+{s_len}c")
-                editor.delete(f"{first}-{p_len}c", first)
-                new_first = f"{first}-{p_len}c"
+                new_first = editor.index(f"{first}-{p_len}c")
+                _atomic_text_replace(editor, new_first, f"{last}+{s_len}c", selected)
                 new_last = f"{new_first}+{len(selected)}c"
                 editor.tag_add(tk.SEL, new_first, new_last)
                 editor.mark_set(tk.INSERT, new_last)
-                self.current_tab.is_modified = True
-                self._update_tab_title(self.current_tab)
-                self._schedule_syntax_highlight()
+                tab.is_modified = True
+                self._update_tab_title(tab)
+                tab._apply_syntax_highlighting()
                 self._refresh_active_visual_view()
                 return "break"
 
             # Case C: Apply formatting around selected text
-            editor.delete(first, last)
-            editor.insert(first, f"{prefix}{selected}{suffix}")
+            _atomic_text_replace(editor, first, last, f"{prefix}{selected}{suffix}")
             new_sel_first = f"{first}+{p_len}c"
             new_sel_last = f"{first}+{p_len + len(selected)}c"
             editor.tag_add(tk.SEL, new_sel_first, new_sel_last)
             editor.mark_set(tk.INSERT, new_sel_last)
             editor.see(new_sel_last)
-            self.current_tab.is_modified = True
-            self._update_tab_title(self.current_tab)
-            self._schedule_syntax_highlight()
+            tab.is_modified = True
+            self._update_tab_title(tab)
+            tab._apply_syntax_highlighting()
             self._refresh_active_visual_view()
             return "break"
 
@@ -8534,11 +9440,203 @@ class MarkdownNotepad(tk.Tk):
             new_pos = f"{insert_pos}+{p_len}c"
             editor.mark_set(tk.INSERT, new_pos)
             editor.see(new_pos)
-            self.current_tab.is_modified = True
-            self._update_tab_title(self.current_tab)
-            self._schedule_syntax_highlight()
+            tab.is_modified = True
+            self._update_tab_title(tab)
+            tab._apply_syntax_highlighting()
             self._refresh_active_visual_view()
             return "break"
+
+    def _open_ribbon_font_color_popup(self):
+        """Open the Font Color palette anchored to the ribbon Deck 2 color group."""
+        anchor = getattr(self, '_doc_font_color_group', None) or self
+        if getattr(self, '_doc_font_color_popup', None) and self._doc_font_color_popup.winfo_exists():
+            self._doc_font_color_popup.close(invoke_on_close=False)
+            self._doc_font_color_popup = None
+            return
+
+        def _on_pick(hex_c):
+            self._doc_font_color_popup = None
+            self.set_document_font_color(hex_c)
+            self._focus_active_editor()
+
+        def _on_close():
+            self._doc_font_color_popup = None
+            self._focus_active_editor()
+
+        self._doc_font_color_popup = _DocColorPalettePopup(
+            self,
+            anchor_widget=anchor,
+            on_select=_on_pick,
+            on_close=_on_close,
+            initial_color=self._last_doc_font_color,
+        )
+
+    def _choose_document_font_color(self):
+        """Open OS color chooser and apply chosen color to selected document text."""
+        res = colorchooser.askcolor(color=self._last_doc_font_color, title="Choose Font Color", parent=self)
+        if res and res[1]:
+            self.set_document_font_color(res[1])
+
+    @staticmethod
+    def _apply_color_to_single_line(line_text: str, s_col: int, e_col: int, norm: Optional[str]) -> Tuple[str, int, int]:
+        """Apply or strip <span style="color:..."> on [s_col, e_col] of *line_text*, keeping block prefixes outside."""
+        m_al = _ALIGN_SINGLE_RE.match(line_text)
+        c_min = m_al.start(3) if m_al else 0
+        c_max = m_al.end(3) if m_al else len(line_text)
+        inner_slice = line_text[c_min:c_max]
+        m_pfx = re.match(r'^(\s*(?:#{1,6}\s+|>\s?|[-*+]\s+|\d+\.\s+))', inner_slice)
+        pfx_end = c_min + (len(m_pfx.group(1)) if m_pfx else 0)
+
+        s_c = max(pfx_end, min(c_max, s_col))
+        e_c = max(s_c, min(c_max, e_col))
+        if s_c >= e_c:
+            return line_text, s_c, e_c
+
+        # Case 1: Wholly inside an existing <span style="color:#old">...</span>
+        for m in _COLOR_SPAN_RE.finditer(line_text):
+            span_s, span_e = m.start(), m.end()
+            inner_s, inner_e = m.start(2), m.end(2)
+            old_col = _normalize_hex_color(m.group(1))
+            if inner_s <= s_c and e_c <= inner_e and old_col:
+                before_txt = line_text[inner_s:s_c]
+                mid_txt = _COLOR_CLOSE_RE.sub('', _COLOR_ANY_OPEN_RE.sub('', line_text[s_c:e_c]))
+                after_txt = line_text[e_c:inner_e]
+                parts = []
+                if before_txt:
+                    parts.append(f'<span style="color:{old_col}">{before_txt}</span>')
+                mid_offset = sum(len(p) for p in parts)
+                if norm and mid_txt:
+                    open_tag = f'<span style="color:{norm}">'
+                    parts.append(f'{open_tag}{mid_txt}</span>')
+                    sel_s = span_s + mid_offset + len(open_tag)
+                    sel_e = sel_s + len(mid_txt)
+                else:
+                    parts.append(mid_txt)
+                    sel_s = span_s + mid_offset
+                    sel_e = sel_s + len(mid_txt)
+                if after_txt:
+                    parts.append(f'<span style="color:{old_col}">{after_txt}</span>')
+                new_line = line_text[:span_s] + "".join(parts) + line_text[span_e:]
+                return new_line, sel_s, sel_e
+
+        # Case 2: General selection (handle any partial overlap at boundaries cleanly)
+        prefix = line_text[:s_c]
+        sel_raw = line_text[s_c:e_c]
+        suffix = line_text[e_c:]
+
+        # Fix left partial overlap if s_c falls inside an existing span
+        for m in _COLOR_SPAN_RE.finditer(line_text):
+            span_s, span_e = m.start(), m.end()
+            inner_s, inner_e = m.start(2), m.end(2)
+            if span_s < s_c < inner_e and e_c > inner_e:
+                if s_c <= inner_s:
+                    # Started inside opening tag itself
+                    prefix = line_text[:span_s]
+                else:
+                    prefix = prefix + '</span>'
+                break
+
+        # Fix right partial overlap if e_c falls inside an existing span
+        for m in _COLOR_SPAN_RE.finditer(line_text):
+            span_s, span_e = m.start(), m.end()
+            inner_s, inner_e = m.start(2), m.end(2)
+            old_col = _normalize_hex_color(m.group(1))
+            if span_s < e_c < span_e and s_c < span_s:
+                if e_c >= inner_e:
+                    # Ended inside closing </span>
+                    suffix = line_text[span_e:]
+                elif old_col:
+                    suffix = f'<span style="color:{old_col}">' + suffix
+                break
+
+        sel_clean = _COLOR_CLOSE_RE.sub('', _COLOR_ANY_OPEN_RE.sub('', sel_raw))
+        if norm and sel_clean:
+            open_tag = f'<span style="color:{norm}">'
+            wrapped = f'{open_tag}{sel_clean}</span>'
+            sel_s = len(prefix) + len(open_tag)
+            sel_e = sel_s + len(sel_clean)
+        else:
+            wrapped = sel_clean
+            sel_s = len(prefix)
+            sel_e = sel_s + len(sel_clean)
+
+        return prefix + wrapped + suffix, sel_s, sel_e
+
+    def set_document_font_color(self, color: Optional[str]):
+        """Apply or reset font color on selected text in the active document or spreadsheet tab."""
+        if not self.current_tab:
+            return "break"
+        if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+            self.current_tab.set_cell_fg_color(color)
+            return "break"
+
+        norm = _normalize_hex_color(color) if color is not None else None
+        if color is not None and norm is None:
+            return "break"
+
+        if norm is not None:
+            self._last_doc_font_color = norm
+            if hasattr(self, '_doc_font_swatch') and self._doc_font_swatch.winfo_exists():
+                self._doc_font_swatch.config(bg=norm)
+
+        tab = self.current_tab
+        editor = tab.source_editor
+        try:
+            first = editor.index(tk.SEL_FIRST)
+            last = editor.index(tk.SEL_LAST)
+        except tk.TclError:
+            self._set_status("Select text to apply font color")
+            return "break"
+
+        s_line, s_col = map(int, first.split('.'))
+        e_line, e_col = map(int, last.split('.'))
+        if s_line == e_line and s_col == e_col:
+            return "break"
+
+        if s_line == e_line:
+            line_text = editor.get(f"{s_line}.0", f"{s_line}.end")
+            new_line, sel_s, sel_e = self._apply_color_to_single_line(line_text, s_col, e_col, norm)
+            _atomic_text_replace(editor, f"{s_line}.0", f"{s_line}.end", new_line)
+            new_first = f"{s_line}.{sel_s}"
+            new_last = f"{s_line}.{sel_e}"
+        else:
+            last_full = (e_col == 0)
+            eff_e_line = e_line - 1 if (last_full and e_line > s_line) else e_line
+            new_lines = []
+            first_sel_s = 0
+            last_sel_e = 0
+            for ln in range(s_line, eff_e_line + 1):
+                raw = editor.get(f"{ln}.0", f"{ln}.end")
+                if not raw.strip() or _ALIGN_OPEN_RE.match(raw) or _ALIGN_CLOSE_RE.match(raw):
+                    new_lines.append(raw)
+                    if ln == s_line:
+                        first_sel_s = len(raw)
+                    if ln == eff_e_line:
+                        last_sel_e = len(raw)
+                    continue
+                ls = s_col if ln == s_line else 0
+                le = len(raw) if (ln < eff_e_line or last_full) else e_col
+                nl, ns, ne = self._apply_color_to_single_line(raw, ls, le, norm)
+                new_lines.append(nl)
+                if ln == s_line:
+                    first_sel_s = ns
+                if ln == eff_e_line:
+                    last_sel_e = ne
+            replacement = "\n".join(new_lines)
+            _atomic_text_replace(editor, f"{s_line}.0", f"{eff_e_line}.end", replacement)
+            new_first = f"{s_line}.{first_sel_s}"
+            new_last = f"{eff_e_line}.{last_sel_e}"
+
+        editor.tag_remove(tk.SEL, "1.0", tk.END)
+        editor.tag_add(tk.SEL, new_first, new_last)
+        editor.mark_set(tk.INSERT, new_last)
+        editor.see(new_last)
+        tab.is_modified = True
+        self._update_tab_title(tab)
+        tab._apply_syntax_highlighting()
+        self._refresh_active_visual_view()
+        self._set_status(f"Font color set to {norm}" if norm else "Font color reset to default")
+        return "break"
 
     def set_document_line_spacing(self, spacing: Any):
         """Apply global document line spacing (1.0, 1.5, or 2.0) to all DocumentTabs and save theme."""
@@ -8610,10 +9708,7 @@ class MarkdownNotepad(tk.Tk):
         else:
             replacement = f'<div align="{align_norm}">\n' + "\n".join(clean_lines) + "\n</div>"
 
-        editor.edit_separator()
-        editor.delete(f'{start_line}.0', f'{end_line}.end')
-        editor.insert(f'{start_line}.0', replacement)
-        editor.edit_separator()
+        _atomic_text_replace(editor, f'{start_line}.0', f'{end_line}.end', replacement)
 
         # Restore cursor / selection cleanly inside the resulting aligned or unwrapped content
         new_open_len = len(f'<div align="{align_norm}">') if (align_norm != 'none' and len(clean_lines) == 1) else 0
@@ -8651,34 +9746,36 @@ class MarkdownNotepad(tk.Tk):
         """Insert prefix at the beginning of the current line (with toggle/replace support)"""
         if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
             return "break"
-        
+
         editor = self.current_tab.source_editor
         pos = editor.index(tk.INSERT)
         line = pos.split('.')[0]
         line_text = editor.get(f"{line}.0", f"{line}.end")
-        
-        heading_match = re.match(r'^(#{1,6}\s+)(.*)$', line_text)
+        m_al = _ALIGN_SINGLE_RE.match(line_text)
+        col_off = m_al.start(3) if m_al else 0
+        scan_text = m_al.group(3) if m_al else line_text
+
+        heading_match = re.match(r'^(#{1,6}\s+)(.*)$', scan_text)
         if prefix.startswith('#'):
             if heading_match:
-                old_prefix, rest = heading_match.groups()
+                old_prefix, _rest = heading_match.groups()
                 if old_prefix == prefix:
-                    editor.delete(f"{line}.0", f"{line}.{len(old_prefix)}")
+                    _atomic_text_replace(editor, f"{line}.{col_off}", f"{line}.{col_off + len(old_prefix)}", "")
                 else:
-                    editor.delete(f"{line}.0", f"{line}.{len(old_prefix)}")
-                    editor.insert(f"{line}.0", prefix)
+                    _atomic_text_replace(editor, f"{line}.{col_off}", f"{line}.{col_off + len(old_prefix)}", prefix)
             else:
-                editor.insert(f"{line}.0", prefix)
+                editor.insert(f"{line}.{col_off}", prefix)
         elif prefix in ("> ", "- ", "1. "):
-            if line_text.startswith(prefix):
-                editor.delete(f"{line}.0", f"{line}.{len(prefix)}")
+            if scan_text.startswith(prefix):
+                _atomic_text_replace(editor, f"{line}.{col_off}", f"{line}.{col_off + len(prefix)}", "")
             else:
-                editor.insert(f"{line}.0", prefix)
+                editor.insert(f"{line}.{col_off}", prefix)
         else:
-            editor.insert(f"{line}.0", prefix)
+            editor.insert(f"{line}.{col_off}", prefix)
 
         self.current_tab.is_modified = True
         self._update_tab_title(self.current_tab)
-        self._schedule_syntax_highlight()
+        self.current_tab._apply_syntax_highlighting()
         self._refresh_active_visual_view()
         return "break"
     
@@ -8792,7 +9889,7 @@ class MarkdownNotepad(tk.Tk):
     
     def _find_document_images(self):
         """Find all image references in the current document"""
-        if not self.current_tab:
+        if not self.current_tab or not hasattr(self.current_tab, 'source_editor'):
             return []
             
         content = self.current_tab.source_editor.get(1.0, tk.END)
@@ -9017,9 +10114,39 @@ class MarkdownNotepad(tk.Tk):
                         if not self.save_file():
                             return  # Save was cancelled
         
-        # Stop auto-save timer
+        # Stop auto-save and pending UI timers
         if self._auto_save_job:
-            self.after_cancel(self._auto_save_job)
+            try:
+                self.after_cancel(self._auto_save_job)
+            except Exception:
+                pass
+            self._auto_save_job = None
+        if getattr(self, '_zoom_save_job', None):
+            try:
+                self.after_cancel(self._zoom_save_job)
+            except Exception:
+                pass
+            self._zoom_save_job = None
+        self._hide_fullscreen_hint()
+        op = getattr(self, 'outline_panel', None)
+        if op is not None and getattr(op, '_update_job', None):
+            try:
+                op.after_cancel(op._update_job)
+            except Exception:
+                pass
+            op._update_job = None
+        if getattr(self, '_doc_font_color_popup', None):
+            try:
+                self._doc_font_color_popup.close(invoke_on_close=False)
+            except Exception:
+                pass
+            self._doc_font_color_popup = None
+        for tab in list(self.tabs):
+            if hasattr(tab, 'cleanup'):
+                try:
+                    tab.cleanup()
+                except Exception:
+                    pass
 
         if TTS_AVAILABLE and get_tts_manager:
             try:
@@ -9097,13 +10224,12 @@ class MarkdownNotepad(tk.Tk):
         if hasattr(self, 'line_spacing_mb'):
             self.line_spacing_mb.config(text=f"\u2195 {sp:.1f} \u25be")
         self.configure(bg=self.theme.get('desk_bg', '#d9dce1'))
-        self._save_theme()
-        
+
         # Apply to all tabs (each tab re-styles its source editor, syntax tags and visual page)
         for tab in self.tabs:
             tab.apply_theme(self.theme)
             tab.set_zoom(self.zoom_pct / 100.0)
-        
+
         if getattr(self, 'ai_sidebar', None):
             self.ai_sidebar.apply_theme(self.theme)
         if getattr(self, 'outline_panel', None):
@@ -9112,7 +10238,16 @@ class MarkdownNotepad(tk.Tk):
             except Exception:
                 pass
         self._setup_styles()
-        
+        ribbon_bg = self.theme.get('ribbon_bg', '#f3effa')
+        if hasattr(self, '_doc_font_color_group'):
+            try:
+                self._doc_font_color_group.config(bg=ribbon_bg)
+                self._doc_font_apply_btn.config(bg=ribbon_bg)
+                self._doc_font_drop_btn.config(bg=ribbon_bg)
+            except Exception:
+                pass
+        self._save_theme()
+
         self._set_status("Theme applied")
 
 
@@ -9642,18 +10777,19 @@ class ThemeDialog(tk.Toplevel):
     
     def _apply(self):
         """Apply the current settings (merged into the existing theme so other keys survive)"""
+        default = MarkdownNotepad.DEFAULT_THEME
         self.theme = {
             **self.theme,
-            'source_bg': self.source_bg_var.get(),
-            'source_fg': self.source_fg_var.get(),
+            'source_bg': self._safe_hex(self.source_bg_var.get(), default['source_bg']),
+            'source_fg': self._safe_hex(self.source_fg_var.get(), default['source_fg']),
             'source_font': self.source_font_var.get() or MONO_FONT,
             'source_font_size': self._safe_int(self.source_size_var, 11),
-            'visual_bg': self.visual_bg_var.get(),
-            'visual_fg': self.visual_fg_var.get(),
+            'visual_bg': self._safe_hex(self.visual_bg_var.get(), default['visual_bg']),
+            'visual_fg': self._safe_hex(self.visual_fg_var.get(), default['visual_fg']),
             'visual_font': self.visual_font_var.get() or VISUAL_FONT,
             'visual_font_size': self._safe_int(self.visual_size_var, 11),
             'line_spacing': _normalize_line_spacing(self.line_spacing_var.get()),
-            'desk_bg': self.desk_bg_var.get(),
+            'desk_bg': self._safe_hex(self.desk_bg_var.get(), default.get('desk_bg', '#dcd6e8')),
         }
         self.on_apply(self.theme)
         self.destroy()
@@ -9810,15 +10946,25 @@ class BlockquoteStyleDialog(tk.Toplevel):
         self.justify_var.set('left')
 
     def _apply(self):
+        def _safe_bq_int(var, fallback, lo=0, hi=80):
+            try:
+                return max(lo, min(hi, int(var.get())))
+            except Exception:
+                return fallback
+
+        def _safe_opt_hex(val: str) -> str:
+            s = (val or '').strip()
+            return ThemeDialog._safe_hex(s, '') if s else ''
+
         self.theme.update({
             'blockquote_font': self.font_var.get().strip(),
-            'blockquote_size': int(self.size_var.get() or 0),
+            'blockquote_size': _safe_bq_int(self.size_var, 0, 0, 36),
             'blockquote_style': self.style_var.get(),
-            'blockquote_fg': self.fg_var.get().strip(),
-            'blockquote_bg': self.bg_var.get().strip(),
-            'blockquote_bar_fg': self.bar_var.get().strip(),
-            'blockquote_padding': int(self.pad_var.get() or 16),
-            'blockquote_spacing': int(self.space_var.get() or 4),
+            'blockquote_fg': _safe_opt_hex(self.fg_var.get()),
+            'blockquote_bg': _safe_opt_hex(self.bg_var.get()),
+            'blockquote_bar_fg': _safe_opt_hex(self.bar_var.get()),
+            'blockquote_padding': _safe_bq_int(self.pad_var, 16, 4, 80),
+            'blockquote_spacing': _safe_bq_int(self.space_var, 4, 0, 32),
             'blockquote_justify': self.justify_var.get(),
         })
         if self.on_apply:
@@ -10035,7 +11181,12 @@ class InsertImageDialog(tk.Toplevel):
         else:
             # Markdown syntax with optional size in alt text
             if width or height:
-                size_str = f"{width}x{height}" if width and height else (width or height)
+                if width and height:
+                    size_str = f"{width}x{height}"
+                elif width:
+                    size_str = width
+                else:
+                    size_str = f"height={height}"
                 markdown = f"![{alt_text}|{size_str}]({rel_path})"
             else:
                 markdown = f"![{alt_text}]({rel_path})"
@@ -10124,20 +11275,23 @@ class ImageManagerDialog(tk.Toplevel):
         # Clear existing
         for item in self.tree.get_children():
             self.tree.delete(item)
-        
+        self._item_raw_matches = {}
+
         # Find images in document
         content = self.text_widget.get(1.0, tk.END)
-        pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
-        matches = re.findall(pattern, content)
-        
+        pattern = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+        matches = list(pattern.finditer(content))
+
         total = len(matches)
         found = 0
         missing = 0
         embedded = 0
-        
-        for alt, path in matches:
+
+        for m in matches:
+            alt, path = m.group(1), m.group(2)
+            full_match = m.group(0)
             if path.startswith('data:'):
-                self.tree.insert("", tk.END, values=(alt or "(no alt)", "Embedded base64", "✓ Embedded"))
+                iid = self.tree.insert("", tk.END, values=(alt or "(no alt)", "Embedded base64", "✓ Embedded"))
                 embedded += 1
             else:
                 # Check if file exists
@@ -10145,56 +11299,65 @@ class ImageManagerDialog(tk.Toplevel):
                     full_path = path
                 else:
                     full_path = os.path.join(self.doc_dir, path)
-                
+
                 if os.path.exists(full_path):
-                    self.tree.insert("", tk.END, values=(alt or "(no alt)", path, "✓ Found"))
+                    iid = self.tree.insert("", tk.END, values=(alt or "(no alt)", path, "✓ Found"))
                     found += 1
                 else:
-                    self.tree.insert("", tk.END, values=(alt or "(no alt)", path, "✗ Missing"), tags=("missing",))
+                    iid = self.tree.insert("", tk.END, values=(alt or "(no alt)", path, "✗ Missing"), tags=("missing",))
                     missing += 1
-        
+            self._item_raw_matches[iid] = full_match
+
         # Style missing items
         self.tree.tag_configure("missing", foreground="red")
-        
+
         # Update stats
         self.stats_label.config(
             text=f"Total: {total} images | Found: {found} | Missing: {missing} | Embedded: {embedded}"
         )
-    
+
     def _add_image(self):
         """Add a new image to the document"""
         self.parent.insert_image()
         self._load_images()
-    
+
     def _remove_image(self):
         """Remove selected image reference from document"""
         selection = self.tree.selection()
         if not selection:
             messagebox.showinfo("No Selection", "Please select an image to remove.")
             return
-        
+
         item = selection[0]
         values = self.tree.item(item, "values")
         alt, path, status = values
-        
-        if messagebox.askyesno("Confirm Removal", 
+
+        if messagebox.askyesno("Confirm Removal",
                                f"Remove this image reference from the document?\n\n"
                                f"Alt: {alt}\nPath: {path}\n\n"
                                "Note: This only removes the reference, not the actual file."):
-            # Find and remove from document
-            content = self.text_widget.get(1.0, tk.END)
-            
-            # Escape special regex characters in path
-            escaped_path = re.escape(path)
-            escaped_alt = re.escape(alt) if alt != "(no alt)" else "[^\\]]*"
-            
-            pattern = rf'!\[{escaped_alt}\]\({escaped_path}\)'
-            new_content = re.sub(pattern, '', content, count=1)
-            
-            # Update document
-            self.text_widget.delete(1.0, tk.END)
-            self.text_widget.insert(1.0, new_content.rstrip())
-            
+            content = self.text_widget.get("1.0", "end-1c")
+            raw_match = getattr(self, '_item_raw_matches', {}).get(item)
+            if raw_match and raw_match in content:
+                new_content = content.replace(raw_match, '', 1)
+            else:
+                escaped_alt = re.escape(alt) if alt != "(no alt)" else r"[^\]]*"
+                if path == "Embedded base64":
+                    pattern = rf'!\[{escaped_alt}\]\(data:image/[^)]+\)'
+                else:
+                    escaped_path = re.escape(path)
+                    pattern = rf'!\[{escaped_alt}\]\({escaped_path}\)'
+                new_content = re.sub(pattern, '', content, count=1)
+
+            _atomic_text_replace(self.text_widget, "1.0", tk.END, new_content.rstrip())
+            if hasattr(self.parent, 'current_tab') and self.parent.current_tab:
+                self.parent.current_tab.is_modified = True
+                self.parent._update_tab_title(self.parent.current_tab)
+            if hasattr(self.parent, '_schedule_syntax_highlight'):
+                self.parent._schedule_syntax_highlight()
+            if hasattr(self.parent, '_refresh_active_visual_view'):
+                self.parent._refresh_active_visual_view()
+
             self._load_images()
     
     def _fix_broken(self):
@@ -10245,8 +11408,14 @@ class ImageManagerDialog(tk.Toplevel):
         new_content = re.sub(pattern, fix_match, content)
         
         if fixed_count > 0:
-            self.text_widget.delete(1.0, tk.END)
-            self.text_widget.insert(1.0, new_content.rstrip())
+            _atomic_text_replace(self.text_widget, "1.0", tk.END, new_content.rstrip())
+            if hasattr(self.parent, 'current_tab') and self.parent.current_tab:
+                self.parent.current_tab.is_modified = True
+                self.parent._update_tab_title(self.parent.current_tab)
+            if hasattr(self.parent, '_schedule_syntax_highlight'):
+                self.parent._schedule_syntax_highlight()
+            if hasattr(self.parent, '_refresh_active_visual_view'):
+                self.parent._refresh_active_visual_view()
             messagebox.showinfo("Fixed", f"Fixed {fixed_count} broken image path(s).")
             self._load_images()
         else:
@@ -10767,7 +11936,7 @@ class InsertTableDialog(tk.Toplevel):
         self.text_widget.insert(insert_idx, table_md)
 
         # Place cursor inside the first cell
-        first_cell_start = f"{insert_idx}+1l+2c"
+        first_cell_start = f"{insert_idx}+1l linestart+2c"
         first_cell_end = f"{first_cell_start}+{col_width if not include_header else len('Header 1')}c"
         try:
             self.text_widget.mark_set(tk.INSERT, first_cell_start)
@@ -10891,22 +12060,26 @@ class MathSymbolDialog(tk.Toplevel):
         ttk.Button(footer, text="Close", command=self.destroy, width=8).pack(side=tk.RIGHT)
 
     def _insert_symbol(self, sym: str):
-        if self.notepad.current_tab:
-            editor = self.notepad.current_tab.source_editor
-            editor.insert(tk.INSERT, sym)
-            self.notepad.current_tab.is_modified = True
-            self.notepad._update_tab_title(self.notepad.current_tab)
-            self.notepad._schedule_syntax_highlight()
-            self.notepad._refresh_active_visual_view()
-            editor.focus_set()
+        tab = self.notepad.current_tab
+        if not tab or getattr(tab, 'tab_type', 'document') == 'spreadsheet' or not hasattr(tab, 'source_editor'):
+            return
+        editor = tab.source_editor
+        editor.insert(tk.INSERT, sym)
+        tab.is_modified = True
+        self.notepad._update_tab_title(tab)
+        self.notepad._schedule_syntax_highlight()
+        self.notepad._refresh_active_visual_view()
+        editor.focus_set()
 
     def _insert_template(self, prefix: str, suffix: str):
-        if self.notepad.current_tab:
-            if suffix:
-                self.notepad._insert_format(prefix, suffix)
-            else:
-                self.notepad._insert_text(prefix)
-            self.notepad.current_tab.source_editor.focus_set()
+        tab = self.notepad.current_tab
+        if not tab or getattr(tab, 'tab_type', 'document') == 'spreadsheet' or not hasattr(tab, 'source_editor'):
+            return
+        if suffix:
+            self.notepad._insert_format(prefix, suffix)
+        else:
+            self.notepad._insert_text(prefix)
+        tab.source_editor.focus_set()
 
 
 class SnapshotDialog(tk.Toplevel):
@@ -11104,7 +12277,7 @@ class SnapshotDialog(tk.Toplevel):
 
     def _on_create(self):
         label = self.name_var.get().strip()
-        self.notepad.create_quick_snapshot(label if label else None)
+        self.notepad.create_quick_snapshot(label if label else None, tab=self.tab)
         self.name_var.set("")
         self._refresh_list()
 
@@ -11127,7 +12300,7 @@ class SnapshotDialog(tk.Toplevel):
             start_index="1.0",
             end_index=tk.END,
             action_name=f"Snapshot Comparison: {snap_name}",
-            on_accept=self.notepad._apply_diff,
+            on_accept=lambda rep, s, e, orig, mode="full", t=self.tab: self.notepad._apply_diff(rep, s, e, orig, mode, target_tab=t),
             theme=self.notepad.theme,
             default_apply_mode="full",
         )
@@ -11155,13 +12328,13 @@ class SnapshotDialog(tk.Toplevel):
         ):
             return
 
-        self.notepad.create_quick_snapshot(f"Auto-backup before restoring '{snap_name}'")
+        self.notepad.create_quick_snapshot(f"Auto-backup before restoring '{snap_name}'", tab=self.tab)
         if getattr(self.tab, 'tab_type', 'document') == 'spreadsheet':
             self.tab.set_content(snap_text)
             self.tab.is_modified = True
             self.notepad._update_tab_title(self.tab)
         else:
-            self.notepad._apply_diff(snap_text, "1.0", tk.END, current_text, apply_mode="full")
+            self.notepad._apply_diff(snap_text, "1.0", tk.END, current_text, apply_mode="full", target_tab=self.tab)
         self._refresh_list()
         self.notepad._set_status(f"Restored snapshot: '{snap_name}'")
 

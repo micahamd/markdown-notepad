@@ -5,6 +5,7 @@ Provides AI chatbot functionality with support for multiple LLM providers.
 Currently implements Anthropic Claude, Google Gemini, DeepSeek, and Ollama.
 """
 
+import inspect
 import json
 import os
 import re
@@ -1187,7 +1188,7 @@ class AnthropicClient(LLMClient):
                 # Streaming response
                 full_response = ""
                 with self.client.messages.stream(
-                    model=messages[0].role if hasattr(messages[0], 'model') else "claude-3-5-haiku-20241022",
+                    model=messages[0].model if (messages and hasattr(messages[0], 'model')) else "claude-3-5-haiku-20241022",
                     messages=api_messages,
                     system=system_prompt if system_prompt else None,
                     max_tokens=max_tokens,
@@ -1349,8 +1350,12 @@ class AnthropicClient(LLMClient):
                     break
         
         try:
-            # Clamp max_tokens to valid Anthropic output range [1, 8192]
-            safe_max_tokens = max(1, min(int(max_tokens or 1000000), 2000000))
+            # Clamp max_tokens to valid per-model Anthropic output range
+            model_lower = (model_name or "").lower()
+            max_cap = 64000 if any(
+                tag in model_lower for tag in ('claude-3-7', 'claude-sonnet-4', 'claude-opus-4', 'claude-4')
+            ) else 8192
+            safe_max_tokens = max(1, min(int(max_tokens or max_cap), max_cap))
             # Build kwargs for the API call
             stream_kwargs = {
                 "model": model_name,
@@ -1504,9 +1509,12 @@ class GeminiClient(LLMClient):
         
         api_messages = self._convert_messages_to_api_format(messages)
         
-        # Build generation config
+        # Build generation config with per-model output token limits
+        model_lower = "gemini-2.5-flash"
+        max_cap = 65536 if any(tag in model_lower for tag in ('2.5', '3', 'gemini-3')) else 8192
+        safe_max_tokens = max(1, min(int(max_tokens or max_cap), max_cap))
         gen_config = {
-            "max_output_tokens": max_tokens,
+            "max_output_tokens": safe_max_tokens,
             "temperature": temperature,
         }
         if top_p < 1.0:
@@ -1624,9 +1632,12 @@ class GeminiClient(LLMClient):
                         })
                     break
         
-        # Build generation config
+        # Build generation config with per-model output token limits
+        model_lower = (model_name or "").lower()
+        max_cap = 65536 if any(tag in model_lower for tag in ('2.5', '3', 'gemini-3')) else 8192
+        safe_max_tokens = max(1, min(int(max_tokens or max_cap), max_cap))
         gen_config = {
-            "max_output_tokens": max_tokens,
+            "max_output_tokens": safe_max_tokens,
             "temperature": temperature,
         }
         if top_p < 1.0:
@@ -1720,15 +1731,29 @@ class OllamaClient(LLMClient):
         self.base_url = base_url.rstrip('/')
         self.api_key = ""  # Not used but kept for interface compatibility
         self._cached_models = None
-        
-        # Set the host for ollama library if available
+        self._ollama_client = None
+
         if OLLAMA_AVAILABLE:
-            try:
-                # Set custom host if not default
-                if base_url != "http://localhost:11434":
-                    os.environ['OLLAMA_HOST'] = base_url
-            except:
-                pass
+            client_cls = getattr(ollama, 'Client', None)
+            if client_cls is not None:
+                try:
+                    self._ollama_client = client_cls(host=self.base_url)
+                except Exception:
+                    self._ollama_client = None
+
+    def _get_client(self):
+        """Return per-instance ollama.Client when supported, falling back to module."""
+        if self._ollama_client is not None:
+            return self._ollama_client
+        if OLLAMA_AVAILABLE:
+            client_cls = getattr(ollama, 'Client', None)
+            if client_cls is not None:
+                try:
+                    self._ollama_client = client_cls(host=self.base_url)
+                    return self._ollama_client
+                except Exception:
+                    pass
+        return ollama
     
     def _convert_messages_to_api_format(self, messages: List[ChatMessage]) -> List[Dict]:
         """Convert ChatMessage objects to Ollama API format"""
@@ -1767,10 +1792,11 @@ class OllamaClient(LLMClient):
             api_messages.insert(0, {"role": "system", "content": system_prompt})
         
         try:
+            client = self._get_client()
             if on_chunk:
                 # Streaming response
                 full_response = ""
-                stream = ollama.chat(
+                stream = client.chat(
                     model="llama3.2",
                     messages=api_messages,
                     stream=True,
@@ -1787,7 +1813,7 @@ class OllamaClient(LLMClient):
                 return full_response
             else:
                 # Non-streaming response
-                response = ollama.chat(
+                response = client.chat(
                     model="llama3.2",
                     messages=api_messages,
                     options={
@@ -1809,7 +1835,7 @@ class OllamaClient(LLMClient):
         
         try:
             # Fetch models from local Ollama server
-            models_response = ollama.list()
+            models_response = self._get_client().list()
             models = []
             
             # Handle different response formats
@@ -1881,7 +1907,7 @@ class OllamaClient(LLMClient):
             options["top_k"] = top_k
         
         try:
-            stream = ollama.chat(
+            stream = self._get_client().chat(
                 model=model_name,
                 messages=api_messages,
                 stream=True,
@@ -1925,7 +1951,7 @@ class OllamaClient(LLMClient):
         
         try:
             # Try to list models as a connection test
-            models = ollama.list()
+            models = self._get_client().list()
             model_count = 0
             if hasattr(models, 'models'):
                 model_count = len(models.models)
@@ -2098,9 +2124,27 @@ class DeepSeekClient(LLMClient):
                 'role': msg.get('role', 'user'),
                 'content': str(content or '')
             })
+
+        # Attach images as OpenAI-compatible image_url parts on the last user message
+        if images and api_messages:
+            for i in range(len(api_messages) - 1, -1, -1):
+                if api_messages[i].get('role') == 'user':
+                    text_content = api_messages[i].get('content', '')
+                    parts = []
+                    if text_content:
+                        parts.append({"type": "text", "text": str(text_content)})
+                    for img_b64 in images:
+                        parts.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_b64}"
+                            }
+                        })
+                    api_messages[i]['content'] = parts
+                    break
         
         try:
-            safe_max_tokens = max(1, min(int(max_tokens or 1000000), 2000000))
+            safe_max_tokens = max(1, min(int(max_tokens or 8192), 8192))
             stream = self.client.chat.completions.create(
                 model=model_name,
                 messages=api_messages,
@@ -2456,7 +2500,76 @@ def _parse_agy_models_output(stdout_text: str) -> List[str]:
     return models
 
 
-def call_antigravity_cli(system_prompt: str, user_message: str, model_name: str = "gemini-3.8-flash-low", effort: str = "low", cli_command: str = "") -> str:
+def _terminate_process_cleanly(proc: subprocess.Popen) -> None:
+    """Terminate a child Popen process cleanly, escalating to kill if needed."""
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                proc.kill()
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    for pipe in (getattr(proc, 'stdout', None), getattr(proc, 'stderr', None)):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+
+def _run_popen_cancellable(
+    cmd: List[str],
+    timeout: float = 180.0,
+    cancel_event: Optional[threading.Event] = None,
+) -> tuple[int, str, str]:
+    """Run subprocess via Popen, polling every 0.15s for cancel_event or timeout."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Antigravity CLI generation cancelled.")
+
+    popen_kwargs: Dict[str, Any] = {
+        'stdout': subprocess.PIPE,
+        'stderr': subprocess.PIPE,
+        'text': True,
+        'encoding': 'utf-8',
+        'errors': 'replace',
+    }
+    if sys.platform == 'win32':
+        popen_kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    deadline = time.monotonic() + timeout
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            _terminate_process_cleanly(proc)
+            raise RuntimeError("Antigravity CLI generation cancelled.")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_process_cleanly(proc)
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        try:
+            out, err = proc.communicate(timeout=min(0.15, remaining))
+            return proc.returncode, str(out or '').strip(), str(err or '').strip()
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def call_antigravity_cli(
+    system_prompt: str,
+    user_message: str,
+    model_name: str = "gemini-3.8-flash-low",
+    effort: str = "low",
+    cli_command: str = "",
+    cancel_event: Optional[threading.Event] = None,
+) -> str:
     """Execute non-interactive prompt call via agy CLI."""
     executable = str(cli_command or find_antigravity_cli_command()).strip()
     if not executable:
@@ -2480,32 +2593,25 @@ def call_antigravity_cli(system_prompt: str, user_message: str, model_name: str 
                 cmd.extend(['--effort', 'low'])
 
     cmd.extend(['-p', prompt_input])
-    run_kwargs = {
-        'capture_output': True,
-        'text': True,
-        'encoding': 'utf-8',
-        'errors': 'replace',
-        'timeout': 180,
-    }
-    if sys.platform == 'win32':
-        run_kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
     try:
-        completed = subprocess.run(cmd, **run_kwargs)
+        returncode, stdout_text, stderr_text = _run_popen_cancellable(
+            cmd, timeout=180.0, cancel_event=cancel_event
+        )
     except FileNotFoundError as exc:
         raise RuntimeError(f"Antigravity CLI executable not found: {executable}") from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("Antigravity CLI timed out while generating a response.") from exc
 
-    stdout_text = str(completed.stdout or '').strip()
-    stderr_text = str(completed.stderr or '').strip()
-    detail = stderr_text or stdout_text or f"exit code {completed.returncode}"
+    detail = stderr_text or stdout_text or f"exit code {returncode}"
 
     # Fallback guard 1: if --effort conflicted or is unsupported, retry without --effort
-    if completed.returncode != 0 and '--effort' in cmd and any(
+    if returncode != 0 and '--effort' in cmd and any(
         phrase in detail.lower()
         for phrase in ('effort is not supported', 'conflicts with --effort', 'invalid model selection')
     ):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Antigravity CLI generation cancelled.")
         cmd_no_effort = [c for c in cmd]
         try:
             eff_idx = cmd_no_effort.index('--effort')
@@ -2514,15 +2620,18 @@ def call_antigravity_cli(system_prompt: str, user_message: str, model_name: str 
             pass
 
         try:
-            completed = subprocess.run(cmd_no_effort, **run_kwargs)
-            stdout_text = str(completed.stdout or '').strip()
-            stderr_text = str(completed.stderr or '').strip()
-            detail = stderr_text or stdout_text or f"exit code {completed.returncode}"
-        except Exception:
-            pass
+            returncode, stdout_text, stderr_text = _run_popen_cancellable(
+                cmd_no_effort, timeout=180.0, cancel_event=cancel_event
+            )
+            detail = stderr_text or stdout_text or f"exit code {returncode}"
+        except Exception as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Antigravity CLI generation cancelled.") from exc
 
     # Fallback guard 2: if the model slug is unrecognized/stale, discover live models and retry once
-    if completed.returncode != 0 and 'not recognized as a known model' in detail.lower():
+    if returncode != 0 and 'not recognized as a known model' in detail.lower():
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Antigravity CLI generation cancelled.")
         live_models = list_antigravity_models(executable)
         if live_models:
             fallback_model = live_models[0]
@@ -2537,14 +2646,15 @@ def call_antigravity_cli(system_prompt: str, user_message: str, model_name: str 
                 '-p', prompt_input,
             ]
             try:
-                completed = subprocess.run(retry_cmd, **run_kwargs)
-                stdout_text = str(completed.stdout or '').strip()
-                stderr_text = str(completed.stderr or '').strip()
-                detail = stderr_text or stdout_text or f"exit code {completed.returncode}"
-            except Exception:
-                pass
+                returncode, stdout_text, stderr_text = _run_popen_cancellable(
+                    retry_cmd, timeout=180.0, cancel_event=cancel_event
+                )
+                detail = stderr_text or stdout_text or f"exit code {returncode}"
+            except Exception as exc:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("Antigravity CLI generation cancelled.") from exc
 
-    if completed.returncode != 0:
+    if returncode != 0:
         raise RuntimeError(f"Antigravity CLI failed: {detail}")
 
     if not stdout_text:
@@ -2632,7 +2742,8 @@ class AgyClient(LLMClient):
             user_message=user_message,
             model_name=model,
             effort=effort,
-            cli_command=self.cli_command
+            cli_command=self.cli_command,
+            cancel_event=kwargs.get('cancel_event'),
         )
         if on_chunk:
             on_chunk(response)
@@ -3624,12 +3735,14 @@ class AISettingsDialog(tk.Toplevel):
         self.ctx_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         ctx_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Mousewheel support inside Context Menu Actions canvas
+        # Mousewheel support inside Context Menu Actions canvas (local bindings only)
         def _on_ctx_wheel(e):
-            if e.delta:
+            if getattr(e, 'delta', 0):
                 self.ctx_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        self.ctx_canvas.bind("<Enter>", lambda e: self.ctx_canvas.bind_all("<MouseWheel>", _on_ctx_wheel))
-        self.ctx_canvas.bind("<Leave>", lambda e: self.ctx_canvas.unbind_all("<MouseWheel>"))
+            return "break"
+        self._on_ctx_wheel = _on_ctx_wheel
+        self.ctx_canvas.bind("<MouseWheel>", self._on_ctx_wheel)
+        self.ctx_inner.bind("<MouseWheel>", self._on_ctx_wheel)
 
         self.ctx_action_widgets = []
 
@@ -3876,12 +3989,24 @@ class AISettingsDialog(tk.Toplevel):
         )
         remove_btn.pack(side=tk.RIGHT)
 
+        if hasattr(self, '_on_ctx_wheel'):
+            self._bind_ctx_wheel_recursive(row_frame)
+
         self.ctx_action_widgets.append({
             'frame': row_frame,
             'enabled_var': enabled_var,
             'name_var': name_var,
             'prompt_var': prompt_var,
         })
+
+    def _bind_ctx_wheel_recursive(self, widget):
+        """Bind local <MouseWheel> scrolling on ctx_canvas child widgets."""
+        try:
+            widget.bind("<MouseWheel>", self._on_ctx_wheel, add=True)
+            for child in widget.winfo_children():
+                self._bind_ctx_wheel_recursive(child)
+        except Exception:
+            pass
 
     def _remove_context_action(self, frame):
         """Remove a context action row"""
@@ -4211,12 +4336,7 @@ class AISettingsDialog(tk.Toplevel):
             messagebox.showerror("Error", "Failed to save settings.", parent=self)
 
     def destroy(self):
-        """Release global mousewheel binding if active before closing dialog."""
-        try:
-            if hasattr(self, "ctx_canvas") and self.ctx_canvas.winfo_exists():
-                self.ctx_canvas.unbind_all("<MouseWheel>")
-        except Exception:
-            pass
+        """Cleanly destroy settings dialog."""
         super().destroy()
 
 
@@ -4651,6 +4771,7 @@ class ChatSidebar(tk.Frame):
         self._reg(self.input_hint, bg='input_bg', fg='muted')
         self.input_hint.place(x=9, y=6)
         self.input_hint.bind('<Button-1>', lambda e: self.input_text.focus_set())
+        self.input_hint.bind('<Button-3>', lambda e: self._show_text_widget_context_menu(self.input_text, e))
 
         self.attach_btn = self._flat_button(btn_frame, "Attach", self._attach_file, width=6)
         self.attach_btn.pack(side=tk.TOP, padx=(6, 0), pady=(0, 3))
@@ -4785,9 +4906,7 @@ class ChatSidebar(tk.Frame):
 
     def _update_hint(self):
         empty = not self.input_text.get('1.0', 'end-1c').strip()
-        if empty and self.focus_get() is not self.input_text:
-            self.input_hint.place(x=9, y=6)
-        elif empty:
+        if empty:
             self.input_hint.place(x=9, y=6)
         else:
             self.input_hint.place_forget()
@@ -4927,6 +5046,29 @@ class ChatSidebar(tk.Frame):
                         return txt
         return None
 
+    @staticmethod
+    def _extract_balanced_func_formula(line: str) -> Optional[str]:
+        """Extract =FUNC(...) using balanced parenthesis depth, ignoring parens inside quotes."""
+        m_fn = re.search(r'(?<![\w=])(=[A-Za-z_][A-Za-z0-9_]*\()', line)
+        if not m_fn:
+            return None
+        eq_pos = m_fn.start(1)
+        open_pos = m_fn.end(1) - 1
+        depth = 0
+        in_quote = False
+        for i in range(open_pos, len(line)):
+            ch = line[i]
+            if ch == '"':
+                in_quote = not in_quote
+            elif not in_quote:
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        return line[eq_pos:i + 1].strip()
+        return None
+
     def _extract_formula_at_index(self, text_index: str) -> Optional[str]:
         """Extract an Excel/spreadsheet formula (=...) on the line at text_index, if any."""
         w = self.chat_display
@@ -4945,7 +5087,10 @@ class ChatSidebar(tk.Frame):
             cand = m_cell.group(1).strip().strip('`')
             if len(cand) >= 2:
                 return cand
-        m_eq = re.search(r'(?<![\w=])(=[A-Za-z_][A-Za-z0-9_]*\([^\n]*\)|=[$A-Za-z]{1,3}[0-9]+[^\s,;\n`]*)', line)
+        balanced = self._extract_balanced_func_formula(line)
+        if balanced:
+            return balanced
+        m_eq = re.search(r'(?<![\w=])(=[$A-Za-z]{1,3}[0-9]+[^\s,;\n`]*)', line)
         if m_eq:
             return m_eq.group(1).strip().strip('`')
         if line.startswith('=') and len(line) >= 2 and not line.startswith('==='):
@@ -5121,18 +5266,23 @@ class ChatSidebar(tk.Frame):
             self._flash_status("Removed message(s) from chat history")
             return
 
-        prompt_to_rerun = self._messages[user_idx].content
-        self._messages = self._messages[:user_idx]
-        if self.current_document_id:
-            self.history_manager.save_history(self._messages, self.current_document_id)
-        self._render_all()
+        orig_msg = self._messages[user_idx]
+        prompt_to_rerun = orig_msg.content
+        orig_images = list(getattr(orig_msg, 'images', None) or [])
 
-        if prompt_to_rerun and prompt_to_rerun.strip():
-            self.input_text.delete('1.0', tk.END)
-            self.input_text.insert('1.0', prompt_to_rerun)
-            self._update_hint()
-            self._send_message()
+        if (prompt_to_rerun and prompt_to_rerun.strip()) or orig_images:
+            if not self._provider_ready():
+                return
+            self._messages = self._messages[:user_idx]
+            if self.current_document_id:
+                self.history_manager.save_history(self._messages, self.current_document_id)
+            self._render_all()
+            self._dispatch_message(prompt_to_rerun or "", images=orig_images)
         else:
+            self._messages = self._messages[:user_idx]
+            if self.current_document_id:
+                self.history_manager.save_history(self._messages, self.current_document_id)
+            self._render_all()
             self._flash_status("Rolled back to selected turn")
 
     def _speak_message(self, idx: int):
@@ -5478,6 +5628,34 @@ class ChatSidebar(tk.Frame):
             return False
         return True
 
+    def _snapshot_generation_params(self) -> Dict[str, Any]:
+        """Snapshot client, credentials, model, and generation parameters on the main thread."""
+        s = self.settings
+        provider = s.provider
+        active_model = (s.agy_model or s.model) if provider in ('agy', 'antigravity') else s.model
+        client = self.llm_client
+        if client is not None:
+            if provider == 'gemini':
+                client.api_key = s.gemini_api_key
+            elif provider == 'anthropic':
+                client.api_key = s.api_key
+            elif provider == 'deepseek':
+                client.api_key = s.deepseek_api_key
+            elif provider in ('agy', 'antigravity') and isinstance(client, AgyClient):
+                client.model = active_model
+                client.effort = s.agy_effort or 'low'
+                client.cli_command = s.agy_path or find_antigravity_cli_command()
+        return {
+            'client': client,
+            'provider': provider,
+            'model': active_model,
+            'system_prompt': s.system_prompt,
+            'max_tokens': s.max_tokens,
+            'temperature': s.temperature,
+            'top_p': s.top_p,
+            'top_k': s.top_k,
+        }
+
     def _send_message(self):
         """Send message to AI"""
         if self.is_generating or self._editing:
@@ -5487,6 +5665,24 @@ class ChatSidebar(tk.Frame):
         if not message and not self.attached_files:
             return
         if not self._provider_ready():
+            return
+
+        attachments = list(self.attached_files)
+        self.input_text.delete(1.0, tk.END)
+        self._update_hint()
+        self.attached_files.clear()
+        self._update_attachments_display()
+
+        self._dispatch_message(message, attachments=attachments)
+
+    def _dispatch_message(
+        self,
+        message: str,
+        images: Optional[List[str]] = None,
+        attachments: Optional[List[Dict]] = None,
+    ):
+        """Dispatch a user prompt (and optional images/attachments) to the LLM worker thread."""
+        if self.is_generating or self._editing:
             return
 
         # Immediate debounce and state lock
@@ -5501,52 +5697,50 @@ class ChatSidebar(tk.Frame):
         self._spin = 0
         self._set_generating_ui(True)
 
-        self.input_text.delete(1.0, tk.END)
-        self._update_hint()
-
         try:
             # Build display message (include attachment info)
             display_msg = message
-            if self.attached_files:
-                names = ', '.join(f['name'] for f in self.attached_files)
+            if attachments:
+                names = ', '.join(f['name'] for f in attachments)
                 display_msg = f"{message}\n\U0001f4ce Attached: {names}" if message else f"\U0001f4ce Attached: {names}"
+            elif not display_msg and images:
+                display_msg = f"\U0001f4ce Attached {len(images)} image(s)"
 
             # History for the API is captured BEFORE the new message is added
             messages = self._history_for_api() if self.include_history_var.get() else []
 
-            # Show + store the user message
-            self._remove_empty_state()
-            user_msg = ChatMessage(role="user", content=message)
-            self._messages.append(user_msg)
-            self._draw_message("user", display_msg, user_msg.timestamp, len(self._messages) - 1)
-            if self._gen_doc_id:
-                self.history_manager.add_message(user_msg, self._gen_doc_id)
-
-            # Build current message content
+            # Build current message content & images
             content_parts: List[str] = []
-            images: List[str] = []
+            msg_images: List[str] = list(images) if images is not None else []
             if self.include_doc_var.get() and self.get_document_content:
                 doc_content = self.get_document_content()
                 if doc_content:
                     content_parts.append(f"[Current Document]\n{doc_content}\n[End Document]\n\n")
-            if self.get_document_images and self.include_doc_var.get():
+            if images is None and self.get_document_images and self.include_doc_var.get():
                 for img_data in self.get_document_images()[:3]:  # Limit to 3 images
                     try:
                         img = img_data.get('image')
                         if img and PIL_AVAILABLE:
                             encoded = self.llm_client.encode_image_for_api(img, self.settings.image_max_size[0])
                             if encoded:
-                                images.append(encoded)
+                                msg_images.append(encoded)
                     except Exception:
                         pass
-            for attachment in self.attached_files:
-                if attachment['type'] == 'image':
-                    images.append(attachment['content'])
-                elif attachment['type'] == 'text':
-                    content_parts.append(
-                        f"\n[Attached File: {attachment['name']}]\n{attachment['content']}\n[End File]\n")
-            self.attached_files.clear()
-            self._update_attachments_display()
+            if attachments:
+                for attachment in attachments:
+                    if attachment['type'] == 'image':
+                        msg_images.append(attachment['content'])
+                    elif attachment['type'] == 'text':
+                        content_parts.append(
+                            f"\n[Attached File: {attachment['name']}]\n{attachment['content']}\n[End File]\n")
+
+            # Show + store the user message
+            self._remove_empty_state()
+            user_msg = ChatMessage(role="user", content=message, images=list(msg_images))
+            self._messages.append(user_msg)
+            self._draw_message("user", display_msg, user_msg.timestamp, len(self._messages) - 1)
+            if self._gen_doc_id:
+                self.history_manager.add_message(user_msg, self._gen_doc_id)
 
             content_parts.append(message)
             messages.append({"role": "user", "content": "".join(content_parts)})
@@ -5554,8 +5748,12 @@ class ChatSidebar(tk.Frame):
             # Assistant card with live progress indicator
             self._start_assistant_stream()
 
-            thread = threading.Thread(target=self._generate_response,
-                                      args=(messages, images, gen_id, cancel), daemon=True)
+            gen_params = self._snapshot_generation_params()
+            thread = threading.Thread(
+                target=self._generate_response,
+                args=(messages, msg_images, gen_id, cancel, gen_params),
+                daemon=True,
+            )
             thread.start()
         except Exception as e:
             self._reset_generating_state()
@@ -5563,34 +5761,27 @@ class ChatSidebar(tk.Frame):
             self._add_chat_message("system", f"Error: failed to dispatch message: {e}")
 
     def _generate_response(self, messages: List[Dict], images: List[str], gen_id: int,
-                           cancel: threading.Event):
+                           cancel: threading.Event, gen_params: Optional[Dict[str, Any]] = None):
         """Generate response in background thread"""
         try:
-            active_model = self.settings.model
-            if self.settings.provider == 'gemini':
-                self.llm_client.api_key = self.settings.gemini_api_key
-            elif self.settings.provider == 'anthropic':
-                self.llm_client.api_key = self.settings.api_key
-            elif self.settings.provider == 'deepseek':
-                self.llm_client.api_key = self.settings.deepseek_api_key
-            elif self.settings.provider in ('agy', 'antigravity'):
-                active_model = self.settings.agy_model or self.settings.model
-                if isinstance(self.llm_client, AgyClient):
-                    self.llm_client.model = active_model
-                    self.llm_client.effort = self.settings.agy_effort or 'low'
-                    self.llm_client.cli_command = self.settings.agy_path or find_antigravity_cli_command()
+            params = gen_params if gen_params is not None else self._snapshot_generation_params()
+            client = params['client']
+            active_model = params['model']
 
             text = ""
-            gen = self.llm_client.send_message_stream(
-                messages,
-                system_prompt=self.settings.system_prompt,
-                max_tokens=self.settings.max_tokens,
-                temperature=self.settings.temperature,
-                top_p=self.settings.top_p,
-                top_k=self.settings.top_k,
-                images=images if images else None,
-                model=active_model
-            )
+            stream_kwargs: Dict[str, Any] = {
+                'system_prompt': params['system_prompt'],
+                'max_tokens': params['max_tokens'],
+                'temperature': params['temperature'],
+                'top_p': params['top_p'],
+                'top_k': params['top_k'],
+                'images': images if images else None,
+                'model': active_model,
+            }
+            if isinstance(client, AgyClient):
+                stream_kwargs['cancel_event'] = cancel
+
+            gen = client.send_message_stream(messages, **stream_kwargs)
             try:
                 for chunk in gen:
                     if cancel.is_set():
@@ -5661,7 +5852,8 @@ class ChatSidebar(tk.Frame):
             self._tick()
         else:
             self.send_btn.configure(text="Send", command=self._send_message, state=tk.NORMAL)
-            ToolTip(self.send_btn, "Send message (Shift+Enter)")
+            if hasattr(self, 'send_btn_tip') and self.send_btn_tip:
+                self.send_btn_tip.set_text("Submit your prompt message to the AI assistant (Shift+Enter or Ctrl+Enter). Click while generating to stop.")
             self.progress.stop()
             self.progress.pack_forget()
             self.edit_btn.configure(state=tk.NORMAL)
@@ -6146,7 +6338,7 @@ class ChatSidebar(tk.Frame):
         if is_sheet:
             has_sheet_patches = bool(
                 re.search(r"```(?:spreadsheet-edits|spreadsheet|excel|csv|tsv)", response_text, re.IGNORECASE) or
-                re.search(r"\b[A-Za-z]+[0-9]+\s*[:=]\s*", response_text) or
+                re.search(r"\b[A-Za-z]{1,3}[1-9][0-9]*\s*[:=]\s*", response_text) or
                 ("|" in response_text and "\n|" in response_text)
             )
 
@@ -6179,22 +6371,47 @@ class ChatSidebar(tk.Frame):
 
     def _apply_response_to_document(self, response_text: str, selection: Optional[Dict] = None):
         """Open the diff panel to apply AI response to document"""
-        if self.apply_edit_callback:
-            if selection:
-                self.apply_edit_callback(
-                    selection['text'],
-                    response_text,
-                    selection['start_index'],
-                    selection['end_index']
-                )
-            else:
-                self.apply_edit_callback(
-                    None,
-                    response_text,
-                    None,
-                    None
-                )
-        self._clear_pending_selection()
+        if not self.apply_edit_callback:
+            return
+        orig = selection['text'] if selection else None
+        start_idx = selection['start_index'] if selection else None
+        end_idx = selection['end_index'] if selection else None
+
+        def _on_applied(*_args, **_kwargs):
+            self._clear_pending_selection()
+
+        accepts_cb = False
+        kw_name: Optional[str] = None
+        accepts_var_kw = False
+        try:
+            sig = inspect.signature(self.apply_edit_callback)
+            params = list(sig.parameters.values())
+            pos_params = [
+                p for p in params
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            accepts_cb = (
+                len(pos_params) >= 5
+                or any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+            )
+            for p in params:
+                if p.kind == inspect.Parameter.KEYWORD_ONLY and p.name in (
+                    'on_applied', 'on_confirm', 'on_complete', 'on_accept', 'callback'
+                ):
+                    kw_name = p.name
+                    break
+            accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        except (ValueError, TypeError):
+            pass
+
+        if accepts_cb:
+            self.apply_edit_callback(orig, response_text, start_idx, end_idx, _on_applied)
+        elif kw_name:
+            self.apply_edit_callback(orig, response_text, start_idx, end_idx, **{kw_name: _on_applied})
+        elif accepts_var_kw:
+            self.apply_edit_callback(orig, response_text, start_idx, end_idx, on_applied=_on_applied)
+        else:
+            self.apply_edit_callback(orig, response_text, start_idx, end_idx)
 
     def _remove_apply_buttons(self):
         """Remove any embedded Apply/Discard buttons from chat display"""

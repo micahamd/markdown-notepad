@@ -7,9 +7,11 @@ and accurately embeds them inline within the generated Markdown content.
 
 import os
 import io
+import posixpath
 import re
 import zipfile
 from pathlib import Path
+from urllib.parse import unquote
 from typing import Dict, List, Tuple, Optional, Any
 
 # Try importing fitz (PyMuPDF)
@@ -93,7 +95,7 @@ class DocumentImageExtractor:
     def can_extract(cls, filepath: str) -> bool:
         """Check if image extraction is supported for the given file extension."""
         ext = Path(filepath).suffix.lower()
-        return ext in {'.pdf', '.epub', '.docx', '.pptx', '.xlsx', '.html', '.htm'}
+        return ext in {'.pdf', '.epub', '.docx', '.pptx', '.xlsx'}
 
     @classmethod
     def get_default_assets_dir(cls, filepath: str) -> str:
@@ -119,81 +121,79 @@ class DocumentImageExtractor:
         markdown_pages: List[str] = []
         img_counter = 0
 
-        doc = fitz.open(pdf_path)
+        with fitz.open(pdf_path) as doc:
+            for p_idx in range(len(doc)):
+                page = doc[p_idx]
+                page_num = p_idx + 1
+                page_elements = []
 
-        for p_idx in range(len(doc)):
-            page = doc[p_idx]
-            page_num = p_idx + 1
-            page_elements = []
-
-            # 1. Retrieve text blocks with bounding boxes: (x0, y0, x1, y1, text, block_no, block_type)
-            text_blocks = page.get_text("blocks")
-            for b in text_blocks:
-                x0, y0, x1, y1, text, b_no, b_type = b
-                if b_type == 0 and text.strip():  # Text block
-                    page_elements.append({
-                        'type': 'text',
-                        'y0': y0,
-                        'x0': x0,
-                        'content': text.rstrip()
-                    })
-
-            # 2. Retrieve image placements on this page
-            image_info_list = page.get_image_info(xrefs=True)
-            for info in image_info_list:
-                xref = info.get('xref')
-                if not xref:
-                    continue
-
-                bbox = info.get('bbox', (0, 0, 0, 0))
-                y0 = bbox[1]
-                x0 = bbox[0]
-
-                try:
-                    base_img = doc.extract_image(xref)
-                    if base_img:
-                        img_bytes = base_img.get('image')
-                        img_ext = base_img.get('ext', 'png')
-                        img_counter += 1
-
-                        # Filter out tiny icon/artifact images (< 15x15 px or < 200 bytes)
-                        width = base_img.get('width', 0)
-                        height = base_img.get('height', 0)
-                        if (width > 0 and width < 15) or (height > 0 and height < 15) or len(img_bytes) < 200:
-                            continue
-
-                        img_filename = f"img_p{page_num}_{img_counter}.{img_ext}"
-                        img_path = os.path.join(output_dir, img_filename)
-
-                        with open(img_path, 'wb') as f:
-                            f.write(img_bytes)
-
-                        extracted_images[img_filename] = img_path
-
-                        # Insert markdown reference
-                        caption = f"Image (Page {page_num})"
-                        if width and height:
-                            caption = f"{caption}|{width}x{height}"
-                        
-                        img_md = f"\n![{caption}]({img_filename})\n"
+                # 1. Retrieve text blocks with bounding boxes: (x0, y0, x1, y1, text, block_no, block_type)
+                text_blocks = page.get_text("blocks")
+                for b in text_blocks:
+                    x0, y0, x1, y1, text, b_no, b_type = b
+                    if b_type == 0 and text.strip():  # Text block
                         page_elements.append({
-                            'type': 'image',
+                            'type': 'text',
                             'y0': y0,
                             'x0': x0,
-                            'content': img_md
+                            'content': text.rstrip()
                         })
-                except Exception as e:
-                    print(f"Warning: Failed to extract image xref {xref} on page {page_num}: {e}")
 
-            # Sort page elements from top to bottom (y0 coordinate order)
-            page_elements.sort(key=lambda item: (item['y0'], item['x0']))
+                # 2. Retrieve image placements on this page
+                image_info_list = page.get_image_info(xrefs=True)
+                for info in image_info_list:
+                    xref = info.get('xref')
+                    if not xref:
+                        continue
 
-            # Combine page content
-            page_md = "\n\n".join(item['content'] for item in page_elements if item['content'].strip())
-            if page_md.strip():
-                markdown_pages.append(page_md)
+                    bbox = info.get('bbox', (0, 0, 0, 0))
+                    y0 = bbox[1]
+                    x0 = bbox[0]
 
-        doc.close()
+                    try:
+                        base_img = doc.extract_image(xref)
+                        if base_img:
+                            img_bytes = base_img.get('image')
+                            img_ext = base_img.get('ext', 'png')
+                            img_counter += 1
+
+                            # Filter out tiny icon/artifact images (< 15x15 px or < 200 bytes)
+                            width = base_img.get('width', 0)
+                            height = base_img.get('height', 0)
+                            if (width > 0 and width < 15) or (height > 0 and height < 15) or len(img_bytes) < 200:
+                                continue
+
+                            img_filename = f"img_p{page_num}_{img_counter}.{img_ext}"
+                            img_path = os.path.join(output_dir, img_filename)
+
+                            with open(img_path, 'wb') as f:
+                                f.write(img_bytes)
+
+                            extracted_images[img_filename] = img_path
+
+                            # Insert markdown reference
+                            caption = f"Image (Page {page_num})"
+                            if width and height:
+                                caption = f"{caption}|{width}x{height}"
+                            
+                            img_md = f"\n![{caption}]({img_filename})\n"
+                            page_elements.append({
+                                'type': 'image',
+                                'y0': y0,
+                                'x0': x0,
+                                'content': img_md
+                            })
+                    except Exception as e:
+                        print(f"Warning: Failed to extract image xref {xref} on page {page_num}: {e}")
+
+                # Sort page elements from top to bottom (y0 coordinate order)
+                page_elements.sort(key=lambda item: (item['y0'], item['x0']))
+
+                # Combine page content
+                page_md = "\n\n".join(item['content'] for item in page_elements if item['content'].strip())
+                if page_md.strip():
+                    markdown_pages.append(page_md)
+
         full_markdown = "\n\n".join(markdown_pages)
         return full_markdown, extracted_images
 
@@ -205,7 +205,8 @@ class DocumentImageExtractor:
         """
         os.makedirs(output_dir, exist_ok=True)
         extracted_images: Dict[str, str] = {}
-        path_mapping: Dict[str, str] = {}
+        exact_mapping: Dict[str, str] = {}
+        basename_mapping: Dict[str, str] = {}
         total_extracted = 0
 
         try:
@@ -237,14 +238,12 @@ class DocumentImageExtractor:
 
                         extracted_images[saved_filename] = target_path
 
-                        # Map original paths to extracted filename
-                        path_mapping[member_name] = saved_filename
-                        path_mapping[filename] = saved_filename
-                        path_mapping[f"../Images/{filename}"] = saved_filename
-                        path_mapping[f"Images/{filename}"] = saved_filename
-                        path_mapping[f"images/{filename}"] = saved_filename
-                        path_mapping[f"../images/{filename}"] = saved_filename
-                        path_mapping[f"OEBPS/Images/{filename}"] = saved_filename
+                        # Map normalized archive paths first; keep first-seen basename mapping without overwriting
+                        raw_member = member_name.replace('\\', '/')
+                        norm_member = posixpath.normpath(raw_member).lstrip('./')
+                        exact_mapping[raw_member] = saved_filename
+                        exact_mapping[norm_member] = saved_filename
+                        basename_mapping.setdefault(filename, saved_filename)
         except Exception as e:
             print(f"Error extracting EPUB images: {e}")
 
@@ -253,11 +252,27 @@ class DocumentImageExtractor:
             alt = match.group(1)
             src = match.group(2)
 
-            # Look up normalized src in mapping
-            norm_src = src.replace('\\', '/')
-            base_src = os.path.basename(norm_src)
+            norm_src = unquote(src).replace('\\', '/')
+            cleaned_src = norm_src
+            while cleaned_src.startswith(('../', './')):
+                cleaned_src = cleaned_src[3:] if cleaned_src.startswith('../') else cleaned_src[2:]
+            norm_posix = posixpath.normpath(norm_src).lstrip('./')
 
-            resolved = path_mapping.get(norm_src) or path_mapping.get(base_src)
+            resolved = (
+                exact_mapping.get(norm_src)
+                or exact_mapping.get(norm_posix)
+                or exact_mapping.get(cleaned_src)
+            )
+            if not resolved and cleaned_src:
+                suffix_needle = '/' + cleaned_src
+                for arch_path, saved_name in exact_mapping.items():
+                    if arch_path.endswith(suffix_needle):
+                        resolved = saved_name
+                        break
+            if not resolved:
+                base_src = os.path.basename(norm_src)
+                resolved = basename_mapping.get(base_src)
+
             if resolved:
                 return f"![{alt}]({resolved})"
             return match.group(0)
@@ -317,13 +332,16 @@ class DocumentImageExtractor:
             print(f"Error extracting Office images: {e}")
 
         # If raw markdown already has image references, update them
+        rewrite_count = 0
         if raw_markdown and re.search(r'!\[.*?\]\(.*?\)', raw_markdown):
             def rewrite_office_src(match: re.Match) -> str:
+                nonlocal rewrite_count
                 alt = match.group(1)
                 src = match.group(2)
                 base_src = os.path.basename(src.replace('\\', '/'))
                 resolved = path_mapping.get(base_src) or path_mapping.get(src)
                 if resolved:
+                    rewrite_count += 1
                     return f"![{alt}]({resolved})"
                 return match.group(0)
 
@@ -333,13 +351,14 @@ class DocumentImageExtractor:
                 raw_markdown
             )
         else:
-            # If markdown has no inline references, append extracted images
             updated_markdown = raw_markdown
-            if extracted_images:
-                img_section = "\n\n---\n\n## Extracted Images\n\n"
-                for img_name in sorted(extracted_images.keys()):
-                    img_section += f"![{img_name}]({img_name})\n\n"
-                updated_markdown += img_section
+
+        if extracted_images and rewrite_count == 0:
+            # Append extracted images when markdown had no matching references rewritten
+            img_section = "\n\n---\n\n## Extracted Images\n\n"
+            for img_name in sorted(extracted_images.keys()):
+                img_section += f"![{img_name}]({img_name})\n\n"
+            updated_markdown += img_section
 
         return updated_markdown, extracted_images
 
@@ -365,7 +384,7 @@ class DocumentImageExtractor:
         if ext == '.pdf':
             # PyMuPDF spatial extraction
             pdf_md, images = cls.extract_from_pdf(filepath, output_dir)
-            if pdf_md and len(pdf_md.strip()) > 50:
+            if images or (pdf_md and len(pdf_md.strip()) > 0):
                 processed_md = pdf_md
                 extracted_images = images
             else:

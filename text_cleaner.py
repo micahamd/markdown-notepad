@@ -70,7 +70,7 @@ class TextCleaner:
     }
 
     # Regex patterns
-    RE_CODE_FENCE = re.compile(r'^\s*(```|~~~)')
+    RE_CODE_FENCE = re.compile(r'^\s*(`{3,}|~{3,})')
     RE_TABLE_ROW = re.compile(r'^\s*\|.*\|\s*$')
     RE_MD_HEADING = re.compile(r'^\s*#{1,6}\s+')
     RE_LIST_ITEM = re.compile(r'^\s*(?:[-*+]|\d+[.)]|\([0-9a-zA-Z]+\))\s+')
@@ -80,13 +80,36 @@ class TextCleaner:
     # Page numbers and form feeds
     RE_FORM_FEED = re.compile(r'\x0c')
     RE_STANDALONE_PAGE_NUM = re.compile(
-        r'^\s*(?:(?:Page|p\.|pp\.|-)\s*)?(?:\d+|[ivxlcdm]+)(?:\s*-)?\s*$',
+        r'^\s*(?:(?:Page|p\.|pp\.|-)\s*)?\d+(?:\s*-)?\s*$',
+        re.IGNORECASE
+    )
+    RE_ROMAN_PAGE_NUM = re.compile(
+        r'^\s*(?:'
+        r'(?:Page|p\.|pp\.)\s+[-—]?\s*(?=[ivxlcdm]+\b)m{0,3}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})(?:\s*[-—])?'
+        r'|[-—]\s*(?=[ivxlcdm]+\b)m{0,3}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})\s*[-—]'
+        r')\s*$',
         re.IGNORECASE
     )
     RE_BRACKETED_PAGE_NUM = re.compile(r'^\s*\[\s*\d+\s*\]\s*$')
 
     # De-hyphenation across line breaks: "infor-\nmation" -> "information"
     RE_HYPHEN_LINEBREAK = re.compile(r'(\b[A-Za-z]+)[-\u2010\u00ad]\s*\n\s*([A-Za-z]+\b)')
+
+    @classmethod
+    def _update_fence_state(
+        cls, line: str, active_fence: Optional[Tuple[str, int]]
+    ) -> Tuple[bool, Optional[Tuple[str, int]]]:
+        """Track fenced code block state across lines. Returns (is_fence_line, next_fence)."""
+        if active_fence is None:
+            m = cls.RE_CODE_FENCE.match(line)
+            if m:
+                fence = m.group(1)
+                return True, (fence[0], len(fence))
+            return False, None
+        fence_char, fence_len = active_fence
+        if re.match(rf'^\s*{re.escape(fence_char)}{{{fence_len},}}\s*$', line):
+            return True, None
+        return False, active_fence
 
     @classmethod
     def clean(cls, text: str, options: Optional[TextCleanerOptions] = None) -> str:
@@ -146,14 +169,26 @@ class TextCleaner:
 
     @classmethod
     def _strip_page_artifacts(cls, text: str) -> str:
-        """Remove form feeds and standalone page number lines."""
+        """Remove form feeds and standalone page number lines outside code blocks."""
         text = cls.RE_FORM_FEED.sub('\n\n', text)
 
         lines = text.split('\n')
         cleaned_lines = []
+        active_fence: Optional[Tuple[str, int]] = None
         for i, line in enumerate(lines):
+            is_fence, next_fence = cls._update_fence_state(line, active_fence)
+            in_code = is_fence or (active_fence is not None)
+            active_fence = next_fence
+            if in_code:
+                cleaned_lines.append(line)
+                continue
+
             stripped = line.strip()
-            if stripped and (cls.RE_STANDALONE_PAGE_NUM.match(stripped) or cls.RE_BRACKETED_PAGE_NUM.match(stripped)):
+            if stripped and (
+                cls.RE_STANDALONE_PAGE_NUM.match(stripped)
+                or cls.RE_ROMAN_PAGE_NUM.match(stripped)
+                or cls.RE_BRACKETED_PAGE_NUM.match(stripped)
+            ):
                 if len(stripped) <= 15:
                     prev_empty = (i == 0 or not lines[i - 1].strip())
                     next_empty = (i == len(lines) - 1 or not lines[i + 1].strip())
@@ -173,9 +208,15 @@ class TextCleaner:
             return text
 
         candidate_counts: Dict[str, int] = {}
+        active_fence: Optional[Tuple[str, int]] = None
         for line in lines:
+            is_fence, next_fence = cls._update_fence_state(line, active_fence)
+            in_code = is_fence or (active_fence is not None)
+            active_fence = next_fence
+            if in_code:
+                continue
             s = line.strip()
-            if 4 <= len(s) <= 75 and not s.startswith(('#', '```', '|', '>', '-', '*', '1.')):
+            if 4 <= len(s) <= 75 and not s.startswith(('#', '```', '~~~', '|', '>', '-', '*', '1.')):
                 candidate_counts[s] = candidate_counts.get(s, 0) + 1
 
         repeating_headers = {
@@ -187,8 +228,12 @@ class TextCleaner:
             return text
 
         cleaned_lines = []
+        active_fence = None
         for line in lines:
-            if line.strip() in repeating_headers:
+            is_fence, next_fence = cls._update_fence_state(line, active_fence)
+            in_code = is_fence or (active_fence is not None)
+            active_fence = next_fence
+            if not in_code and line.strip() in repeating_headers:
                 continue
             cleaned_lines.append(line)
 
@@ -197,9 +242,9 @@ class TextCleaner:
     @classmethod
     def _dehyphenate(cls, text: str) -> str:
         """
-        Merge words broken across line breaks with hyphens.
-        'infor-\nmation' -> 'information'
-        'self-\nevident' -> 'self-evident'
+        Merge words broken across line breaks with hyphens (outside code blocks).
+        'infor-\\nmation' -> 'information'
+        'self-\\nevident' -> 'self-evident'
         """
         def replace_hyphen(match: re.Match) -> str:
             prefix = match.group(1)
@@ -214,25 +259,49 @@ class TextCleaner:
 
             return f"{prefix}{suffix}"
 
-        return cls.RE_HYPHEN_LINEBREAK.sub(replace_hyphen, text)
+        segments: List[Tuple[bool, List[str]]] = []
+        active_fence: Optional[Tuple[str, int]] = None
+        for line in text.splitlines(keepends=True):
+            is_fence, next_fence = cls._update_fence_state(line, active_fence)
+            in_code = is_fence or (active_fence is not None)
+            active_fence = next_fence
+            if segments and segments[-1][0] == in_code:
+                segments[-1][1].append(line)
+            else:
+                segments.append((in_code, [line]))
+
+        out_parts = []
+        for in_code, seg_lines in segments:
+            seg_text = ''.join(seg_lines)
+            if in_code:
+                out_parts.append(seg_text)
+            else:
+                out_parts.append(cls.RE_HYPHEN_LINEBREAK.sub(replace_hyphen, seg_text))
+        return ''.join(out_parts)
 
     @classmethod
     def _reflow_paragraphs(cls, text: str, options: TextCleanerOptions) -> str:
         """
         Intelligently reflow soft line breaks into cohesive paragraphs
-        while preserving code blocks, tables, lists, and headings.
+        while preserving code blocks, tables, lists, blockquotes, and headings.
         """
         raw_lines = text.split('\n')
         if not raw_lines:
             return text
 
-        non_empty_lengths = [len(l.strip()) for l in raw_lines if l.strip() and not l.startswith(('#', '```', '|'))]
+        non_empty_lengths = []
+        active_fence: Optional[Tuple[str, int]] = None
+        for l in raw_lines:
+            is_fence, next_fence = cls._update_fence_state(l, active_fence)
+            in_code = is_fence or (active_fence is not None)
+            active_fence = next_fence
+            if not in_code and l.strip() and not l.lstrip().startswith(('#', '```', '~~~', '|')):
+                non_empty_lengths.append(len(l.strip()))
         median_length = statistics.median(non_empty_lengths) if non_empty_lengths else 65
         min_continuation_length = max(35, int(median_length * 0.60))
 
         output_paragraphs: List[str] = []
         current_paragraph: List[str] = []
-        in_code_block = False
 
         def flush_paragraph():
             if current_paragraph:
@@ -241,57 +310,104 @@ class TextCleaner:
                     output_paragraphs.append(combined)
                 current_paragraph.clear()
 
-        for line in raw_lines:
+        idx = 0
+        n = len(raw_lines)
+        while idx < n:
+            line = raw_lines[idx]
             stripped = line.strip()
 
-            if options.preserve_code_blocks and cls.RE_CODE_FENCE.match(line):
-                flush_paragraph()
-                in_code_block = not in_code_block
-                output_paragraphs.append(line)
-                continue
-
-            if in_code_block:
-                output_paragraphs.append(line)
-                continue
+            # Fenced code block (accumulated as a single newline-joined block)
+            if options.preserve_code_blocks:
+                is_fence, fence_state = cls._update_fence_state(line, None)
+                if is_fence and fence_state is not None:
+                    flush_paragraph()
+                    code_lines = [line]
+                    idx += 1
+                    while idx < n:
+                        code_lines.append(raw_lines[idx])
+                        _, next_state = cls._update_fence_state(raw_lines[idx], fence_state)
+                        idx += 1
+                        if next_state is None:
+                            break
+                    output_paragraphs.append('\n'.join(code_lines))
+                    continue
 
             if not stripped:
                 flush_paragraph()
+                idx += 1
                 continue
 
+            # Markdown table block (accumulated as a single newline-joined block)
             if options.preserve_tables and cls.RE_TABLE_ROW.match(line):
                 flush_paragraph()
-                output_paragraphs.append(line)
+                table_lines = [line]
+                idx += 1
+                while idx < n and cls.RE_TABLE_ROW.match(raw_lines[idx]):
+                    table_lines.append(raw_lines[idx])
+                    idx += 1
+                output_paragraphs.append('\n'.join(table_lines))
                 continue
 
             if cls.RE_MD_HEADING.match(line):
                 flush_paragraph()
                 output_paragraphs.append(line)
+                idx += 1
                 continue
 
             if options.auto_promote_headings and cls._is_all_caps_heading(stripped):
                 flush_paragraph()
                 output_paragraphs.append(f"## {stripped.title()}")
+                idx += 1
                 continue
 
             if cls.RE_HORIZONTAL_RULE.match(line):
                 flush_paragraph()
                 output_paragraphs.append(line)
+                idx += 1
                 continue
 
+            # List block (accumulated as a single newline-joined block)
             if options.preserve_lists and cls.RE_LIST_ITEM.match(line):
                 flush_paragraph()
-                output_paragraphs.append(line)
+                list_lines = [line]
+                idx += 1
+                while idx < n:
+                    nxt = raw_lines[idx]
+                    if not nxt.strip():
+                        break
+                    if cls.RE_LIST_ITEM.match(nxt):
+                        list_lines.append(nxt)
+                        idx += 1
+                    elif nxt[0] in (' ', '\t') and not (
+                        cls.RE_MD_HEADING.match(nxt)
+                        or cls.RE_HORIZONTAL_RULE.match(nxt)
+                        or cls.RE_TABLE_ROW.match(nxt)
+                        or cls.RE_CODE_FENCE.match(nxt)
+                        or cls.RE_BLOCKQUOTE.match(nxt)
+                    ):
+                        list_lines.append(nxt)
+                        idx += 1
+                    else:
+                        break
+                output_paragraphs.append('\n'.join(list_lines))
                 continue
 
+            # Blockquote block (accumulated as a single newline-joined block)
             if options.preserve_blockquotes and cls.RE_BLOCKQUOTE.match(line):
                 flush_paragraph()
-                output_paragraphs.append(line)
+                quote_lines = [line]
+                idx += 1
+                while idx < n and cls.RE_BLOCKQUOTE.match(raw_lines[idx]):
+                    quote_lines.append(raw_lines[idx])
+                    idx += 1
+                output_paragraphs.append('\n'.join(quote_lines))
                 continue
 
             # Preserve standalone image tags
             if re.match(r'^\s*(?:!\[.*?\]\(.*?\)|<img\s+[^>]*>)\s*$', stripped, re.IGNORECASE):
                 flush_paragraph()
                 output_paragraphs.append(stripped)
+                idx += 1
                 continue
 
             if not current_paragraph:
@@ -306,6 +422,8 @@ class TextCleaner:
                     current_paragraph.append(stripped)
                 else:
                     current_paragraph.append(stripped)
+
+            idx += 1
 
         flush_paragraph()
         return '\n\n'.join(output_paragraphs)
@@ -345,10 +463,45 @@ class TextCleaner:
 
     @classmethod
     def _finalize_whitespace(cls, text: str) -> str:
-        """Clean up extraneous spaces and excessive blank lines."""
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        lines = [re.sub(r'[ \t]{2,}', ' ', l).rstrip() for l in text.split('\n')]
-        return '\n'.join(lines).strip() + '\n'
+        """Clean up extraneous spaces and excessive blank lines while preserving code blocks, tables, and indentation."""
+        out_lines: List[str] = []
+        active_fence: Optional[Tuple[str, int]] = None
+        blank_run = 0
+
+        for line in text.split('\n'):
+            is_fence, next_fence = cls._update_fence_state(line, active_fence)
+            in_code = is_fence or (active_fence is not None)
+            active_fence = next_fence
+
+            if in_code:
+                blank_run = 0
+                out_lines.append(line)
+                continue
+
+            if not line.strip():
+                blank_run += 1
+                if blank_run <= 1:
+                    out_lines.append('')
+                continue
+
+            blank_run = 0
+            if cls.RE_TABLE_ROW.match(line):
+                out_lines.append(line.rstrip())
+            else:
+                m = re.match(r'^([ \t]*)(.*)$', line)
+                leading, body = m.group(1), m.group(2)
+                cleaned_body = re.sub(r'[ \t]{2,}', ' ', body).rstrip()
+                out_lines.append(f"{leading}{cleaned_body}")
+
+        # Trim leading/trailing empty lines without stripping leading indentation on content lines
+        while out_lines and not out_lines[0].strip():
+            out_lines.pop(0)
+        while out_lines and not out_lines[-1].strip():
+            out_lines.pop()
+
+        if not out_lines:
+            return ''
+        return '\n'.join(out_lines) + '\n'
 
 
 def clean_document(text: str, options: Optional[TextCleanerOptions] = None) -> str:
