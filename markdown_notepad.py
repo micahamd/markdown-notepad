@@ -325,6 +325,79 @@ _COLOR_ANY_OPEN_RE = re.compile(
 )
 _COLOR_CLOSE_RE = re.compile(r'</span>', re.IGNORECASE)
 
+_SAFE_FONT_FAMILY_RE = re.compile(r'^[A-Za-z0-9 _\-]{1,60}$')
+_STYLE_SPAN_RE = re.compile(
+    r'<span\s+style=(?P<q>["\'])(?P<style>(?:(?!(?P=q))[^\n])+)(?P=q)\s*>(?P<body>.*?)</span>',
+    re.IGNORECASE,
+)
+_STYLE_ANY_OPEN_RE = re.compile(
+    r'<span\s+style=(?P<q>["\'])(?:(?!(?P=q))[^\n])+(?P=q)\s*>',
+    re.IGNORECASE,
+)
+
+
+def _parse_inline_span_style(style_str: str) -> Dict[str, Any]:
+    """Strictly parse inline <span style="..."> CSS declarations into canonical properties."""
+    props: Dict[str, Any] = {}
+    if not style_str:
+        return props
+    for decl in style_str.split(';'):
+        if ':' not in decl:
+            continue
+        k, v = decl.split(':', 1)
+        key = k.strip().lower()
+        val = v.strip()
+        if not val:
+            continue
+        if key == 'color':
+            norm = _normalize_hex_color(val)
+            if norm:
+                props['color'] = norm
+        elif key == 'font-family':
+            fam = val.strip().strip('\'"').strip()
+            if _SAFE_FONT_FAMILY_RE.match(fam):
+                props['font_family'] = fam
+        elif key == 'font-size':
+            m_sz = re.match(r'^(\d+)\s*pt$', val, re.IGNORECASE)
+            if m_sz:
+                props['font_size'] = max(6, min(72, int(m_sz.group(1))))
+        elif key == 'text-decoration':
+            tokens = val.lower().split()
+            if 'underline' in tokens:
+                props['underline'] = True
+            if 'line-through' in tokens:
+                props['strike'] = True
+    return props
+
+
+def _format_inline_span_style(props: Dict[str, Any]) -> str:
+    """Emit canonical CSS declarations for inline <span style="..."> properties."""
+    if not props:
+        return ""
+    parts: List[str] = []
+    if props.get('color'):
+        norm = _normalize_hex_color(props['color'])
+        if norm:
+            parts.append(f"color:{norm}")
+    if props.get('font_family'):
+        fam = str(props['font_family']).strip().strip('\'"').strip()
+        if _SAFE_FONT_FAMILY_RE.match(fam):
+            parts.append(f"font-family:'{fam}'")
+    if props.get('font_size') is not None:
+        try:
+            sz = max(6, min(72, int(props['font_size'])))
+            parts.append(f"font-size:{sz}pt")
+        except (ValueError, TypeError):
+            pass
+    decos: List[str] = []
+    if props.get('underline'):
+        decos.append("underline")
+    if props.get('strike'):
+        decos.append("line-through")
+    if decos:
+        parts.append(f"text-decoration:{' '.join(decos)}")
+    return ";".join(parts)
+
 
 def _atomic_text_replace(editor: tk.Text, start_idx: str, end_idx: str, new_text: str):
     """Replace text in *editor* as a single atomic undoable operation."""
@@ -361,7 +434,7 @@ class _DocColorPalettePopup(tk.Toplevel):
         self.on_select = on_select
         self.on_close = on_close
         self.initial_color = _normalize_hex_color(initial_color) or "#dc2626"
-        self._focus_job = None
+        self._outside_binds = []
         self._choosing_custom = False
         self._closed = False
 
@@ -425,8 +498,25 @@ class _DocColorPalettePopup(tk.Toplevel):
         self.geometry(f"+{tx}+{ty}")
 
         self.bind("<Escape>", lambda e: self.close())
-        self.bind("<FocusOut>", self._on_focus_out)
         self.focus_set()
+
+        seen_wins = []
+        for src_w in (master, anchor_widget):
+            if src_w is None:
+                continue
+            try:
+                top = src_w.winfo_toplevel()
+            except Exception:
+                top = None
+            if top is not None and top not in seen_wins:
+                seen_wins.append(top)
+        for win in seen_wins:
+            try:
+                fid = win.bind("<ButtonPress-1>", self._on_outside_click, add="+")
+                if fid:
+                    self._outside_binds.append((win, fid))
+            except Exception:
+                pass
 
     def _pick(self, hex_c: Optional[str]):
         cb = self.on_select
@@ -448,40 +538,24 @@ class _DocColorPalettePopup(tk.Toplevel):
                 return
         self.close()
 
-    def _on_focus_out(self, event=None):
+    def _on_outside_click(self, event=None):
         if self._choosing_custom or self._closed:
             return
-        if self._focus_job:
-            try:
-                self.after_cancel(self._focus_job)
-            except Exception:
-                pass
-        self._focus_job = self.after(120, self._check_focus)
-
-    def _check_focus(self):
-        self._focus_job = None
-        if self._choosing_custom or self._closed:
+        w = getattr(event, 'widget', None)
+        if _is_widget_descendant(w, self) or _is_widget_descendant(w, self.anchor_widget):
             return
-        try:
-            if not self.winfo_exists():
-                return
-            focused = self.focus_get()
-            if _is_widget_descendant(focused, self):
-                return
-        except Exception:
-            pass
         self.close()
 
     def close(self, invoke_on_close: bool = True):
         if self._closed:
             return
         self._closed = True
-        if self._focus_job:
+        for win, fid in self._outside_binds:
             try:
-                self.after_cancel(self._focus_job)
+                win.unbind("<ButtonPress-1>", fid)
             except Exception:
                 pass
-            self._focus_job = None
+        self._outside_binds.clear()
         try:
             if self.winfo_exists():
                 self.destroy()
@@ -643,9 +717,7 @@ class FloatingMiniToolbar:
         cp = getattr(self, '_color_popup', None)
         if cp is not None:
             try:
-                if cp.winfo_exists() and (
-                    _is_widget_descendant(focused, cp) or getattr(cp, '_choosing_custom', False)
-                ):
+                if cp.winfo_exists():
                     return
             except Exception:
                 pass
@@ -722,22 +794,71 @@ class FloatingMiniToolbar:
                 finally:
                     self.hide()
 
+            def _snap_sel():
+                try:
+                    f_i = self.editor.index(tk.SEL_FIRST)
+                    l_i = self.editor.index(tk.SEL_LAST)
+                    if self.editor.compare(f_i, "<", l_i):
+                        return (f_i, l_i)
+                except tk.TclError:
+                    pass
+                return None
+
+            def _toggle_underline():
+                sel_r = _snap_sel()
+                try:
+                    notepad = self.editor.winfo_toplevel()
+                    if hasattr(notepad, 'toggle_document_underline'):
+                        notepad.toggle_document_underline(sel_range=sel_r)
+                finally:
+                    self.hide()
+                    try:
+                        self.editor.focus_set()
+                    except Exception:
+                        pass
+
+            def _step_font_size(delta):
+                sel_r = _snap_sel()
+                notepad = self.editor.winfo_toplevel()
+                if hasattr(notepad, 'step_document_font_size'):
+                    notepad.step_document_font_size(delta, sel_range=sel_r)
+                try:
+                    self.editor.focus_set()
+                except Exception:
+                    pass
+                self._check_and_show()
+
             btn_defs = [
                 ("𝐁", lambda: _wrap_fmt("**", "**"), "Bold (Ctrl+B)"),
                 ("𝐼", lambda: _wrap_fmt("*", "*"), "Italic (Ctrl+I)"),
+                ("U", _toggle_underline, "Underline (Ctrl+U)"),
                 ("🖍", lambda: _wrap_fmt("==", "=="), "Highlight (Ctrl+Shift+H)"),
                 ("`", lambda: _wrap_fmt("`", "`"), "Inline Code (Ctrl+`)"),
                 ("🔗", lambda: _wrap_fmt("[", "](url)"), "Insert Link (Ctrl+K)"),
             ]
 
             for text, cmd, tip in btn_defs:
+                b_font = (SANS_FONT, 9, "bold") if text == "𝐁" else ((SANS_FONT, 9, "underline") if text == "U" else (SANS_FONT, 9))
                 b = tk.Button(
-                    frame, text=text, command=cmd, font=(SANS_FONT, 9, "bold" if text == "𝐁" else "normal"),
+                    frame, text=text, command=cmd, font=b_font,
                     bg="#f3effa", fg="#2e1065", activebackground="#ede9fe", activeforeground="#4c1d95",
                     relief=tk.FLAT, bd=0, padx=5, pady=2, cursor="hand2", takefocus=0
                 )
                 b.pack(side=tk.LEFT, padx=1, pady=1)
                 ToolTip(b, tip, delay=250)
+
+            for sz_lbl, sz_delta, sz_tip in (
+                ("A-", -2, "Decrease font size (-2pt)"),
+                ("A+", 2, "Increase font size (+2pt)"),
+            ):
+                sb = tk.Button(
+                    frame, text=sz_lbl, command=lambda d=sz_delta: _step_font_size(d),
+                    font=(SANS_FONT, 8, "bold"),
+                    bg="#f3effa", fg="#2e1065", activebackground="#ede9fe", activeforeground="#4c1d95",
+                    relief=tk.FLAT, bd=0, padx=4, pady=2, cursor="hand2", takefocus=0,
+                )
+                sb.pack(side=tk.LEFT, padx=1, pady=1)
+                ToolTip(sb, sz_tip, delay=250)
 
             color_btn = tk.Button(
                 frame, text="A", font=(SANS_FONT, 9, "bold"),
@@ -756,10 +877,12 @@ class FloatingMiniToolbar:
                     self._color_popup = None
                     return
 
+                sel_range = _snap_sel()
+
                 def _on_pick(hex_c):
                     self._color_popup = None
                     try:
-                        notepad.set_document_font_color(hex_c)
+                        notepad.set_document_font_color(hex_c, sel_range=sel_range)
                     finally:
                         self.hide()
                         try:
@@ -3062,14 +3185,16 @@ class MarkdownVisualWidget(tk.Frame):
             self.text_widget.config(state=tk.DISABLED)
             self._restore_yview()
     
-    # Inline markdown pattern: captures bold, italic, highlight, color span, code, math, footnotes, anchors, links in order
+    # Inline markdown pattern: captures bold, italic, highlight, style span, underline, strike, code, math, footnotes, anchors, links in order
     _INLINE_RE = re.compile(
         r'(\*\*|__)(?P<bold>.+?)\1'        # **bold** or __bold__
         r'|(?<!\*)\*(?!\*)(?P<italic>.+?)(?<!\*)\*(?!\*)'  # *italic*
         r'|(?<!_)_(?!_)(?P<italic2>.+?)(?<!_)_(?!_)'       # _italic_
         r'|==(?P<highlight>[^=\n]+)=='     # ==highlight==
         r'|<mark>(?P<mark_text>.*?)</mark>' # <mark>highlight</mark>
-        r'|<span\s+style=["\']color\s*:\s*(?P<span_color>#[0-9a-fA-F]{3,6})\s*;?["\']\s*>(?P<span_text>.*?)</span>'
+        r'|<span\s+style=(?P<span_q>["\'])(?P<span_style>(?:(?!(?P=span_q))[^\n])+)(?P=span_q)\s*>(?P<span_text>.*?)</span>'
+        r'|<u>(?P<uline>.*?)</u>'          # <u>underline</u>
+        r'|~~(?P<strike>[^~\n]+?)~~'       # ~~strikethrough~~
         r'|`(?P<code>[^`]+)`'              # `code`
         r'|(?<!\$)\$(?!\$)(?P<math_inline>[^$\n]+?)(?<!\$)\$(?!\$)' # $math$
         r'|\[\^(?P<footnote_ref>[^\]\n]+)\]' # [^1]
@@ -3103,16 +3228,44 @@ class MarkdownVisualWidget(tk.Frame):
                 tw.insert(tk.END, m.group('highlight'), base_tags + ('highlight',) if base_tags else 'highlight')
             elif m.group('mark_text') is not None:
                 tw.insert(tk.END, m.group('mark_text'), base_tags + ('highlight',) if base_tags else 'highlight')
-            elif m.group('span_color') is not None:
-                norm_c = _normalize_hex_color(m.group('span_color'))
+            elif m.group('span_style') is not None:
+                props = _parse_inline_span_style(m.group('span_style'))
                 inner = m.group('span_text') or ''
-                if norm_c:
-                    ctag = f"color_{norm_c}"
-                    tw.tag_configure(ctag, foreground=norm_c)
-                    tw.tag_raise(ctag)
-                    self._insert_inline(inner, base_tags + (ctag,))
+                if props:
+                    if set(props.keys()) == {'color'}:
+                        norm_c = props['color']
+                        ctag = f"color_{norm_c}"
+                        tw.tag_configure(ctag, foreground=norm_c)
+                        tw.tag_raise(ctag)
+                        self._insert_inline(inner, base_tags + (ctag,))
+                    else:
+                        theme = self.current_theme or {}
+                        base_fam = theme.get('visual_font') or VISUAL_FONT or SANS_FONT or "Segoe UI"
+                        base_sz = theme.get('visual_font_size', 11)
+                        eff_fam = props.get('font_family') or base_fam
+                        eff_sz = props.get('font_size') or base_sz
+                        stag = (
+                            f"style_{props.get('color', '')}_{eff_fam}_{eff_sz}"
+                            f"_{int(bool(props.get('underline')))}_{int(bool(props.get('strike')))}"
+                        )
+                        kw = {}
+                        if props.get('color'):
+                            kw['foreground'] = props['color']
+                        if 'font_family' in props or 'font_size' in props:
+                            kw['font'] = (eff_fam, self._px(eff_sz))
+                        if props.get('underline'):
+                            kw['underline'] = True
+                        if props.get('strike'):
+                            kw['overstrike'] = True
+                        tw.tag_configure(stag, **kw)
+                        tw.tag_raise(stag)
+                        self._insert_inline(inner, base_tags + (stag,))
                 else:
                     self._insert_inline(inner, base_tags)
+            elif m.group('uline') is not None:
+                self._insert_inline(m.group('uline'), base_tags + ('underline',))
+            elif m.group('strike') is not None:
+                self._insert_inline(m.group('strike'), base_tags + ('strike',))
             elif m.group('code') is not None:
                 tw.insert(tk.END, m.group('code'), base_tags + ('code',) if base_tags else 'code')
             elif m.group('math_inline') is not None:
@@ -3593,6 +3746,8 @@ class MarkdownVisualWidget(tk.Frame):
         # Inline styles
         tw.tag_configure("bold", font=(font_family, self._px(font_size), "bold"))
         tw.tag_configure("italic", font=(font_family, self._px(font_size), "italic"))
+        tw.tag_configure("underline", underline=True)
+        tw.tag_configure("strike", overstrike=True)
         hl_bg = "#713f12" if is_dark else "#fef08a"
         hl_fg = "#fef9c3" if is_dark else "#1a1a1a"
         tw.tag_configure("highlight", background=hl_bg, foreground=hl_fg)
@@ -4014,6 +4169,8 @@ class DocumentTab(ttk.Frame):
         self._target_counts = {}
         self._nav_history = []
         self._color_tags = set()
+        self._style_tags = set()
+        self._style_tags_configured = set()
         
         desk_bg = theme.get('desk_bg', '#d9dce1')
         
@@ -4026,6 +4183,7 @@ class DocumentTab(ttk.Frame):
             wrap=tk.WORD,
             font=self._source_font(),
             undo=True,
+            exportselection=False,
             padx=15,
             pady=12,
             bg=theme.get('visual_bg', '#ffffff'),
@@ -4120,6 +4278,7 @@ class DocumentTab(ttk.Frame):
         else:
             self.source_editor.config(font=self._source_font())
         self._setup_syntax_tags()
+        self._apply_syntax_highlighting()
         self.visual_viewer.set_zoom(zoom)
 
     def apply_desk_color(self, desk_bg):
@@ -4616,6 +4775,8 @@ class DocumentTab(ttk.Frame):
                              foreground='' if is_visual else italic_fg)
         editor.tag_configure('syn_bold_italic', font=(b_font, px(sz), 'bold italic'),
                              foreground='' if is_visual else bold_fg)
+        editor.tag_configure('syn_underline', underline=True)
+        editor.tag_configure('syn_strike', overstrike=True)
         editor.tag_configure('syn_highlight', background=hl_bg, foreground=hl_fg)
         editor.tag_configure('syn_code_inline', font=(mono_font, px(sz * 0.95)), background=code_bg, foreground=code_fg)
         editor.tag_configure('syn_link', foreground=link_fg, underline=True)
@@ -4626,10 +4787,16 @@ class DocumentTab(ttk.Frame):
         editor.tag_configure('syn_math', foreground='#5eead4' if dark else '#0f766e', background=code_bg, font=(math_font, px(sz), 'italic'))
         editor.tag_configure('syn_flash', background=hl_bg, foreground=hl_fg)
 
-        # Raise active font color tags above inline/heading/blockquote tags, and keep sel on top
+        self._style_tags_configured = set()
+        # Raise active font color/style tags above inline/heading/blockquote tags, and keep sel on top
         for ctag in getattr(self, '_color_tags', ()):
             try:
                 editor.tag_raise(ctag)
+            except tk.TclError:
+                pass
+        for stag in getattr(self, '_style_tags', ()):
+            try:
+                editor.tag_raise(stag)
             except tk.TclError:
                 pass
         editor.tag_raise('sel')
@@ -4641,15 +4808,40 @@ class DocumentTab(ttk.Frame):
         tags_to_clear = [
             'syn_h1', 'syn_h2', 'syn_h3', 'syn_h4',
             'syn_h1_italic', 'syn_h2_italic', 'syn_h3_italic', 'syn_h4_italic',
-            'syn_bold', 'syn_italic', 'syn_bold_italic', 'syn_highlight',
+            'syn_bold', 'syn_italic', 'syn_bold_italic', 'syn_underline', 'syn_strike',
+            'syn_highlight',
             'syn_code_inline', 'syn_code_block', 'syn_link', 'syn_anchor',
             'syn_footnote', 'syn_math', 'syn_flash', 'syn_blockquote',
             'syn_list_marker', 'syn_hr', 'syn_delimiter', 'syn_fmt_elide',
             'syn_align_left', 'syn_align_center', 'syn_align_right', 'syn_align_tag',
         ]
         tags_to_clear.extend(list(getattr(self, '_color_tags', ())))
+        tags_to_clear.extend(list(getattr(self, '_style_tags', ())))
         for tag in tags_to_clear:
             editor.tag_remove(tag, '1.0', tk.END)
+
+        is_visual = (self.current_mode == "visual")
+        if is_visual:
+            sz = self.theme.get('visual_font_size', 11)
+            b_font = self.theme.get('visual_font') or VISUAL_FONT or SANS_FONT or 'Segoe UI'
+            h_font = b_font
+        else:
+            sz = self.theme.get('source_font_size', 11)
+            b_font = self.theme.get('source_font') or MONO_FONT
+            h_font = b_font
+        dpi_k = self.source_page.dpi() / 72.0 * self.zoom
+        def _px(pt):
+            return -max(4, round(pt * dpi_k))
+        h_deltas = {
+            1: 10 if is_visual else 8,
+            2: 7 if is_visual else 5,
+            3: 4 if is_visual else 3,
+            4: 2 if is_visual else 1,
+        }
+        if not hasattr(self, '_style_tags'):
+            self._style_tags = set()
+        if not hasattr(self, '_style_tags_configured'):
+            self._style_tags_configured = set()
 
         def _overlaps(s: int, e: int, spans: List[Tuple[int, int]]) -> bool:
             return any(s < se and ss < e for ss, se in spans)
@@ -4784,20 +4976,97 @@ class DocumentTab(ttk.Frame):
                 editor.tag_add('syn_highlight', f'{lineno}.{col_off + m.start(1)}', f'{lineno}.{col_off + m.end(1)}')
                 editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.end(1)}', f'{lineno}.{col_off + m.end()}')
 
-            for m in _COLOR_SPAN_RE.finditer(scan_line):
+            for m in re.finditer(r'~~([^~\n]+?)~~', scan_line):
                 if _overlaps(m.start(), m.end(), code_spans):
                     continue
-                norm_hex = _normalize_hex_color(m.group(1))
-                if not norm_hex:
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start() + 2}')
+                editor.tag_add('syn_strike', f'{lineno}.{col_off + m.start() + 2}', f'{lineno}.{col_off + m.end() - 2}')
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.end() - 2}', f'{lineno}.{col_off + m.end()}')
+
+            for m in re.finditer(r'<u>(.*?)</u>', scan_line, re.IGNORECASE):
+                if _overlaps(m.start(), m.end(), code_spans):
                     continue
-                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start(2)}')
-                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.end(2)}', f'{lineno}.{col_off + m.end()}')
-                ctag = f'syn_color_{norm_hex}'
-                if ctag not in self._color_tags:
-                    self._color_tags.add(ctag)
-                    editor.tag_configure(ctag, foreground=norm_hex)
-                editor.tag_raise(ctag)
-                editor.tag_add(ctag, f'{lineno}.{col_off + m.start(2)}', f'{lineno}.{col_off + m.end(2)}')
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + m.start(1)}')
+                editor.tag_add('syn_underline', f'{lineno}.{col_off + m.start(1)}', f'{lineno}.{col_off + m.end(1)}')
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.end(1)}', f'{lineno}.{col_off + m.end()}')
+
+            for m in _STYLE_SPAN_RE.finditer(scan_line):
+                if _overlaps(m.start(), m.end(), code_spans):
+                    continue
+                props = _parse_inline_span_style(m.group('style'))
+                if not props:
+                    continue
+                s_i, e_i = m.start('body'), m.end('body')
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + m.start()}', f'{lineno}.{col_off + s_i}')
+                editor.tag_add('syn_fmt_elide', f'{lineno}.{col_off + e_i}', f'{lineno}.{col_off + m.end()}')
+                if s_i >= e_i:
+                    continue
+                if set(props.keys()) == {'color'}:
+                    norm_hex = props['color']
+                    ctag = f'syn_color_{norm_hex}'
+                    if ctag not in self._color_tags:
+                        self._color_tags.add(ctag)
+                        editor.tag_configure(ctag, foreground=norm_hex)
+                    editor.tag_raise(ctag)
+                    editor.tag_add(ctag, f'{lineno}.{col_off + s_i}', f'{lineno}.{col_off + e_i}')
+                elif 'font_family' in props or 'font_size' in props:
+                    pts = {s_i, e_i}
+                    for sp_list in (bi_spans, bold_spans, italic_spans):
+                        for ss, se in sp_list:
+                            if s_i < ss < e_i:
+                                pts.add(ss)
+                            if s_i < se < e_i:
+                                pts.add(se)
+                    sorted_pts = sorted(pts)
+                    for seg_s, seg_e in zip(sorted_pts, sorted_pts[1:]):
+                        if seg_s >= seg_e:
+                            continue
+                        in_bi = any(ss <= seg_s and seg_e <= se for ss, se in bi_spans)
+                        is_b = in_bi or bool(h_lvl) or any(ss <= seg_s and seg_e <= se for ss, se in bold_spans)
+                        is_i = in_bi or any(ss <= seg_s and seg_e <= se for ss, se in italic_spans)
+                        eff_fam = props.get('font_family') or (h_font if h_lvl else b_font)
+                        eff_sz = props.get('font_size') or ((sz + h_deltas.get(h_lvl, 0)) if h_lvl else sz)
+                        ws = []
+                        if is_b:
+                            ws.append('bold')
+                        if is_i:
+                            ws.append('italic')
+                        stag = (
+                            f"syn_style_{props.get('color', '')}_{eff_fam}_{eff_sz}"
+                            f"_{int(is_b)}_{int(is_i)}_{int(bool(props.get('underline')))}"
+                            f"_{int(bool(props.get('strike')))}"
+                        )
+                        if stag not in self._style_tags or stag not in self._style_tags_configured:
+                            self._style_tags.add(stag)
+                            self._style_tags_configured.add(stag)
+                            kw = {'font': (eff_fam, _px(eff_sz), *ws)}
+                            if props.get('color'):
+                                kw['foreground'] = props['color']
+                            if props.get('underline'):
+                                kw['underline'] = True
+                            if props.get('strike'):
+                                kw['overstrike'] = True
+                            editor.tag_configure(stag, **kw)
+                        editor.tag_raise(stag)
+                        editor.tag_add(stag, f'{lineno}.{col_off + seg_s}', f'{lineno}.{col_off + seg_e}')
+                else:
+                    stag = (
+                        f"syn_style_{props.get('color', '')}___0_0"
+                        f"_{int(bool(props.get('underline')))}_{int(bool(props.get('strike')))}"
+                    )
+                    if stag not in self._style_tags or stag not in self._style_tags_configured:
+                        self._style_tags.add(stag)
+                        self._style_tags_configured.add(stag)
+                        kw = {}
+                        if props.get('color'):
+                            kw['foreground'] = props['color']
+                        if props.get('underline'):
+                            kw['underline'] = True
+                        if props.get('strike'):
+                            kw['overstrike'] = True
+                        editor.tag_configure(stag, **kw)
+                    editor.tag_raise(stag)
+                    editor.tag_add(stag, f'{lineno}.{col_off + s_i}', f'{lineno}.{col_off + e_i}')
 
             for m in re.finditer(r'\$\$(.+?)\$\$|(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)', scan_line):
                 if _overlaps(m.start(), m.end(), code_spans):
@@ -4837,7 +5106,9 @@ class DocumentTab(ttk.Frame):
     def _prune_empty_inline_markers_in_text(line_text: str, cur_col: int) -> Tuple[str, int]:
         """Remove empty inline marker wrappers from *line_text* and adjust *cur_col*."""
         empty_pats = (
-            re.compile(r'<span\s+style=["\']color\s*:\s*#[0-9a-fA-F]{3,6}\s*;?["\']\s*></span>', re.IGNORECASE),
+            re.compile(r'<span\s+style=(?P<q>["\'])(?:(?!(?P=q))[^\n])+(?P=q)\s*></span>', re.IGNORECASE),
+            re.compile(r'<u></u>', re.IGNORECASE),
+            re.compile(r'~~~~'),
             re.compile(r'<mark></mark>', re.IGNORECASE),
             re.compile(r'===='),
             re.compile(r'(?<!\*)\*\*\*\*\*\*(?!\*)'),
@@ -6468,6 +6739,7 @@ class MarkdownNotepad(tk.Tk):
         self.mode_var = tk.StringVar(value="visual")
         self._last_doc_font_color = "#dc2626"
         self._doc_font_color_popup = None
+        self._pending_doc_sel = None
         self._setup_ui()
         self._init_tts_listeners()
         self._setup_bindings()
@@ -6831,6 +7103,8 @@ class MarkdownNotepad(tk.Tk):
         menubar.add_cascade(label="Format", menu=format_menu)
         format_menu.add_command(label="Bold", command=lambda: self._insert_format("**", "**"), accelerator="Ctrl+B")
         format_menu.add_command(label="Italic", command=lambda: self._insert_format("*", "*"), accelerator="Ctrl+I")
+        format_menu.add_command(label="Underline", command=self.toggle_document_underline, accelerator="Ctrl+U")
+        format_menu.add_command(label="Strikethrough", command=self.toggle_document_strikethrough, accelerator="Ctrl+Shift+X")
         format_menu.add_command(label="Highlight", command=lambda: self._insert_format("==", "=="), accelerator="Ctrl+Shift+H")
         format_menu.add_command(label="Inline Code", command=lambda: self._insert_format("`", "`"), accelerator="Ctrl+`")
 
@@ -6845,6 +7119,27 @@ class MarkdownNotepad(tk.Tk):
         font_color_menu.add_separator()
         font_color_menu.add_command(label="More Colors...", command=self._choose_document_font_color)
         format_menu.add_cascade(label="Font Color", menu=font_color_menu)
+
+        font_family_menu = tk.Menu(format_menu, tearoff=0)
+        font_family_menu.add_command(label="Default", command=lambda: self.set_document_font_family(None))
+        font_family_menu.add_separator()
+        for _ffam in ('Segoe UI', 'Arial', 'Calibri', 'Georgia', 'Times New Roman', 'Verdana', 'Trebuchet MS', 'Consolas', 'Courier New'):
+            font_family_menu.add_command(
+                label=_ffam,
+                command=lambda f=_ffam: self.set_document_font_family(f),
+            )
+        format_menu.add_cascade(label="Font Family", menu=font_family_menu)
+
+        font_size_menu = tk.Menu(format_menu, tearoff=0)
+        font_size_menu.add_command(label="Auto (Default)", command=lambda: self.set_document_font_size(None))
+        font_size_menu.add_separator()
+        for _fsz in (8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36):
+            font_size_menu.add_command(
+                label=f"{_fsz} pt",
+                command=lambda s=_fsz: self.set_document_font_size(s),
+            )
+        format_menu.add_cascade(label="Font Size", menu=font_size_menu)
+        format_menu.add_command(label="Clear Font Style", command=self.clear_document_selection_formatting)
 
         format_menu.add_separator()
 
@@ -7027,6 +7322,8 @@ class MarkdownNotepad(tk.Tk):
         # Typography
         add_format_button("\U0001d401", lambda: self._insert_format("**", "**"), "Format selected text as bold (**text**) (Ctrl+B).", width=3)
         add_format_button("\U0001d43c", lambda: self._insert_format("*", "*"), "Format selected text as italic (*text*) (Ctrl+I).", width=3)
+        add_format_button("U", self.toggle_document_underline, "Toggle underline on selected text (Ctrl+U).", width=3)
+        add_format_button("S", self.toggle_document_strikethrough, "Toggle strikethrough on selected text (~~text~~) (Ctrl+Shift+X).", width=3)
         add_format_button("\U0001f58d HL", lambda: self._insert_format("==", "=="), "Format selected text with a highlight marker (==text==) (Ctrl+Shift+H).")
         add_format_button("</>", lambda: self._insert_format("`", "`"), "Format selected text as inline code (`code`) (Ctrl+`).")
 
@@ -7040,7 +7337,7 @@ class MarkdownNotepad(tk.Tk):
             a_wrap, text="A", font=(SANS_FONT, 9, "bold"),
             bg=ribbon_bg, fg="#1e1b4b", activebackground="#ede9fe",
             relief=tk.FLAT, bd=0, padx=5, pady=0, cursor="hand2", takefocus=0,
-            command=lambda: self.set_document_font_color(self._last_doc_font_color),
+            command=lambda: self.set_document_font_color(self._last_doc_font_color, sel_range=self._pending_doc_sel),
         )
         self._doc_font_apply_btn.pack(side=tk.TOP, fill=tk.X)
         self._doc_font_swatch = tk.Frame(a_wrap, bg=self._last_doc_font_color, height=3)
@@ -7052,9 +7349,58 @@ class MarkdownNotepad(tk.Tk):
             command=self._open_ribbon_font_color_popup,
         )
         self._doc_font_drop_btn.pack(side=tk.LEFT, fill=tk.Y)
+        self._doc_font_apply_btn.bind(
+            "<ButtonPress-1>", lambda e: setattr(self, '_pending_doc_sel', self._capture_doc_selection()), add="+"
+        )
+        self._doc_font_drop_btn.bind(
+            "<ButtonPress-1>", lambda e: setattr(self, '_pending_doc_sel', self._capture_doc_selection()), add="+"
+        )
         ToolTip(self._doc_font_apply_btn, "Apply the active font color to selected text.")
         ToolTip(self._doc_font_drop_btn, "Choose a font color for selected text.")
         self._format_buttons.extend([self._doc_font_apply_btn, self._doc_font_drop_btn])
+
+        self._doc_font_family_var = tk.StringVar(value='Default')
+        self._doc_font_family_combo = ttk.Combobox(
+            btm,
+            textvariable=self._doc_font_family_var,
+            values=('Default', 'Segoe UI', 'Arial', 'Calibri', 'Georgia', 'Times New Roman', 'Verdana', 'Trebuchet MS', 'Consolas', 'Courier New'),
+            state='readonly',
+            width=12,
+        )
+        self._doc_font_family_combo.pack(side=tk.LEFT, padx=(2, 1))
+        ToolTip(self._doc_font_family_combo, "Set font family for selected text.")
+
+        self._doc_font_size_var = tk.StringVar(value='Auto')
+        self._doc_font_size_combo = ttk.Combobox(
+            btm,
+            textvariable=self._doc_font_size_var,
+            values=('Auto', '8', '9', '10', '11', '12', '14', '16', '18', '20', '24', '28', '36'),
+            width=5,
+        )
+        self._doc_font_size_combo.pack(side=tk.LEFT, padx=(1, 2))
+        ToolTip(self._doc_font_size_combo, "Set font size (pt) for selected text.")
+
+        def _capture_pending_sel(event=None):
+            self._pending_doc_sel = self._capture_doc_selection()
+
+        def _on_font_family_selected(event=None):
+            fam = self._doc_font_family_var.get()
+            sel = self._pending_doc_sel or self._capture_doc_selection()
+            self.set_document_font_family(None if fam == 'Default' else fam, sel_range=sel)
+            self._focus_active_editor()
+
+        def _on_font_size_selected(event=None):
+            sz = self._doc_font_size_var.get()
+            sel = self._pending_doc_sel or self._capture_doc_selection()
+            self.set_document_font_size(None if sz == 'Auto' else sz, sel_range=sel)
+            self._focus_active_editor()
+
+        self._doc_font_family_combo.bind("<ButtonPress-1>", _capture_pending_sel, add="+")
+        self._doc_font_family_combo.bind("<<ComboboxSelected>>", _on_font_family_selected)
+        self._doc_font_size_combo.bind("<ButtonPress-1>", _capture_pending_sel, add="+")
+        self._doc_font_size_combo.bind("<<ComboboxSelected>>", _on_font_size_selected)
+        self._doc_font_size_combo.bind("<Return>", _on_font_size_selected)
+        self._format_buttons.extend([self._doc_font_family_combo, self._doc_font_size_combo])
 
         # Line Spacing (1 / 1.5 / 2) and Selected-Text Alignment (Left / Center / Right / None)
         ls_init = _normalize_line_spacing(self.theme.get('line_spacing', 1.0))
@@ -7252,6 +7598,11 @@ class MarkdownNotepad(tk.Tk):
         self.bind("<Control-B>", self._doc_shortcut(lambda: self._insert_format("**", "**")))
         self.bind("<Control-i>", self._doc_shortcut(lambda: self._insert_format("*", "*")))
         self.bind("<Control-Key-i>", self._doc_shortcut(lambda: self._insert_format("*", "*")))
+        self.bind("<Control-u>", self._doc_shortcut(self.toggle_document_underline))
+        self.bind("<Control-U>", self._doc_shortcut(self.toggle_document_underline))
+        self.bind("<Control-X>", self._doc_shortcut(self.toggle_document_strikethrough))
+        self.bind("<Control-Shift-X>", self._doc_shortcut(self.toggle_document_strikethrough))
+        self.bind("<Control-Shift-Key-X>", self._doc_shortcut(self.toggle_document_strikethrough))
         self.bind("<Control-grave>", self._doc_shortcut(lambda: self._insert_format("`", "`")))
         self.bind("<Control-H>", self._doc_shortcut(lambda: self._insert_format("==", "==")))
         self.bind("<Control-Shift-H>", self._doc_shortcut(lambda: self._insert_format("==", "==")))
@@ -7779,22 +8130,46 @@ class MarkdownNotepad(tk.Tk):
         
         # Formatting actions
         if has_selection and self.current_tab:
+            ctx_sel = self._capture_doc_selection()
             menu.add_separator()
             menu.add_command(label="Bold", command=lambda: self._insert_format("**", "**"), accelerator="Ctrl+B")
             menu.add_command(label="Italic", command=lambda: self._insert_format("*", "*"), accelerator="Ctrl+I")
+            menu.add_command(label="Underline", command=lambda sr=ctx_sel: self.toggle_document_underline(sel_range=sr), accelerator="Ctrl+U")
+            menu.add_command(label="Strikethrough", command=lambda sr=ctx_sel: self.toggle_document_strikethrough(sel_range=sr), accelerator="Ctrl+Shift+X")
             menu.add_command(label="Highlight", command=lambda: self._insert_format("==", "=="), accelerator="Ctrl+Shift+H")
             if getattr(self.current_tab, 'tab_type', 'document') == 'document':
                 color_ctx = tk.Menu(menu, tearoff=0)
-                color_ctx.add_command(label="Automatic (Default)", command=lambda: self.set_document_font_color(None))
+                color_ctx.add_command(label="Automatic (Default)", command=lambda sr=ctx_sel: self.set_document_font_color(None, sel_range=sr))
                 color_ctx.add_separator()
                 for _cname, _chex in _DOC_FONT_PALETTE:
                     color_ctx.add_command(
                         label=f"{_cname} ({_chex})",
-                        command=lambda hc=_chex: self.set_document_font_color(hc),
+                        command=lambda hc=_chex, sr=ctx_sel: self.set_document_font_color(hc, sel_range=sr),
                     )
                 color_ctx.add_separator()
                 color_ctx.add_command(label="More Colors...", command=self._choose_document_font_color)
                 menu.add_cascade(label="Font Color", menu=color_ctx)
+
+                fam_ctx = tk.Menu(menu, tearoff=0)
+                fam_ctx.add_command(label="Default", command=lambda sr=ctx_sel: self.set_document_font_family(None, sel_range=sr))
+                fam_ctx.add_separator()
+                for _ffam in ('Segoe UI', 'Arial', 'Calibri', 'Georgia', 'Times New Roman', 'Verdana', 'Trebuchet MS', 'Consolas', 'Courier New'):
+                    fam_ctx.add_command(
+                        label=_ffam,
+                        command=lambda f=_ffam, sr=ctx_sel: self.set_document_font_family(f, sel_range=sr),
+                    )
+                menu.add_cascade(label="Font Family", menu=fam_ctx)
+
+                sz_ctx = tk.Menu(menu, tearoff=0)
+                sz_ctx.add_command(label="Auto (Default)", command=lambda sr=ctx_sel: self.set_document_font_size(None, sel_range=sr))
+                sz_ctx.add_separator()
+                for _fsz in (8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36):
+                    sz_ctx.add_command(
+                        label=f"{_fsz} pt",
+                        command=lambda s=_fsz, sr=ctx_sel: self.set_document_font_size(s, sel_range=sr),
+                    )
+                menu.add_cascade(label="Font Size", menu=sz_ctx)
+                menu.add_command(label="Clear Font Style", command=lambda sr=ctx_sel: self.clear_document_selection_formatting(sel_range=sr))
 
         if self.current_tab and getattr(self.current_tab, 'tab_type', 'document') == 'document':
             align_ctx = tk.Menu(menu, tearoff=0)
@@ -8379,6 +8754,11 @@ class MarkdownNotepad(tk.Tk):
             ("<Control-M>", "[@", "]"),
         ):
             tab.source_editor.bind(seq, lambda e, p=pfx, s=sfx: self._insert_format(p, s))
+        tab.source_editor.bind("<Control-u>", lambda e: self.toggle_document_underline())
+        tab.source_editor.bind("<Control-U>", lambda e: self.toggle_document_underline())
+        tab.source_editor.bind("<Control-X>", lambda e: self.toggle_document_strikethrough())
+        tab.source_editor.bind("<Control-Shift-X>", lambda e: self.toggle_document_strikethrough())
+        tab.source_editor.bind("<Control-Shift-Key-X>", lambda e: self.toggle_document_strikethrough())
     
     def close_tab(self, tab=None):
         """Close a tab"""
@@ -9729,8 +10109,78 @@ class MarkdownNotepad(tk.Tk):
             return "break"
 
         except tk.TclError:
-            # No selection, insert the formatting markers and place cursor in between
+            # No selection: handle cursor-only format toggle or insert marker pair
             insert_pos = editor.index(tk.INSERT)
+            if prefix == suffix and prefix in ("**", "*", "==", "`", "~~"):
+                line_no, col = map(int, insert_pos.split('.'))
+                line_text = editor.get(f"{line_no}.0", f"{line_no}.end")
+                left_ctx = line_text[:col]
+                right_ctx = line_text[col:]
+
+                # 1. Empty-pair removal
+                l_stars = len(left_ctx) - len(left_ctx.rstrip('*'))
+                r_stars = len(right_ctx) - len(right_ctx.lstrip('*'))
+                del_start = del_end = None
+                if prefix == "**" and l_stars in (2, 3) and r_stars in (2, 3):
+                    del_start = f"{line_no}.{col - 2}"
+                    del_end = f"{line_no}.{col + 2}"
+                elif prefix == "*" and l_stars in (1, 3) and r_stars in (1, 3):
+                    del_start = f"{line_no}.{col - 1}"
+                    del_end = f"{line_no}.{col + 1}"
+                elif prefix in ("==", "`", "~~") and left_ctx.endswith(prefix) and right_ctx.startswith(suffix):
+                    del_start = f"{line_no}.{col - p_len}"
+                    del_end = f"{line_no}.{col + s_len}"
+
+                if del_start is not None:
+                    _atomic_text_replace(editor, del_start, del_end, "")
+                    editor.mark_set(tk.INSERT, del_start)
+                    editor.see(del_start)
+                    tab.is_modified = True
+                    self._update_tab_title(tab)
+                    tab._apply_syntax_highlighting()
+                    self._refresh_active_visual_view()
+                    return "break"
+
+                # 2. Close-and-step-out toggle-off
+                if prefix in ("*", "**"):
+                    clean_left = re.sub(r'`[^`\n]*`', '', left_ctx)
+                    bold_open = False
+                    italic_open = False
+                    idx = 0
+                    n_cl = len(clean_left)
+                    while idx < n_cl:
+                        if clean_left[idx] == '*':
+                            run_end = idx
+                            while run_end < n_cl and clean_left[run_end] == '*':
+                                run_end += 1
+                            run_len = run_end - idx
+                            if run_len >= 3:
+                                bold_open = not bold_open
+                                italic_open = not italic_open
+                            elif run_len == 2:
+                                bold_open = not bold_open
+                            elif run_len == 1:
+                                italic_open = not italic_open
+                            idx = run_end
+                        else:
+                            idx += 1
+                    if (prefix == "**" and bold_open and r_stars >= 2) or (prefix == "*" and italic_open and r_stars in (1, 3)):
+                        step_col = col + (2 if prefix == "**" else 1)
+                        new_pos = f"{line_no}.{step_col}"
+                        editor.mark_set(tk.INSERT, new_pos)
+                        editor.see(new_pos)
+                        tab._update_active_line_elision()
+                        return "break"
+                else:
+                    scan_left = left_ctx if prefix == "`" else re.sub(r'`[^`\n]*`', '', left_ctx)
+                    occ_count = scan_left.count(prefix)
+                    if right_ctx.startswith(suffix) and (occ_count % 2 == 1):
+                        new_pos = f"{line_no}.{col + s_len}"
+                        editor.mark_set(tk.INSERT, new_pos)
+                        editor.see(new_pos)
+                        tab._update_active_line_elision()
+                        return "break"
+
             editor.insert(insert_pos, f"{prefix}{suffix}")
             new_pos = f"{insert_pos}+{p_len}c"
             editor.mark_set(tk.INSERT, new_pos)
@@ -9741,6 +10191,23 @@ class MarkdownNotepad(tk.Tk):
             self._refresh_active_visual_view()
             return "break"
 
+    def _capture_doc_selection(self) -> Optional[Tuple[str, str]]:
+        """Capture current non-empty selection range in the active document tab."""
+        tab = getattr(self, 'current_tab', None)
+        if not tab or getattr(tab, 'tab_type', 'document') != 'document':
+            return None
+        editor = getattr(tab, 'source_editor', None)
+        if not editor:
+            return None
+        try:
+            first = editor.index(tk.SEL_FIRST)
+            last = editor.index(tk.SEL_LAST)
+            if editor.compare(first, "<", last):
+                return (first, last)
+        except tk.TclError:
+            pass
+        return None
+
     def _open_ribbon_font_color_popup(self):
         """Open the Font Color palette anchored to the ribbon Deck 2 color group."""
         anchor = getattr(self, '_doc_font_color_group', None) or self
@@ -9749,9 +10216,11 @@ class MarkdownNotepad(tk.Tk):
             self._doc_font_color_popup = None
             return
 
+        sel_range = self._capture_doc_selection() or getattr(self, '_pending_doc_sel', None)
+
         def _on_pick(hex_c):
             self._doc_font_color_popup = None
-            self.set_document_font_color(hex_c)
+            self.set_document_font_color(hex_c, sel_range=sel_range)
             self._focus_active_editor()
 
         def _on_close():
@@ -9766,15 +10235,18 @@ class MarkdownNotepad(tk.Tk):
             initial_color=self._last_doc_font_color,
         )
 
-    def _choose_document_font_color(self):
+    def _choose_document_font_color(self, sel_range: Optional[Tuple[str, str]] = None):
         """Open OS color chooser and apply chosen color to selected document text."""
+        snap = sel_range or self._capture_doc_selection() or getattr(self, '_pending_doc_sel', None)
         res = colorchooser.askcolor(color=self._last_doc_font_color, title="Choose Font Color", parent=self)
         if res and res[1]:
-            self.set_document_font_color(res[1])
+            self.set_document_font_color(res[1], sel_range=snap)
 
     @staticmethod
-    def _apply_color_to_single_line(line_text: str, s_col: int, e_col: int, norm: Optional[str]) -> Tuple[str, int, int]:
-        """Apply or strip <span style="color:..."> on [s_col, e_col] of *line_text*, keeping block prefixes outside."""
+    def _apply_style_to_single_line(
+        line_text: str, s_col: int, e_col: int, props_update: Dict[str, Any]
+    ) -> Tuple[str, int, int]:
+        """Apply or update <span style="..."> on [s_col, e_col] of *line_text*, keeping block prefixes outside."""
         m_al = _ALIGN_SINGLE_RE.match(line_text)
         c_min = m_al.start(3) if m_al else 0
         c_max = m_al.end(3) if m_al else len(line_text)
@@ -9787,21 +10259,40 @@ class MarkdownNotepad(tk.Tk):
         if s_c >= e_c:
             return line_text, s_c, e_c
 
-        # Case 1: Wholly inside an existing <span style="color:#old">...</span>
-        for m in _COLOR_SPAN_RE.finditer(line_text):
+        strip_u = props_update.get('underline') is False
+        u_tag_re = re.compile(r'</?u>', re.IGNORECASE)
+
+        def _clean_inner(txt: str) -> str:
+            out = _COLOR_CLOSE_RE.sub('', _STYLE_ANY_OPEN_RE.sub('', txt))
+            if strip_u:
+                out = u_tag_re.sub('', out)
+            return out
+
+        # Case 1: Wholly inside an existing <span style="...">...</span>
+        for m in _STYLE_SPAN_RE.finditer(line_text):
             span_s, span_e = m.start(), m.end()
-            inner_s, inner_e = m.start(2), m.end(2)
-            old_col = _normalize_hex_color(m.group(1))
-            if inner_s <= s_c and e_c <= inner_e and old_col:
-                before_txt = line_text[inner_s:s_c]
-                mid_txt = _COLOR_CLOSE_RE.sub('', _COLOR_ANY_OPEN_RE.sub('', line_text[s_c:e_c]))
-                after_txt = line_text[e_c:inner_e]
+            inner_s, inner_e = m.start('body'), m.end('body')
+            old_props = _parse_inline_span_style(m.group('style'))
+            if span_s <= s_c and e_c <= span_e and max(s_c, inner_s) < min(e_c, inner_e) and old_props:
+                eff_s = max(s_c, inner_s)
+                eff_e = min(e_c, inner_e)
+                before_txt = line_text[inner_s:eff_s]
+                mid_txt = _clean_inner(line_text[eff_s:eff_e])
+                after_txt = line_text[eff_e:inner_e]
+                old_css = _format_inline_span_style(old_props)
+                merged = dict(old_props)
+                for k, v in props_update.items():
+                    if v is None or v is False:
+                        merged.pop(k, None)
+                    else:
+                        merged[k] = v
+                new_css = _format_inline_span_style(merged)
                 parts = []
                 if before_txt:
-                    parts.append(f'<span style="color:{old_col}">{before_txt}</span>')
+                    parts.append(f'<span style="{old_css}">{before_txt}</span>' if old_css else before_txt)
                 mid_offset = sum(len(p) for p in parts)
-                if norm and mid_txt:
-                    open_tag = f'<span style="color:{norm}">'
+                if new_css and mid_txt:
+                    open_tag = f'<span style="{new_css}">'
                     parts.append(f'{open_tag}{mid_txt}</span>')
                     sel_s = span_s + mid_offset + len(open_tag)
                     sel_e = sel_s + len(mid_txt)
@@ -9810,43 +10301,44 @@ class MarkdownNotepad(tk.Tk):
                     sel_s = span_s + mid_offset
                     sel_e = sel_s + len(mid_txt)
                 if after_txt:
-                    parts.append(f'<span style="color:{old_col}">{after_txt}</span>')
+                    parts.append(f'<span style="{old_css}">{after_txt}</span>' if old_css else after_txt)
                 new_line = line_text[:span_s] + "".join(parts) + line_text[span_e:]
                 return new_line, sel_s, sel_e
 
-        # Case 2: General selection (handle any partial overlap at boundaries cleanly)
+        # Case 2: General / partial-overlap selection
         prefix = line_text[:s_c]
         sel_raw = line_text[s_c:e_c]
         suffix = line_text[e_c:]
 
         # Fix left partial overlap if s_c falls inside an existing span
-        for m in _COLOR_SPAN_RE.finditer(line_text):
+        for m in _STYLE_SPAN_RE.finditer(line_text):
             span_s, span_e = m.start(), m.end()
-            inner_s, inner_e = m.start(2), m.end(2)
+            inner_s, inner_e = m.start('body'), m.end('body')
             if span_s < s_c < inner_e and e_c > inner_e:
                 if s_c <= inner_s:
-                    # Started inside opening tag itself
                     prefix = line_text[:span_s]
                 else:
                     prefix = prefix + '</span>'
                 break
 
         # Fix right partial overlap if e_c falls inside an existing span
-        for m in _COLOR_SPAN_RE.finditer(line_text):
+        for m in _STYLE_SPAN_RE.finditer(line_text):
             span_s, span_e = m.start(), m.end()
-            inner_s, inner_e = m.start(2), m.end(2)
-            old_col = _normalize_hex_color(m.group(1))
+            inner_s, inner_e = m.start('body'), m.end('body')
+            old_props = _parse_inline_span_style(m.group('style'))
+            old_css = _format_inline_span_style(old_props)
             if span_s < e_c < span_e and s_c < span_s:
                 if e_c >= inner_e:
-                    # Ended inside closing </span>
                     suffix = line_text[span_e:]
-                elif old_col:
-                    suffix = f'<span style="color:{old_col}">' + suffix
+                elif old_css:
+                    suffix = f'<span style="{old_css}">' + suffix
                 break
 
-        sel_clean = _COLOR_CLOSE_RE.sub('', _COLOR_ANY_OPEN_RE.sub('', sel_raw))
-        if norm and sel_clean:
-            open_tag = f'<span style="color:{norm}">'
+        sel_clean = _clean_inner(sel_raw)
+        new_props = {k: v for k, v in props_update.items() if v is not None and v is not False}
+        new_css = _format_inline_span_style(new_props)
+        if new_css and sel_clean:
+            open_tag = f'<span style="{new_css}">'
             wrapped = f'{open_tag}{sel_clean}</span>'
             sel_s = len(prefix) + len(open_tag)
             sel_e = sel_s + len(sel_clean)
@@ -9857,32 +10349,54 @@ class MarkdownNotepad(tk.Tk):
 
         return prefix + wrapped + suffix, sel_s, sel_e
 
-    def set_document_font_color(self, color: Optional[str]):
-        """Apply or reset font color on selected text in the active document or spreadsheet tab."""
-        if not self.current_tab:
-            return "break"
-        if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
-            self.current_tab.set_cell_fg_color(color)
-            return "break"
+    @staticmethod
+    def _apply_color_to_single_line(line_text: str, s_col: int, e_col: int, norm: Optional[str]) -> Tuple[str, int, int]:
+        """Apply or strip <span style="color:..."> on [s_col, e_col] of *line_text*, keeping block prefixes outside."""
+        return MarkdownNotepad._apply_style_to_single_line(line_text, s_col, e_col, {'color': norm})
 
-        norm = _normalize_hex_color(color) if color is not None else None
-        if color is not None and norm is None:
-            return "break"
-
-        if norm is not None:
-            self._last_doc_font_color = norm
-            if hasattr(self, '_doc_font_swatch') and self._doc_font_swatch.winfo_exists():
-                self._doc_font_swatch.config(bg=norm)
-
-        tab = self.current_tab
+    def _resolve_doc_selection(
+        self, sel_range: Optional[Tuple[str, str]] = None
+    ) -> Optional[Tuple[str, str]]:
+        """Resolve live selection in active document editor, falling back to *sel_range*."""
+        tab = getattr(self, 'current_tab', None)
+        if not tab or getattr(tab, 'tab_type', 'document') != 'document':
+            return None
         editor = tab.source_editor
         try:
             first = editor.index(tk.SEL_FIRST)
             last = editor.index(tk.SEL_LAST)
+            if editor.compare(first, "<", last):
+                return (first, last)
         except tk.TclError:
-            self._set_status("Select text to apply font color")
+            pass
+        if sel_range and len(sel_range) == 2:
+            try:
+                f_idx = editor.index(sel_range[0])
+                l_idx = editor.index(sel_range[1])
+                if editor.compare(f_idx, "<", l_idx):
+                    return (f_idx, l_idx)
+            except tk.TclError:
+                pass
+        return None
+
+    def set_document_text_style(
+        self,
+        props_update: Dict[str, Any],
+        sel_range: Optional[Tuple[str, str]] = None,
+        status_msg: Optional[str] = None,
+    ):
+        """Apply inline <span style="..."> updates to the selected text in the active document tab."""
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') != 'document':
             return "break"
 
+        resolved = self._resolve_doc_selection(sel_range)
+        if not resolved:
+            self._set_status("Select text to format")
+            return "break"
+
+        first, last = resolved
+        tab = self.current_tab
+        editor = tab.source_editor
         s_line, s_col = map(int, first.split('.'))
         e_line, e_col = map(int, last.split('.'))
         if s_line == e_line and s_col == e_col:
@@ -9890,7 +10404,7 @@ class MarkdownNotepad(tk.Tk):
 
         if s_line == e_line:
             line_text = editor.get(f"{s_line}.0", f"{s_line}.end")
-            new_line, sel_s, sel_e = self._apply_color_to_single_line(line_text, s_col, e_col, norm)
+            new_line, sel_s, sel_e = self._apply_style_to_single_line(line_text, s_col, e_col, props_update)
             _atomic_text_replace(editor, f"{s_line}.0", f"{s_line}.end", new_line)
             new_first = f"{s_line}.{sel_s}"
             new_last = f"{s_line}.{sel_e}"
@@ -9911,7 +10425,7 @@ class MarkdownNotepad(tk.Tk):
                     continue
                 ls = s_col if ln == s_line else 0
                 le = len(raw) if (ln < eff_e_line or last_full) else e_col
-                nl, ns, ne = self._apply_color_to_single_line(raw, ls, le, norm)
+                nl, ns, ne = self._apply_style_to_single_line(raw, ls, le, props_update)
                 new_lines.append(nl)
                 if ln == s_line:
                     first_sel_s = ns
@@ -9926,12 +10440,166 @@ class MarkdownNotepad(tk.Tk):
         editor.tag_add(tk.SEL, new_first, new_last)
         editor.mark_set(tk.INSERT, new_last)
         editor.see(new_last)
+        self._pending_doc_sel = None
         tab.is_modified = True
         self._update_tab_title(tab)
         tab._apply_syntax_highlighting()
         self._refresh_active_visual_view()
-        self._set_status(f"Font color set to {norm}" if norm else "Font color reset to default")
+        if status_msg:
+            self._set_status(status_msg)
         return "break"
+
+    def set_document_font_color(self, color: Optional[str], sel_range: Optional[Tuple[str, str]] = None):
+        """Apply or reset font color on selected text in the active document or spreadsheet tab."""
+        if not self.current_tab:
+            return "break"
+        if getattr(self.current_tab, 'tab_type', 'document') == 'spreadsheet':
+            self.current_tab.set_cell_fg_color(color)
+            return "break"
+
+        norm = _normalize_hex_color(color) if color is not None else None
+        if color is not None and norm is None:
+            return "break"
+
+        if norm is not None:
+            self._last_doc_font_color = norm
+            if hasattr(self, '_doc_font_swatch') and self._doc_font_swatch.winfo_exists():
+                self._doc_font_swatch.config(bg=norm)
+
+        msg = f"Font color set to {norm}" if norm else "Font color reset to default"
+        return self.set_document_text_style({'color': norm}, sel_range=sel_range, status_msg=msg)
+
+    def _get_selection_span_props(self, sel_range: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
+        """Inspect the active line's <span style="..."> covering the selection start/center."""
+        resolved = self._resolve_doc_selection(sel_range)
+        if not resolved:
+            return {}
+        editor = self.current_tab.source_editor
+        first, last = resolved
+        s_line, s_col = map(int, first.split('.'))
+        e_line, e_col = map(int, last.split('.'))
+        line_text = editor.get(f"{s_line}.0", f"{s_line}.end")
+        probe = (s_col + e_col) // 2 if s_line == e_line else s_col
+        for m in _STYLE_SPAN_RE.finditer(line_text):
+            if m.start() <= probe <= m.end():
+                return _parse_inline_span_style(m.group('style'))
+        return {}
+
+    def set_document_font_family(self, family: Optional[str], sel_range: Optional[Tuple[str, str]] = None):
+        """Apply or clear font family on selected text in the active document tab."""
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') != 'document':
+            return "break"
+        if family is None or str(family).strip() in ("", "Default"):
+            return self.set_document_text_style(
+                {'font_family': None}, sel_range=sel_range, status_msg="Font family reset to default"
+            )
+        fam = str(family).strip().strip('\'"').strip()
+        if not _SAFE_FONT_FAMILY_RE.match(fam):
+            return "break"
+        return self.set_document_text_style(
+            {'font_family': fam}, sel_range=sel_range, status_msg=f"Font family set to {fam}"
+        )
+
+    def set_document_font_size(self, size: Optional[Any], sel_range: Optional[Tuple[str, str]] = None):
+        """Apply or clear font size (6..72 pt) on selected text in the active document tab."""
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') != 'document':
+            return "break"
+        if size is None or str(size).strip() in ("", "Auto", "Default"):
+            return self.set_document_text_style(
+                {'font_size': None}, sel_range=sel_range, status_msg="Font size reset to auto"
+            )
+        raw_s = str(size).strip().lower()
+        if raw_s.endswith('pt'):
+            raw_s = raw_s[:-2].strip()
+        try:
+            sz = max(6, min(72, int(raw_s)))
+        except (ValueError, TypeError):
+            return "break"
+        return self.set_document_text_style(
+            {'font_size': sz}, sel_range=sel_range, status_msg=f"Font size set to {sz}pt"
+        )
+
+    def step_document_font_size(self, delta: int, sel_range: Optional[Tuple[str, str]] = None):
+        """Step selection font size by *delta* points (clamped 6..72)."""
+        props = self._get_selection_span_props(sel_range=sel_range)
+        base = props.get('font_size')
+        if base is None:
+            base = self.theme.get('visual_font_size', 11)
+        try:
+            base_int = int(base)
+        except (ValueError, TypeError):
+            base_int = 11
+        return self.set_document_font_size(max(6, min(72, base_int + int(delta))), sel_range=sel_range)
+
+    def toggle_document_underline(self, sel_range: Optional[Tuple[str, str]] = None):
+        """Toggle underline on selected text in the active document tab."""
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') != 'document':
+            return "break"
+        resolved = self._resolve_doc_selection(sel_range)
+        if not resolved:
+            self._set_status("Select text to format")
+            return "break"
+        props = self._get_selection_span_props(sel_range=resolved)
+        if props.get('underline'):
+            return self.set_document_text_style(
+                {'underline': False}, sel_range=resolved, status_msg="Underline removed"
+            )
+        tab = self.current_tab
+        editor = tab.source_editor
+        first, last = resolved
+        selected = editor.get(first, last)
+        if len(selected) >= 7 and selected[:3].lower() == '<u>' and selected[-4:].lower() == '</u>':
+            inner = selected[3:-4]
+            _atomic_text_replace(editor, first, last, inner)
+            new_last = f"{first}+{len(inner)}c"
+            editor.tag_remove(tk.SEL, "1.0", tk.END)
+            editor.tag_add(tk.SEL, first, new_last)
+            editor.mark_set(tk.INSERT, new_last)
+            tab.is_modified = True
+            self._update_tab_title(tab)
+            tab._apply_syntax_highlighting()
+            self._refresh_active_visual_view()
+            self._set_status("Underline removed")
+            return "break"
+        if editor.get(f"{first}-3c", first).lower() == '<u>' and editor.get(last, f"{last}+4c").lower() == '</u>':
+            new_first = editor.index(f"{first}-3c")
+            _atomic_text_replace(editor, new_first, f"{last}+4c", selected)
+            new_last = f"{new_first}+{len(selected)}c"
+            editor.tag_remove(tk.SEL, "1.0", tk.END)
+            editor.tag_add(tk.SEL, new_first, new_last)
+            editor.mark_set(tk.INSERT, new_last)
+            tab.is_modified = True
+            self._update_tab_title(tab)
+            tab._apply_syntax_highlighting()
+            self._refresh_active_visual_view()
+            self._set_status("Underline removed")
+            return "break"
+        return self.set_document_text_style(
+            {'underline': True}, sel_range=resolved, status_msg="Underline applied"
+        )
+
+    def toggle_document_strikethrough(self, sel_range: Optional[Tuple[str, str]] = None):
+        """Toggle strikethrough (~~text~~) on selected text or at cursor in the active document tab."""
+        if not self.current_tab or getattr(self.current_tab, 'tab_type', 'document') != 'document':
+            return "break"
+        editor = self.current_tab.source_editor
+        if not editor.tag_ranges(tk.SEL) and sel_range and len(sel_range) == 2:
+            try:
+                f_idx = editor.index(sel_range[0])
+                l_idx = editor.index(sel_range[1])
+                if editor.compare(f_idx, "<", l_idx):
+                    editor.tag_add(tk.SEL, f_idx, l_idx)
+            except tk.TclError:
+                pass
+        return self._insert_format("~~", "~~")
+
+    def clear_document_selection_formatting(self, sel_range: Optional[Tuple[str, str]] = None):
+        """Strip inline font color, family, size, underline, and strikethrough span styles from selection."""
+        return self.set_document_text_style(
+            {'color': None, 'font_family': None, 'font_size': None, 'underline': False, 'strike': False},
+            sel_range=sel_range,
+            status_msg="Font formatting cleared",
+        )
 
     def set_document_line_spacing(self, spacing: Any):
         """Apply global document line spacing (1.0, 1.5, or 2.0) to all DocumentTabs and save theme."""
@@ -10541,6 +11209,7 @@ class MarkdownNotepad(tk.Tk):
         if hasattr(self, '_doc_font_color_group'):
             try:
                 self._doc_font_color_group.config(bg=ribbon_bg)
+                self._doc_font_apply_btn.master.config(bg=ribbon_bg)
                 self._doc_font_apply_btn.config(bg=ribbon_bg)
                 self._doc_font_drop_btn.config(bg=ribbon_bg)
             except Exception:
