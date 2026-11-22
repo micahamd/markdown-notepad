@@ -549,6 +549,7 @@ def clean_markdown_for_speech(text: str, skip_code_blocks: bool = True) -> str:
     s = re.sub(r"<span\s+style=[^>]*>", "", s, flags=re.IGNORECASE)
     s = re.sub(r"</span>", "", s, flags=re.IGNORECASE)
     s = re.sub(r"</?mark>", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"</?u>", "", s, flags=re.IGNORECASE)
 
     # 7. Strip inline code ticks & emphasis markers cleanly
     s = re.sub(r"`([^`\n]+)`", r"\1", s)

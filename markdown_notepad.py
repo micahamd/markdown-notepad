@@ -1822,6 +1822,11 @@ def _split_md_table_row(row_str: str) -> List[str]:
     return cells
 
 
+def _is_md_table_sep_row(cells: List[str]) -> bool:
+    """Return True iff cells form a valid non-empty GFM table separator row."""
+    return bool(cells) and all(bool(re.match(r'^:?-+:?$', c.strip())) for c in cells)
+
+
 def format_markdown_table_lines(lines: List[str]) -> Tuple[List[str], List[str]]:
     """Format, pad, and align Markdown pipe table lines. Returns (formatted_lines, col_alignments)."""
     parsed_rows = []
@@ -1831,7 +1836,7 @@ def format_markdown_table_lines(lines: List[str]) -> Tuple[List[str], List[str]]
         if not s:
             continue
         cells = _split_md_table_row(s)
-        if cells and all(re.match(r'^:?-+:?$', c) for c in cells if c):
+        if not sep_indices and len(parsed_rows) == 1 and _is_md_table_sep_row(cells):
             sep_indices.add(len(parsed_rows))
         parsed_rows.append(cells)
 
@@ -2038,6 +2043,190 @@ def format_existing_pipe_table_on_paste(text: str) -> Optional[str]:
     return None
 
 
+def _bind_scroll_passthrough(widget: tk.Misc, scroll_target: Optional[tk.Misc]):
+    """Forward MouseWheel, Linux Button-4/5, and Ctrl+MouseWheel from embedded child widgets to scroll_target."""
+    if scroll_target is None or not hasattr(scroll_target, 'yview_scroll'):
+        return
+
+    def _on_wheel(event):
+        if scroll_target.winfo_exists():
+            d = getattr(event, 'delta', 0)
+            if d:
+                units = int(-d / 40)
+                if units == 0:
+                    units = -1 if d > 0 else 1
+            elif getattr(event, 'num', None) == 4:
+                units = -3
+            elif getattr(event, 'num', None) == 5:
+                units = 3
+            else:
+                units = 0
+            if units:
+                scroll_target.yview_scroll(units, 'units')
+        return 'break'
+
+    def _on_ctrl_wheel(event):
+        try:
+            top = widget.winfo_toplevel()
+            if hasattr(top, '_on_ctrl_mousewheel'):
+                return top._on_ctrl_mousewheel(event)
+        except Exception:
+            pass
+        return 'break'
+
+    stack = [widget]
+    while stack:
+        w = stack.pop()
+        try:
+            w.bind('<MouseWheel>', _on_wheel, add='+')
+            w.bind('<Button-4>', _on_wheel, add='+')
+            w.bind('<Button-5>', _on_wheel, add='+')
+            w.bind('<Control-MouseWheel>', _on_ctrl_wheel, add='+')
+            stack.extend(w.winfo_children())
+        except Exception:
+            pass
+
+
+TABLE_STYLE_PRESETS = {
+    'Default (Auto Theme)': {
+        'table_header_bg': '',
+        'table_header_fg': '',
+        'table_row_bg': '',
+        'table_row_alt_bg': '',
+        'table_cell_fg': '',
+        'table_border_color': '',
+        'table_striped': True,
+        'table_border_style': 'grid',
+        'table_cell_pad_y': 3,
+        'table_header_bold': True,
+    },
+    'Royal Purple': {
+        'table_header_bg': '#5b21b6',
+        'table_header_fg': '#ffffff',
+        'table_row_bg': '#ffffff',
+        'table_row_alt_bg': '#f5f3ff',
+        'table_cell_fg': '#1e1b4b',
+        'table_border_color': '#c4b5fd',
+        'table_striped': True,
+        'table_border_style': 'grid',
+        'table_cell_pad_y': 3,
+        'table_header_bold': True,
+    },
+    'Classic Blue (Word)': {
+        'table_header_bg': '#2563eb',
+        'table_header_fg': '#ffffff',
+        'table_row_bg': '#ffffff',
+        'table_row_alt_bg': '#eff6ff',
+        'table_cell_fg': '#0f172a',
+        'table_border_color': '#93c5fd',
+        'table_striped': True,
+        'table_border_style': 'grid',
+        'table_cell_pad_y': 3,
+        'table_header_bold': True,
+    },
+    'Academic (Booktabs)': {
+        'table_header_bg': '#f8fafc',
+        'table_header_fg': '#0f172a',
+        'table_row_bg': '#ffffff',
+        'table_row_alt_bg': '#ffffff',
+        'table_cell_fg': '#1e293b',
+        'table_border_color': '#334155',
+        'table_striped': False,
+        'table_border_style': 'horizontal',
+        'table_cell_pad_y': 4,
+        'table_header_bold': True,
+    },
+    'Emerald Slate': {
+        'table_header_bg': '#047857',
+        'table_header_fg': '#ffffff',
+        'table_row_bg': '#ffffff',
+        'table_row_alt_bg': '#ecfdf5',
+        'table_cell_fg': '#064e3b',
+        'table_border_color': '#6ee7b7',
+        'table_striped': True,
+        'table_border_style': 'grid',
+        'table_cell_pad_y': 3,
+        'table_header_bold': True,
+    },
+    'Warm Amber': {
+        'table_header_bg': '#b45309',
+        'table_header_fg': '#ffffff',
+        'table_row_bg': '#fffbeb',
+        'table_row_alt_bg': '#fef3c7',
+        'table_cell_fg': '#451a03',
+        'table_border_color': '#fcd34d',
+        'table_striped': True,
+        'table_border_style': 'grid',
+        'table_cell_pad_y': 3,
+        'table_header_bold': True,
+    },
+    'Minimal Light': {
+        'table_header_bg': '#f1f5f9',
+        'table_header_fg': '#0f172a',
+        'table_row_bg': '#ffffff',
+        'table_row_alt_bg': '#f8fafc',
+        'table_cell_fg': '#334155',
+        'table_border_color': '#e2e8f0',
+        'table_striped': False,
+        'table_border_style': 'minimal',
+        'table_cell_pad_y': 3,
+        'table_header_bold': True,
+    },
+    'Midnight Dark': {
+        'table_header_bg': '#1e1b4b',
+        'table_header_fg': '#e0e7ff',
+        'table_row_bg': '#0f172a',
+        'table_row_alt_bg': '#1e293b',
+        'table_cell_fg': '#e2e8f0',
+        'table_border_color': '#334155',
+        'table_striped': True,
+        'table_border_style': 'grid',
+        'table_cell_pad_y': 3,
+        'table_header_bold': True,
+    },
+}
+
+
+def _resolve_table_style(theme: Optional[dict], is_dark: bool) -> dict:
+    """Resolve effective table styling from theme overrides and active light/dark mode."""
+    t = theme or {}
+    defaults = {
+        'border': '#475569' if is_dark else '#cbd5e1',
+        'header_bg': '#334155' if is_dark else '#f1f5f9',
+        'header_fg': '#f8fafc' if is_dark else '#0f172a',
+        'row_bg': '#1e293b' if is_dark else '#ffffff',
+        'row_alt_bg': '#0f172a' if is_dark else '#f8fafc',
+        'cell_fg': '#e2e8f0' if is_dark else '#1e293b',
+    }
+    key_map = {
+        'border': 'table_border_color',
+        'header_bg': 'table_header_bg',
+        'header_fg': 'table_header_fg',
+        'row_bg': 'table_row_bg',
+        'row_alt_bg': 'table_row_alt_bg',
+        'cell_fg': 'table_cell_fg',
+    }
+    resolved = {}
+    for out_key, theme_key in key_map.items():
+        norm = _normalize_hex_color(t.get(theme_key))
+        resolved[out_key] = norm if norm else defaults[out_key]
+
+    border_style = t.get('table_border_style', 'grid')
+    if border_style not in ('grid', 'horizontal', 'minimal'):
+        border_style = 'grid'
+
+    try:
+        cell_pad_y = max(1, min(10, int(t.get('table_cell_pad_y', 3) or 3)))
+    except (ValueError, TypeError):
+        cell_pad_y = 3
+
+    resolved['striped'] = bool(t.get('table_striped', True))
+    resolved['border_style'] = border_style
+    resolved['cell_pad_y'] = cell_pad_y
+    resolved['header_bold'] = bool(t.get('table_header_bold', True))
+    return resolved
+
+
 class VisualTableWidget(tk.Frame):
     """
     Interactive, styled MS Word-like grid widget embedded into the document canvas.
@@ -2045,7 +2234,8 @@ class VisualTableWidget(tk.Frame):
     context menu for inserting/deleting rows & columns, column alignment, and copying as TSV.
     """
     def __init__(self, parent, on_change_callback, table_lines: List[str], is_dark: bool = False,
-                 visual_font: str = None, visual_font_size: int = 11, content_width: int = 600, **kwargs):
+                 visual_font: str = None, visual_font_size: int = 11, content_width: int = 600,
+                 theme: Optional[dict] = None, **kwargs):
         super().__init__(parent, bd=1, relief=tk.SOLID, **kwargs)
         self.on_change_callback = on_change_callback
         self.raw_table_lines = list(table_lines)
@@ -2053,14 +2243,20 @@ class VisualTableWidget(tk.Frame):
         self.visual_font = visual_font or VISUAL_FONT or SANS_FONT
         self.visual_font_size = visual_font_size
         self.content_width = content_width
+        self.theme = theme
 
         # Styling
-        self.tbl_border = "#475569" if is_dark else "#cbd5e1"
-        self.header_bg = "#334155" if is_dark else "#f1f5f9"
-        self.header_fg = "#f8fafc" if is_dark else "#0f172a"
-        self.row_bg = "#1e293b" if is_dark else "#ffffff"
-        self.row_alt_bg = "#0f172a" if is_dark else "#f8fafc"
-        self.cell_fg = "#e2e8f0" if is_dark else "#1e293b"
+        ts = _resolve_table_style(theme, is_dark)
+        self.tbl_border = ts['border']
+        self.header_bg = ts['header_bg']
+        self.header_fg = ts['header_fg']
+        self.row_bg = ts['row_bg']
+        self.row_alt_bg = ts['row_alt_bg']
+        self.cell_fg = ts['cell_fg']
+        self.table_striped = ts['striped']
+        self.table_border_style = ts['border_style']
+        self.table_cell_pad_y = ts['cell_pad_y']
+        self.table_header_bold = ts['header_bold']
         self.config(bg=self.tbl_border)
 
         self._build_table_ui()
@@ -2073,7 +2269,7 @@ class VisualTableWidget(tk.Frame):
         sep_indices = set()
         for i, row in enumerate(self.raw_table_lines):
             cells = _split_md_table_row(row)
-            if cells and all(re.match(r'^:?-+:?$', c) for c in cells if c):
+            if not sep_indices and len(parsed_rows) == 1 and _is_md_table_sep_row(cells):
                 sep_indices.add(len(parsed_rows))
             parsed_rows.append(cells)
 
@@ -2134,7 +2330,11 @@ class VisualTableWidget(tk.Frame):
         self.table_body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         cell_font = (self.visual_font, max(8, int(self.visual_font_size * 0.95)))
-        head_font = (self.visual_font, max(8, int(self.visual_font_size * 0.95)), "bold")
+        head_font = (
+            (self.visual_font, max(8, int(self.visual_font_size * 0.95)), "bold")
+            if self.table_header_bold
+            else (self.visual_font, max(8, int(self.visual_font_size * 0.95)))
+        )
 
         col_weights = []
         for c in range(num_cols):
@@ -2159,6 +2359,17 @@ class VisualTableWidget(tk.Frame):
         self.cell_entries = []
         self._cell_vars = []
         self._cell_orig_display = {}
+        cell_var_map = {}
+
+        if self.table_border_style == 'horizontal':
+            hdr_padx, hdr_pady = 0, (1, 2)
+            dat_padx, dat_pady = 0, (0, 1)
+        elif self.table_border_style == 'minimal':
+            hdr_padx, hdr_pady = 0, (0, 1)
+            dat_padx, dat_pady = 0, 0
+        else:
+            hdr_padx, hdr_pady = 1, 1
+            dat_padx, dat_pady = 1, 1
 
         # Header row
         header_row_entries = []
@@ -2167,15 +2378,16 @@ class VisualTableWidget(tk.Frame):
             self._cell_orig_display[(0, col_idx)] = disp_val
             h_var = tk.StringVar(value=disp_val)
             self._cell_vars.append((0, col_idx, h_var))
+            cell_var_map[(0, col_idx)] = h_var
             entry = tk.Entry(
                 self.table_body, textvariable=h_var, font=head_font,
-                bg=self.header_bg, fg=self.header_fg, relief=tk.FLAT, bd=0,
+                bg=self.header_bg, fg=self.header_fg, insertbackground=self.header_fg,
+                relief=tk.FLAT, bd=0,
                 justify=justify_map.get(self.col_alignments[col_idx], tk.LEFT),
                 width=max(4, min(28, col_weights[col_idx]))
             )
-            entry.grid(row=0, column=col_idx, sticky="nsew", padx=1, pady=1, ipady=3)
+            entry.grid(row=0, column=col_idx, sticky="nsew", padx=hdr_padx, pady=hdr_pady, ipady=self.table_cell_pad_y)
             entry.bind("<FocusOut>", lambda e, c=col_idx, v=h_var: self._on_cell_commit(0, c, v.get()))
-            entry.bind("<Return>", lambda e, c=col_idx, v=h_var: self._on_cell_commit(0, c, v.get()))
             entry.bind("<Button-3>", lambda e, c=col_idx: self._show_context_menu(e, 0, c))
             header_row_entries.append(entry)
         self.cell_entries.append(header_row_entries)
@@ -2184,22 +2396,23 @@ class VisualTableWidget(tk.Frame):
         for row_idx, row in enumerate(self.data_rows):
             while len(row) < num_cols:
                 row.append('')
-            c_bg = self.row_alt_bg if (row_idx % 2 == 1) else self.row_bg
+            c_bg = self.row_alt_bg if (self.table_striped and row_idx % 2 == 1) else self.row_bg
             row_entries = []
             for col_idx, cell in enumerate(row):
                 disp_val = _clean_for_display(cell)
                 self._cell_orig_display[(row_idx + 1, col_idx)] = disp_val
                 cell_var = tk.StringVar(value=disp_val)
                 self._cell_vars.append((row_idx + 1, col_idx, cell_var))
+                cell_var_map[(row_idx + 1, col_idx)] = cell_var
                 entry = tk.Entry(
                     self.table_body, textvariable=cell_var, font=cell_font,
-                    bg=c_bg, fg=self.cell_fg, relief=tk.FLAT, bd=0,
+                    bg=c_bg, fg=self.cell_fg, insertbackground=self.cell_fg,
+                    relief=tk.FLAT, bd=0,
                     justify=justify_map.get(self.col_alignments[col_idx], tk.LEFT),
                     width=max(4, min(28, col_weights[col_idx]))
                 )
-                entry.grid(row=row_idx + 1, column=col_idx, sticky="nsew", padx=1, pady=1, ipady=3)
+                entry.grid(row=row_idx + 1, column=col_idx, sticky="nsew", padx=dat_padx, pady=dat_pady, ipady=self.table_cell_pad_y)
                 entry.bind("<FocusOut>", lambda e, r=row_idx + 1, c=col_idx, v=cell_var: self._on_cell_commit(r, c, v.get()))
-                entry.bind("<Return>", lambda e, r=row_idx + 1, c=col_idx, v=cell_var: self._on_cell_commit(r, c, v.get()))
                 entry.bind("<Button-3>", lambda e, r=row_idx + 1, c=col_idx: self._show_context_menu(e, r, c))
                 row_entries.append(entry)
             self.cell_entries.append(row_entries)
@@ -2207,30 +2420,92 @@ class VisualTableWidget(tk.Frame):
         total_r = len(self.cell_entries)
         for r in range(total_r):
             for c in range(num_cols):
-                def _make_nav(curr_r, curr_c):
+                def _make_nav(curr_r, curr_c, curr_var):
+                    def _commit_curr():
+                        self._on_cell_commit(curr_r, curr_c, curr_var.get())
+
+                    def _focus_cell(tr, tc, select_all=False):
+                        _commit_curr()
+                        if 0 <= tr < len(self.cell_entries) and 0 <= tc < len(self.cell_entries[tr]):
+                            e = self.cell_entries[tr][tc]
+                            e.focus_set()
+                            e.icursor(tk.END)
+                            if select_all:
+                                e.selection_range(0, tk.END)
+
                     def _nav_tab(e):
                         if curr_c + 1 < num_cols:
-                            self.cell_entries[curr_r][curr_c + 1].focus_set()
+                            _focus_cell(curr_r, curr_c + 1, select_all=True)
                         elif curr_r + 1 < total_r:
-                            self.cell_entries[curr_r + 1][0].focus_set()
+                            _focus_cell(curr_r + 1, 0, select_all=True)
                         else:
-                            self.insert_row(len(self.data_rows))
+                            _commit_curr()
+                            self.insert_row(len(self.data_rows), focus_col=0)
                         return "break"
 
                     def _nav_shift_tab(e):
                         if curr_c > 0:
-                            self.cell_entries[curr_r][curr_c - 1].focus_set()
+                            _focus_cell(curr_r, curr_c - 1, select_all=True)
                         elif curr_r > 0:
-                            self.cell_entries[curr_r - 1][num_cols - 1].focus_set()
+                            _focus_cell(curr_r - 1, num_cols - 1, select_all=True)
                         return "break"
 
-                    self.cell_entries[curr_r][curr_c].bind("<Tab>", _nav_tab)
-                    self.cell_entries[curr_r][curr_c].bind("<Shift-Tab>", _nav_shift_tab)
+                    def _nav_return(e):
+                        if curr_r + 1 < total_r:
+                            _focus_cell(curr_r + 1, curr_c)
+                        else:
+                            _commit_curr()
+                        return "break"
+
+                    def _nav_shift_return(e):
+                        if curr_r > 0:
+                            _focus_cell(curr_r - 1, curr_c)
+                        else:
+                            _commit_curr()
+                        return "break"
+
+                    def _nav_ctrl_left(e):
+                        if curr_c > 0:
+                            _focus_cell(curr_r, curr_c - 1)
+                        return "break"
+
+                    def _nav_ctrl_right(e):
+                        if curr_c + 1 < num_cols:
+                            _focus_cell(curr_r, curr_c + 1)
+                        return "break"
+
+                    def _nav_ctrl_up(e):
+                        if curr_r > 0:
+                            _focus_cell(curr_r - 1, curr_c)
+                        return "break"
+
+                    def _nav_ctrl_down(e):
+                        if curr_r + 1 < total_r:
+                            _focus_cell(curr_r + 1, curr_c)
+                        return "break"
+
+                    ent = self.cell_entries[curr_r][curr_c]
+                    ent.bind("<Tab>", _nav_tab)
+                    ent.bind("<Shift-Tab>", _nav_shift_tab)
                     try:
-                        self.cell_entries[curr_r][curr_c].bind("<ISO_Left_Tab>", _nav_shift_tab)
+                        ent.bind("<ISO_Left_Tab>", _nav_shift_tab)
                     except tk.TclError:
                         pass
-                _make_nav(r, c)
+                    ent.bind("<Return>", _nav_return)
+                    ent.bind("<Shift-Return>", _nav_shift_return)
+                    try:
+                        ent.bind("<KP_Enter>", _nav_return)
+                        ent.bind("<Shift-KP_Enter>", _nav_shift_return)
+                    except tk.TclError:
+                        pass
+                    ent.bind("<Control-Left>", _nav_ctrl_left)
+                    ent.bind("<Control-Right>", _nav_ctrl_right)
+                    ent.bind("<Control-Up>", _nav_ctrl_up)
+                    ent.bind("<Control-Down>", _nav_ctrl_down)
+
+                _make_nav(r, c, cell_var_map[(r, c)])
+
+        _bind_scroll_passthrough(self, self.master)
 
     def _sync(self):
         def _esc_pipe(s: str) -> str:
@@ -2294,15 +2569,17 @@ class VisualTableWidget(tk.Frame):
                 orig_map[(r, c)] = val
                 self._sync()
 
-    def insert_row(self, insert_idx):
+    def insert_row(self, insert_idx, focus_col: int = 0):
         self._flush_all_cells()
+        insert_idx = max(0, min(len(self.data_rows), insert_idx))
         new_row = ['' for _ in self.headers]
-        self.data_rows.insert(max(0, min(len(self.data_rows), insert_idx)), new_row)
+        self.data_rows.insert(insert_idx, new_row)
         self._sync()
         self._build_table_ui()
         target_r = min(len(self.cell_entries) - 1, insert_idx + 1)
-        if target_r < len(self.cell_entries) and self.cell_entries[target_r]:
-            self.cell_entries[target_r][0].focus_set()
+        target_c = max(0, min(focus_col, max(0, len(self.headers) - 1)))
+        if 0 <= target_r < len(self.cell_entries) and target_c < len(self.cell_entries[target_r]):
+            self.cell_entries[target_r][target_c].focus_set()
 
     def delete_row(self, row_idx):
         self._flush_all_cells()
@@ -2469,6 +2746,8 @@ class VisualFigureWidget(tk.Frame):
             )
             cap_lbl.pack(anchor=align_anchor, pady=(3, 0))
             cap_lbl.bind("<Button-3>", self._show_context_menu)
+
+        _bind_scroll_passthrough(self, self.master)
 
     def _set_prop(self, prop, val):
         full_match = self.raw_match
@@ -3203,7 +3482,8 @@ class MarkdownVisualWidget(tk.Frame):
             is_dark=is_dark,
             visual_font=font_family,
             visual_font_size=font_size,
-            content_width=self.content_width_px()
+            content_width=self.content_width_px(),
+            theme=self.current_theme
         )
         self.text_widget.insert(tk.END, '\n')
         self.text_widget.window_create(tk.END, window=tbl_widget, padx=self._s(6), pady=self._s(8))
@@ -3957,7 +4237,7 @@ class DocumentTab(ttk.Frame):
             stripped = line.strip()
             if stripped.startswith('```'):
                 if in_tbl:
-                    if any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl) for tl in cur_tbl):
+                    if any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl.strip()) for tl in cur_tbl):
                         candidate_blocks.append(('table', tbl_start, lineno - 1, tuple(cur_tbl)))
                     in_tbl = False
                     cur_tbl = []
@@ -3969,13 +4249,13 @@ class DocumentTab(ttk.Frame):
             if stripped.startswith('|') and stripped.endswith('|'):
                 if not in_tbl:
                     in_tbl = True
-                    cur_tbl = [stripped]
+                    cur_tbl = [line]
                     tbl_start = lineno
                 else:
-                    cur_tbl.append(stripped)
+                    cur_tbl.append(line)
             else:
                 if in_tbl:
-                    if any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl) for tl in cur_tbl):
+                    if any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl.strip()) for tl in cur_tbl):
                         candidate_blocks.append(('table', tbl_start, lineno - 1, tuple(cur_tbl)))
                     in_tbl = False
                     cur_tbl = []
@@ -3995,10 +4275,11 @@ class DocumentTab(ttk.Frame):
                     if m_html and not m_html.group(2).startswith('data:'):
                         candidate_blocks.append(('image', lineno, m_html.group(1), 'html', m_html.group(1), m_html.group(2), ''))
 
-        if in_tbl and any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl) for tl in cur_tbl):
+        if in_tbl and any(re.match(r'^\|(\s*:?-+:?\s*\|)+$', tl.strip()) for tl in cur_tbl):
             candidate_blocks.append(('table', tbl_start, len(lines), tuple(cur_tbl)))
 
-        new_sig = (tuple(candidate_blocks), dark, font_family, font_size, content_w, base_path)
+        tbl_style_sig = tuple(sorted(_resolve_table_style(self.theme, dark).items()))
+        new_sig = (tuple(candidate_blocks), dark, font_family, font_size, content_w, base_path, tbl_style_sig)
         if getattr(self, '_last_embedded_sig', None) == new_sig:
             for blk in candidate_blocks:
                 if blk[0] == 'table':
@@ -4026,7 +4307,8 @@ class DocumentTab(ttk.Frame):
                         is_dark=dark,
                         visual_font=font_family,
                         visual_font_size=font_size,
-                        content_width=content_w
+                        content_width=content_w,
+                        theme=self.theme
                     )
                     self.source_editor.window_create(f"{s_line}.0", window=tbl_widget)
                     self._embedded_windows.append(tbl_widget)
@@ -5581,7 +5863,7 @@ class OutlinePanel(ttk.Frame):
                     table_rows_count = 1
                     table_cols_count = len(cells)
                 else:
-                    if not all(re.match(r'^:?-+:?$', c) for c in cells if c):
+                    if not _is_md_table_sep_row(cells):
                         table_rows_count += 1
                     table_cols_count = max(table_cols_count, len(cells))
             else:
@@ -6102,6 +6384,18 @@ class MarkdownNotepad(tk.Tk):
         'blockquote_padding': 16,
         'blockquote_spacing': 4,
         'blockquote_justify': 'left',
+        # Table customization (empty strings mean inherit from active theme)
+        'table_preset': 'Default (Auto Theme)',
+        'table_header_bg': '',
+        'table_header_fg': '',
+        'table_row_bg': '',
+        'table_row_alt_bg': '',
+        'table_cell_fg': '',
+        'table_border_color': '',
+        'table_striped': True,
+        'table_border_style': 'grid',
+        'table_cell_pad_y': 3,
+        'table_header_bold': True,
     }
 
     ZOOM_STEPS = [25, 50, 75, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400]
@@ -6582,6 +6876,7 @@ class MarkdownNotepad(tk.Tk):
         format_menu.add_command(label="Numbered List", command=lambda: self._insert_line_prefix("1. "))
         format_menu.add_command(label="Blockquote", command=lambda: self._insert_line_prefix("> "), accelerator="Ctrl+Shift+Q")
         format_menu.add_command(label="Customize Blockquote Style...", command=self.open_blockquote_style_dialog)
+        format_menu.add_command(label="Customize Table Style...", command=self.open_table_style_dialog)
         format_menu.add_separator()
         format_menu.add_command(label="Insert Table...", command=self.insert_table, accelerator="Alt+T")
         format_menu.add_command(label="Code Block", command=lambda: self._insert_text("\n```\n\n```\n"), accelerator="Ctrl+Shift+K")
@@ -10212,6 +10507,10 @@ class MarkdownNotepad(tk.Tk):
     def open_blockquote_style_dialog(self):
         """Open blockquote customization dialog"""
         BlockquoteStyleDialog(self, self.theme, self._apply_theme)
+
+    def open_table_style_dialog(self):
+        """Open table style customization dialog"""
+        TableStyleDialog(self, self.theme, self._apply_theme)
     
     def _apply_theme(self, new_theme):
         """Apply a new theme to the application"""
@@ -10451,7 +10750,7 @@ class ThemeDialog(tk.Toplevel):
         vls_combo.pack(side=tk.LEFT, padx=2)
         
         # Desk (background behind the page)
-        desk_frame = ttk.LabelFrame(controls_col, text="Page Layout & Blockquote", padding=10)
+        desk_frame = ttk.LabelFrame(controls_col, text="Page Layout, Blockquote & Table", padding=10)
         desk_frame.pack(fill=tk.X, pady=5)
         
         dbg_frame = ttk.Frame(desk_frame)
@@ -10469,6 +10768,11 @@ class ThemeDialog(tk.Toplevel):
             bq_btn_row,
             text="❝ Customize Blockquote Style...",
             command=lambda: BlockquoteStyleDialog(self, self.theme, self._on_blockquote_updated)
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            bq_btn_row,
+            text="⊞ Customize Table Style...",
+            command=lambda: TableStyleDialog(self, self.theme, self._on_table_style_updated)
         ).pack(side=tk.LEFT)
         
         # Font Detection Section
@@ -10656,8 +10960,8 @@ class ThemeDialog(tk.Toplevel):
         bq_scaled = max(7, min(13, int(round((bq_raw_sz if bq_raw_sz > 0 else v_size_raw) * 0.78))))
         bq_style = self.theme.get('blockquote_style') or 'italic'
         bq_justify = self.theme.get('blockquote_justify') or 'left'
-        bq_y0 = mt + 36 + line_gap * 2 + 12
-        bq_y1 = bq_y0 + 44
+        bq_y0 = mt + 35 + line_gap * 2 + 8
+        bq_y1 = bq_y0 + 34
         c.create_rectangle(ml + 6, bq_y0, mr - 6, bq_y1, fill=bq_bg, outline="", tags="preview_page")
         c.create_line(ml + 8, bq_y0, ml + 8, bq_y1, fill=bq_bar, width=4, tags="preview_page")
         bq_tx = ml + 18 if bq_justify == 'left' else ((ml + mr) // 2 if bq_justify == 'center' else mr - 14)
@@ -10669,12 +10973,48 @@ class ThemeDialog(tk.Toplevel):
             width=max(160, text_wrap_w - 30), tags="preview_page"
         )
 
-        # Sample Bulleted List Rows inside Page
-        c.create_text(
-            ml + 10, min(mb - 24, bq_y1 + 10),
-            text=f"• Line spacing: {ls_val:.1f}x\n• Secondary formatted note sample",
-            font=(v_font, max(7, v_scaled - 1)), fill=v_fg, anchor="nw", tags="preview_page"
-        )
+        # Mini-Table Preview inside Page
+        tbl_y0 = bq_y1 + 10
+        avail_tbl_h = mb - tbl_y0 - 4
+        if avail_tbl_h >= 42:
+            ts = _resolve_table_style(self.theme, self._is_dark_hex(v_bg))
+            row_h = min(20, max(14, avail_tbl_h // 3))
+            tx0, tx1 = ml + 6, mr - 6
+            t_mid = (tx0 + tx1) // 2
+            tbl_y1 = tbl_y0 + row_h * 3
+            tbl_font_sz = max(7, min(10, v_scaled - 1))
+            hdr_font = (v_font, tbl_font_sz, "bold") if ts['header_bold'] else (v_font, tbl_font_sz)
+            cell_font = (v_font, tbl_font_sz)
+
+            c.create_rectangle(tx0, tbl_y0, tx1, tbl_y0 + row_h, fill=ts['header_bg'], outline="", tags="preview_page")
+            c.create_rectangle(tx0, tbl_y0 + row_h, tx1, tbl_y0 + row_h * 2, fill=ts['row_bg'], outline="", tags="preview_page")
+            r2_bg = ts['row_alt_bg'] if ts['striped'] else ts['row_bg']
+            c.create_rectangle(tx0, tbl_y0 + row_h * 2, tx1, tbl_y1, fill=r2_bg, outline="", tags="preview_page")
+
+            bcol = ts['border']
+            bstyle = ts['border_style']
+            if bstyle == 'grid':
+                c.create_rectangle(tx0, tbl_y0, tx1, tbl_y1, fill="", outline=bcol, width=1, tags="preview_page")
+                c.create_line(t_mid, tbl_y0, t_mid, tbl_y1, fill=bcol, width=1, tags="preview_page")
+                c.create_line(tx0, tbl_y0 + row_h, tx1, tbl_y0 + row_h, fill=bcol, width=1, tags="preview_page")
+                c.create_line(tx0, tbl_y0 + row_h * 2, tx1, tbl_y0 + row_h * 2, fill=bcol, width=1, tags="preview_page")
+            elif bstyle == 'horizontal':
+                c.create_line(tx0, tbl_y0, tx1, tbl_y0, fill=bcol, width=1, tags="preview_page")
+                c.create_line(tx0, tbl_y0 + row_h, tx1, tbl_y0 + row_h, fill=bcol, width=2, tags="preview_page")
+                c.create_line(tx0, tbl_y0 + row_h * 2, tx1, tbl_y0 + row_h * 2, fill=bcol, width=1, tags="preview_page")
+                c.create_line(tx0, tbl_y1, tx1, tbl_y1, fill=bcol, width=1, tags="preview_page")
+            else:
+                c.create_line(tx0, tbl_y0 + row_h, tx1, tbl_y0 + row_h, fill=bcol, width=1, tags="preview_page")
+
+            tbl_rows_txt = [
+                ("Column A", "Column B", hdr_font, ts['header_fg']),
+                ("Alpha", f"Spacing {ls_val:.1f}x", cell_font, ts['cell_fg']),
+                ("Beta", "Sample cell", cell_font, ts['cell_fg']),
+            ]
+            for r_i, (c1_t, c2_t, fnt, fg_c) in enumerate(tbl_rows_txt):
+                ry_mid = tbl_y0 + r_i * row_h + row_h // 2
+                c.create_text(tx0 + 8, ry_mid, text=c1_t, font=fnt, fill=fg_c, anchor="w", tags="preview_page")
+                c.create_text(t_mid + 8, ry_mid, text=c2_t, font=fnt, fill=fg_c, anchor="w", tags="preview_page")
 
         # 4. Source Editor Template Card
         sy0 = py1 + 12
@@ -10701,6 +11041,12 @@ class ThemeDialog(tk.Toplevel):
 
     def _on_blockquote_updated(self, updated_theme):
         """Merge blockquote updates from BlockquoteStyleDialog into ThemeDialog's working theme."""
+        self.theme.update(updated_theme)
+        self._update_template_preview()
+        self.on_apply(self.theme)
+
+    def _on_table_style_updated(self, updated_theme):
+        """Merge table style updates from TableStyleDialog into ThemeDialog's working theme."""
         self.theme.update(updated_theme)
         self._update_template_preview()
         self.on_apply(self.theme)
@@ -10800,6 +11146,14 @@ class ThemeDialog(tk.Toplevel):
 
         for chrome_key in ('ribbon_bg', 'status_bg', 'status_fg', 'accent_purple'):
             self.theme[chrome_key] = default[chrome_key]
+
+        for tbl_key in (
+            'table_preset', 'table_header_bg', 'table_header_fg',
+            'table_row_bg', 'table_row_alt_bg', 'table_cell_fg',
+            'table_border_color', 'table_striped', 'table_border_style',
+            'table_cell_pad_y', 'table_header_bold',
+        ):
+            self.theme[tbl_key] = default[tbl_key]
 
         self.source_bg_var.set(default['source_bg'])
         self.source_bg_preview.config(bg=default['source_bg'])
@@ -10967,6 +11321,306 @@ class BlockquoteStyleDialog(tk.Toplevel):
             'blockquote_spacing': _safe_bq_int(self.space_var, 4, 0, 32),
             'blockquote_justify': self.justify_var.get(),
         })
+        if self.on_apply:
+            self.on_apply(self.theme)
+        self.destroy()
+
+
+class TableStyleDialog(tk.Toplevel):
+    """Dialog for customizing Markdown table visual appearance:
+    style presets, header/row/border colors, border style, striping, header bold, and cell padding.
+    """
+
+    def __init__(self, parent, current_theme, on_apply):
+        super().__init__(parent)
+        self.parent = parent
+        self.theme = current_theme.copy()
+        self.on_apply = on_apply
+
+        self.title("Customize Table Style")
+        self.transient(parent)
+        self.grab_set()
+
+        self._setup_ui()
+        _fit_and_center_dialog(self, parent, 560, 640)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _setup_ui(self):
+        frame = ttk.Frame(self, padding=14)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Preset selector
+        preset_frame = ttk.LabelFrame(frame, text="Table Style Preset", padding=8)
+        preset_frame.pack(fill=tk.X, pady=(0, 8))
+
+        p_row = ttk.Frame(preset_frame)
+        p_row.pack(fill=tk.X)
+        ttk.Label(p_row, text="Preset:", width=14).pack(side=tk.LEFT)
+        preset_names = list(TABLE_STYLE_PRESETS.keys())
+        cur_preset = self.theme.get('table_preset', 'Default (Auto Theme)')
+        if cur_preset not in TABLE_STYLE_PRESETS:
+            cur_preset = 'Default (Auto Theme)'
+        self.preset_var = tk.StringVar(value=cur_preset)
+        preset_cb = ttk.Combobox(
+            p_row, textvariable=self.preset_var,
+            values=preset_names, state='readonly', width=26
+        )
+        preset_cb.pack(side=tk.LEFT, padx=4)
+        preset_cb.bind("<<ComboboxSelected>>", self._on_preset_selected)
+
+        # Colors group
+        col_frame = ttk.LabelFrame(frame, text="Colors (leave blank for automatic theme colors)", padding=8)
+        col_frame.pack(fill=tk.X, pady=(0, 8))
+
+        self.color_vars = {
+            'table_header_bg': tk.StringVar(value=self.theme.get('table_header_bg', '')),
+            'table_header_fg': tk.StringVar(value=self.theme.get('table_header_fg', '')),
+            'table_row_bg': tk.StringVar(value=self.theme.get('table_row_bg', '')),
+            'table_row_alt_bg': tk.StringVar(value=self.theme.get('table_row_alt_bg', '')),
+            'table_cell_fg': tk.StringVar(value=self.theme.get('table_cell_fg', '')),
+            'table_border_color': tk.StringVar(value=self.theme.get('table_border_color', '')),
+        }
+        self._color_swatches = {}
+
+        color_specs = (
+            ("Header Bg:", 'table_header_bg'),
+            ("Header Text:", 'table_header_fg'),
+            ("Row Bg:", 'table_row_bg'),
+            ("Alt Row Bg:", 'table_row_alt_bg'),
+            ("Cell Text:", 'table_cell_fg'),
+            ("Border Color:", 'table_border_color'),
+        )
+        for label_text, key in color_specs:
+            var = self.color_vars[key]
+            row = ttk.Frame(col_frame)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=label_text, width=14).pack(side=tk.LEFT)
+            swatch = tk.Label(row, width=3, relief=tk.SUNKEN, bg="#ffffff")
+            swatch.pack(side=tk.LEFT, padx=(0, 6))
+            self._color_swatches[key] = swatch
+            ttk.Entry(row, textvariable=var, width=12).pack(side=tk.LEFT, padx=2)
+            ttk.Button(
+                row, text="Pick...", width=7,
+                command=lambda k=key, v=var: self._pick_color(k, v)
+            ).pack(side=tk.LEFT, padx=3)
+            ttk.Button(
+                row, text="Auto", width=6,
+                command=lambda v=var: v.set('')
+            ).pack(side=tk.LEFT, padx=2)
+
+        # Layout & Border Options
+        opt_frame = ttk.LabelFrame(frame, text="Borders, Striping & Padding", padding=8)
+        opt_frame.pack(fill=tk.X, pady=(0, 8))
+
+        o1 = ttk.Frame(opt_frame)
+        o1.pack(fill=tk.X, pady=2)
+        ttk.Label(o1, text="Border Style:", width=14).pack(side=tk.LEFT)
+        cur_bstyle = self.theme.get('table_border_style', 'grid')
+        if cur_bstyle not in ('grid', 'horizontal', 'minimal'):
+            cur_bstyle = 'grid'
+        self.border_style_var = tk.StringVar(value=cur_bstyle)
+        ttk.Combobox(
+            o1, textvariable=self.border_style_var,
+            values=['grid', 'horizontal', 'minimal'], state='readonly', width=14
+        ).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(o1, text="Cell padding Y (px):").pack(side=tk.LEFT, padx=(14, 4))
+        try:
+            init_pad = max(1, min(10, int(self.theme.get('table_cell_pad_y', 3) or 3)))
+        except (ValueError, TypeError):
+            init_pad = 3
+        self.pad_y_var = tk.IntVar(value=init_pad)
+        ttk.Spinbox(o1, from_=1, to=10, textvariable=self.pad_y_var, width=5).pack(side=tk.LEFT)
+
+        o2 = ttk.Frame(opt_frame)
+        o2.pack(fill=tk.X, pady=(4, 0))
+        self.striped_var = tk.BooleanVar(value=bool(self.theme.get('table_striped', True)))
+        ttk.Checkbutton(o2, text="Striped alternating rows", variable=self.striped_var).pack(side=tk.LEFT, padx=(0, 14))
+        self.header_bold_var = tk.BooleanVar(value=bool(self.theme.get('table_header_bold', True)))
+        ttk.Checkbutton(o2, text="Bold header text", variable=self.header_bold_var).pack(side=tk.LEFT)
+
+        # Live mini-table preview
+        prev_frame = ttk.LabelFrame(frame, text="Live Table Preview", padding=8)
+        prev_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        self.preview_canvas = tk.Canvas(
+            prev_frame, height=130, bg="#ffffff",
+            relief=tk.SUNKEN, bd=1, highlightthickness=0
+        )
+        self.preview_canvas.pack(fill=tk.BOTH, expand=True)
+        self.preview_canvas.bind("<Configure>", self._update_preview)
+
+        # Wire live updates
+        for var in list(self.color_vars.values()) + [
+            self.border_style_var, self.pad_y_var, self.striped_var, self.header_bold_var
+        ]:
+            var.trace_add("write", self._update_preview)
+
+        self._update_preview()
+
+        # Action buttons
+        btns = ttk.Frame(frame)
+        btns.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btns, text="Apply", command=self._apply, width=10).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Reset Defaults", command=self._reset).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=self.destroy, width=10).pack(side=tk.RIGHT, padx=4)
+
+    def _collect_preview_theme(self) -> dict:
+        def _safe_pad() -> int:
+            try:
+                return max(1, min(10, int(self.pad_y_var.get())))
+            except Exception:
+                return 3
+
+        def _safe_opt_hex(val: str) -> str:
+            s = (val or '').strip()
+            return ThemeDialog._safe_hex(s, '') if s else ''
+
+        return {
+            **self.theme,
+            'table_preset': self.preset_var.get(),
+            'table_header_bg': _safe_opt_hex(self.color_vars['table_header_bg'].get()),
+            'table_header_fg': _safe_opt_hex(self.color_vars['table_header_fg'].get()),
+            'table_row_bg': _safe_opt_hex(self.color_vars['table_row_bg'].get()),
+            'table_row_alt_bg': _safe_opt_hex(self.color_vars['table_row_alt_bg'].get()),
+            'table_cell_fg': _safe_opt_hex(self.color_vars['table_cell_fg'].get()),
+            'table_border_color': _safe_opt_hex(self.color_vars['table_border_color'].get()),
+            'table_striped': bool(self.striped_var.get()),
+            'table_border_style': self.border_style_var.get(),
+            'table_cell_pad_y': _safe_pad(),
+            'table_header_bold': bool(self.header_bold_var.get()),
+        }
+
+    def _on_preset_selected(self, event=None):
+        name = self.preset_var.get()
+        preset = TABLE_STYLE_PRESETS.get(name)
+        if not preset:
+            return
+        for key, var in self.color_vars.items():
+            var.set(preset.get(key, ''))
+        self.striped_var.set(bool(preset.get('table_striped', True)))
+        self.border_style_var.set(preset.get('table_border_style', 'grid'))
+        self.pad_y_var.set(int(preset.get('table_cell_pad_y', 3)))
+        self.header_bold_var.set(bool(preset.get('table_header_bold', True)))
+        self._update_preview()
+
+    def _pick_color(self, key: str, var: tk.StringVar):
+        is_dark = ThemeDialog._is_dark_hex(self.theme.get('visual_bg', '#ffffff'))
+        resolved = _resolve_table_style(self._collect_preview_theme(), is_dark)
+        swatch_key_map = {
+            'table_header_bg': 'header_bg',
+            'table_header_fg': 'header_fg',
+            'table_row_bg': 'row_bg',
+            'table_row_alt_bg': 'row_alt_bg',
+            'table_cell_fg': 'cell_fg',
+            'table_border_color': 'border',
+        }
+        initial = ThemeDialog._safe_hex(var.get(), '') or resolved[swatch_key_map[key]]
+        color = colorchooser.askcolor(color=initial, parent=self)
+        if color and color[1]:
+            var.set(color[1])
+
+    def _update_preview(self, *args):
+        if not hasattr(self, 'preview_canvas'):
+            return
+        v_bg = ThemeDialog._safe_hex(self.theme.get('visual_bg', '#ffffff'), '#ffffff')
+        is_dark = ThemeDialog._is_dark_hex(v_bg)
+        preview_theme = self._collect_preview_theme()
+        ts = _resolve_table_style(preview_theme, is_dark)
+
+        swatch_key_map = {
+            'table_header_bg': ts['header_bg'],
+            'table_header_fg': ts['header_fg'],
+            'table_row_bg': ts['row_bg'],
+            'table_row_alt_bg': ts['row_alt_bg'],
+            'table_cell_fg': ts['cell_fg'],
+            'table_border_color': ts['border'],
+        }
+        for key, col in swatch_key_map.items():
+            sw = self._color_swatches.get(key)
+            if sw is not None:
+                try:
+                    sw.config(bg=col)
+                except tk.TclError:
+                    pass
+
+        c = self.preview_canvas
+        c.delete("all")
+        c.config(bg=v_bg)
+        cw = max(320, c.winfo_width())
+        ch = max(120, c.winfo_height())
+
+        pad_y = ts['cell_pad_y']
+        row_h = max(18, min(28, 16 + pad_y * 2))
+        total_h = row_h * 4
+        if total_h > ch - 12:
+            row_h = max(16, (ch - 12) // 4)
+            total_h = row_h * 4
+
+        x0 = 14
+        x1 = cw - 14
+        y0 = max(6, (ch - total_h) // 2)
+        y1 = y0 + total_h
+        col_w = (x1 - x0) // 3
+        cx1 = x0 + col_w
+        cx2 = x0 + col_w * 2
+
+        c.create_rectangle(x0, y0, x1, y0 + row_h, fill=ts['header_bg'], outline="")
+        for r_idx in range(3):
+            ry0 = y0 + (r_idx + 1) * row_h
+            r_bg = ts['row_alt_bg'] if (ts['striped'] and r_idx % 2 == 1) else ts['row_bg']
+            c.create_rectangle(x0, ry0, x1, ry0 + row_h, fill=r_bg, outline="")
+
+        bcol = ts['border']
+        bstyle = ts['border_style']
+        if bstyle == 'grid':
+            c.create_rectangle(x0, y0, x1, y1, fill="", outline=bcol, width=1)
+            for cx in (cx1, cx2):
+                c.create_line(cx, y0, cx, y1, fill=bcol, width=1)
+            for r_i in range(1, 4):
+                ry = y0 + r_i * row_h
+                c.create_line(x0, ry, x1, ry, fill=bcol, width=1)
+        elif bstyle == 'horizontal':
+            c.create_line(x0, y0, x1, y0, fill=bcol, width=1)
+            c.create_line(x0, y0 + row_h, x1, y0 + row_h, fill=bcol, width=2)
+            for r_i in (2, 3):
+                ry = y0 + r_i * row_h
+                c.create_line(x0, ry, x1, ry, fill=bcol, width=1)
+            c.create_line(x0, y1, x1, y1, fill=bcol, width=1)
+        else:
+            c.create_line(x0, y0 + row_h, x1, y0 + row_h, fill=bcol, width=1)
+
+        v_font = (self.theme.get('visual_font') or VISUAL_FONT or SANS_FONT or 'Segoe UI')
+        hdr_font = (v_font, 9, 'bold') if ts['header_bold'] else (v_font, 9)
+        cell_font = (v_font, 9)
+
+        sample_rows = [
+            ("Item", "Category", "Value"),
+            ("Alpha", "Primary", "12.4"),
+            ("Beta", "Secondary", "27.8"),
+            ("Gamma", "Tertiary", "41.0"),
+        ]
+        xs = (x0 + 8, cx1 + 8, cx2 + 8)
+        for r_i, vals in enumerate(sample_rows):
+            ry_mid = y0 + r_i * row_h + row_h // 2
+            fnt = hdr_font if r_i == 0 else cell_font
+            fg_c = ts['header_fg'] if r_i == 0 else ts['cell_fg']
+            for c_i, txt in enumerate(vals):
+                c.create_text(xs[c_i], ry_mid, text=txt, font=fnt, fill=fg_c, anchor="w")
+
+    def _reset(self):
+        default = MarkdownNotepad.DEFAULT_THEME
+        self.preset_var.set(default.get('table_preset', 'Default (Auto Theme)'))
+        for key, var in self.color_vars.items():
+            var.set(default.get(key, ''))
+        self.striped_var.set(bool(default.get('table_striped', True)))
+        self.border_style_var.set(default.get('table_border_style', 'grid'))
+        self.pad_y_var.set(int(default.get('table_cell_pad_y', 3)))
+        self.header_bold_var.set(bool(default.get('table_header_bold', True)))
+        self._update_preview()
+
+    def _apply(self):
+        self.theme.update(self._collect_preview_theme())
         if self.on_apply:
             self.on_apply(self.theme)
         self.destroy()

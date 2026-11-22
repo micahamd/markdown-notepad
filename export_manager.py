@@ -126,6 +126,38 @@ def _build_css(theme: Optional[Dict] = None, page_settings: Optional[Dict] = Non
         line_spacing = max(1.0, min(3.0, float((theme or {}).get('line_spacing', 1.6) or 1.6)))
     except (TypeError, ValueError):
         line_spacing = 1.6
+
+    tbl_border = _normalize_hex((theme or {}).get('table_border_color', '')) or '#ccc'
+    tbl_hdr_bg = _normalize_hex((theme or {}).get('table_header_bg', '')) or '#f0f0f0'
+    tbl_hdr_fg = _normalize_hex((theme or {}).get('table_header_fg', ''))
+    tbl_row_bg = _normalize_hex((theme or {}).get('table_row_bg', ''))
+    tbl_alt_bg = _normalize_hex((theme or {}).get('table_row_alt_bg', '')) or '#fafafa'
+    tbl_cell_fg = _normalize_hex((theme or {}).get('table_cell_fg', ''))
+    tbl_striped = True if theme is None else bool(theme.get('table_striped', True))
+    tbl_bstyle = ((theme or {}).get('table_border_style', 'grid') or 'grid').strip().lower()
+    tbl_hdr_bold = True if theme is None else bool(theme.get('table_header_bold', True))
+
+    if tbl_bstyle == 'horizontal':
+        tbl_th_td_border = f"border: none; border-top: 1px solid {tbl_border}; border-bottom: 1px solid {tbl_border};"
+        tbl_th_border_extra = ""
+    elif tbl_bstyle == 'minimal':
+        tbl_th_td_border = "border: none;"
+        tbl_th_border_extra = f"\n        border-bottom: 2px solid {tbl_border};"
+    else:
+        tbl_th_td_border = f"border: 1px solid {tbl_border};"
+        tbl_th_border_extra = ""
+
+    tbl_cell_fg_css = f"\n        color: {tbl_cell_fg};" if tbl_cell_fg else ""
+    tbl_td_bg_css = f"\n    td {{\n        background: {tbl_row_bg};\n    }}" if tbl_row_bg else ""
+    tbl_hdr_fg_css = f"\n        color: {tbl_hdr_fg};" if tbl_hdr_fg else ""
+    tbl_hdr_weight = 'bold' if tbl_hdr_bold else 'normal'
+    if tbl_striped:
+        if tbl_row_bg:
+            tbl_stripe_css = f"\n    tr:nth-child(even), tr:nth-child(even) td {{\n        background: {tbl_alt_bg};\n    }}"
+        else:
+            tbl_stripe_css = f"\n    tr:nth-child(even) {{\n        background: {tbl_alt_bg};\n    }}"
+    else:
+        tbl_stripe_css = ""
     
     page_size = 'A4'
     margin = '2cm'
@@ -232,17 +264,14 @@ def _build_css(theme: Optional[Dict] = None, page_settings: Optional[Dict] = Non
         margin: 1em 0;
     }}
     th, td {{
-        border: 1px solid #ccc;
+        {tbl_th_td_border}
         padding: 0.5em 0.75em;
-        text-align: left;
-    }}
+        text-align: left;{tbl_cell_fg_css}
+    }}{tbl_td_bg_css}
     th {{
-        background: #f0f0f0;
-        font-weight: bold;
-    }}
-    tr:nth-child(even) {{
-        background: #fafafa;
-    }}
+        background: {tbl_hdr_bg};
+        font-weight: {tbl_hdr_weight};{tbl_hdr_fg_css}{tbl_th_border_extra}
+    }}{tbl_stripe_css}
     img {{
         max-width: 100%;
         height: auto;
@@ -297,6 +326,83 @@ _COLOR_SPAN_RE = re.compile(
     r'<span\s+style=["\']\s*color\s*:\s*(#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?)\s*;?\s*["\']\s*>(.*?)</span>',
     re.IGNORECASE | re.DOTALL,
 )
+_SAFE_FONT_FAMILY_RE = re.compile(r'^[A-Za-z0-9 _\-]{1,60}$')
+_STYLE_SPAN_RE = re.compile(
+    r'<span\s+style=(?P<q>["\'])(?P<style>(?:(?!(?P=q))[^\n])+)(?P=q)\s*>(?P<body>.*?)</span>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _normalize_hex(val: Optional[str]) -> Optional[str]:
+    """Normalize a 3- or 6-digit #hex color string to lowercase #rrggbb, else None."""
+    if not val or not isinstance(val, str):
+        return None
+    m = re.fullmatch(r'#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})', val.strip())
+    if not m:
+        return None
+    h = m.group(1).lower()
+    if len(h) == 3:
+        h = ''.join(ch * 2 for ch in h)
+    return f'#{h}'
+
+
+def _parse_safe_span_style(style_str: str) -> Dict[str, Any]:
+    """Parse and strictly sanitize inline span CSS declarations."""
+    props: Dict[str, Any] = {}
+    if not style_str or not isinstance(style_str, str):
+        return props
+    for decl in style_str.split(';'):
+        decl = decl.strip()
+        if not decl or ':' not in decl:
+            continue
+        prop, val = decl.split(':', 1)
+        prop = prop.strip().lower()
+        val = val.strip()
+        if prop == 'color':
+            norm = _normalize_hex(val)
+            if norm:
+                props['color'] = norm
+        elif prop == 'font-family':
+            fam = val.strip().strip('\'"').strip()
+            if fam and _SAFE_FONT_FAMILY_RE.fullmatch(fam):
+                props['font_family'] = fam
+        elif prop == 'font-size':
+            m = re.fullmatch(r'(\d+)\s*pt', val, re.IGNORECASE)
+            if m:
+                props['font_size'] = max(6, min(72, int(m.group(1))))
+        elif prop == 'text-decoration':
+            tokens = val.lower().split()
+            if tokens and all(t in ('underline', 'line-through') for t in tokens):
+                if 'underline' in tokens:
+                    props['underline'] = True
+                if 'line-through' in tokens:
+                    props['strike'] = True
+    return props
+
+
+def _format_safe_span_style(props: Dict[str, Any]) -> str:
+    """Format validated inline span style properties into a canonical CSS string."""
+    if not props:
+        return ""
+    parts: List[str] = []
+    color = _normalize_hex(props.get('color'))
+    if color:
+        parts.append(f"color:{color}")
+    fam = props.get('font_family')
+    if isinstance(fam, str) and _SAFE_FONT_FAMILY_RE.fullmatch(fam):
+        parts.append(f"font-family:'{fam}'")
+    fsize = props.get('font_size')
+    if isinstance(fsize, int) and not isinstance(fsize, bool):
+        clamped = max(6, min(72, fsize))
+        parts.append(f"font-size:{clamped}pt")
+    deco: List[str] = []
+    if props.get('underline'):
+        deco.append('underline')
+    if props.get('strike'):
+        deco.append('line-through')
+    if deco:
+        parts.append(f"text-decoration:{' '.join(deco)}")
+    return ";".join(parts)
 
 
 def _protect_code_for_preprocess(text: str, placeholders: List[str]) -> str:
@@ -363,10 +469,17 @@ def _render_footnote_body_html(raw_body: str) -> str:
         rendered = _html.escape(_export_latex_to_unicode(m.group(1)), quote=True)
         return _stash(f'<span class="math-inline">{rendered}</span>')
 
-    def _sub_color(m: re.Match) -> str:
-        hex_col = m.group(1)
-        inner = _render_footnote_body_html(m.group(2))
-        return _stash(f'<span style="color:{hex_col}">{inner}</span>')
+    def _sub_span(m: re.Match) -> str:
+        props = _parse_safe_span_style(m.group('style'))
+        inner = _render_footnote_body_html(m.group('body'))
+        safe_css = _format_safe_span_style(props)
+        if not safe_css:
+            return _stash(inner)
+        return _stash(f'<span style="{safe_css}">{inner}</span>')
+
+    def _sub_uline(m: re.Match) -> str:
+        inner = _render_footnote_body_html(m.group(1))
+        return _stash(f'<u>{inner}</u>')
 
     def _sub_mark(m: re.Match) -> str:
         inner = _render_footnote_body_html(m.group(1))
@@ -375,7 +488,8 @@ def _render_footnote_body_html(raw_body: str) -> str:
     work = re.sub(r'\[@(?:anchor|def):\s*([^\]\n]+)\]', _sub_anchor, raw_body, flags=re.IGNORECASE)
     work = re.sub(r'\[@(?!(?:anchor|def):)([^\]\n]+)\]', _sub_ref, work, flags=re.IGNORECASE)
     work = _INLINE_MATH_RE.sub(_sub_math, work)
-    work = _COLOR_SPAN_RE.sub(_sub_color, work)
+    work = _STYLE_SPAN_RE.sub(_sub_span, work)
+    work = re.sub(r'<u>(.*?)</u>', _sub_uline, work, flags=re.IGNORECASE | re.DOTALL)
     work = re.sub(r'==([^=\n]+)==', _sub_mark, work)
 
     escaped = _html.escape(work, quote=True)
@@ -475,11 +589,17 @@ def _preprocess_anchors_for_html(text: str) -> str:
     )
     # Highlight ==...==
     text = re.sub(r'==([^=\n]+)==', r'<mark>\1</mark>', text)
-    # Preserve validated <span style="color:#rrggbb">...</span>
-    text = _COLOR_SPAN_RE.sub(
-        lambda m: f'<span style="color:{m.group(1)}">{m.group(2)}</span>',
-        text,
-    )
+    # Preserve validated <span style="...">...</span> (unwrap if invalid/empty)
+    def _sub_safe_span(m: re.Match) -> str:
+        props = _parse_safe_span_style(m.group('style'))
+        safe_css = _format_safe_span_style(props)
+        if not safe_css:
+            return m.group('body')
+        return f'<span style="{safe_css}">{m.group("body")}</span>'
+
+    text = _STYLE_SPAN_RE.sub(_sub_safe_span, text)
+    # Preserve <u>...</u> tags
+    text = re.sub(r'<u>(.*?)</u>', r'<u>\1</u>', text, flags=re.IGNORECASE | re.DOTALL)
 
     # Inline footnote refs [^id]
     def sub_fn_ref(m):
@@ -1059,7 +1179,7 @@ def export_to_docx(md_content: str, output_path: str,
             while i < len(lines) and '|' in lines[i]:
                 table_lines.append(lines[i])
                 i += 1
-            _add_table(doc, table_lines, bm_counter)
+            _add_table(doc, table_lines, bm_counter, theme=theme)
             continue
         
         # Standalone Markdown or HTML Image
@@ -1173,7 +1293,8 @@ _DOCX_INLINE_RE = re.compile(
     r'|(?P<ref>\[@(?!(?:anchor|def):)(?P<ref_lbl>[^\]\n]+)\])'
     r'|(?P<fn>\[\^(?P<fn_lbl>[^\]\n]+)\])'
     r'|(?P<link>\[(?P<link_txt>[^\]]+)\]\((?P<link_url>[^)]+)\))'
-    r'|(?P<cspan><span\s+style=["\']\s*color\s*:\s*(?P<cspan_col>#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?)\s*;?\s*["\']\s*>(?P<cspan_body>.*?)</span>)'
+    r'|(?P<cspan><span\s+style=(?P<cspan_q>["\'])(?P<cspan_style>(?:(?!(?P=cspan_q))[^\n])+)(?P=cspan_q)\s*>(?P<cspan_body>.*?)</span>)'
+    r'|(?P<uline><u>(?P<uline_body>.*?)</u>)'
     r'|(?P<mark_html><mark>(?P<mark_html_body>.*?)</mark>)'
     r'|(?P<mark_md>==(?P<mark_md_body>[^=\n]+)==)'
     r'|(?P<strike>~~(?P<strike_body>.+?)~~)'
@@ -1193,6 +1314,7 @@ def _apply_run_style(
     bold: bool = False,
     italic: bool = False,
     strike: bool = False,
+    underline: bool = False,
     highlight: bool = False,
     color_rgb=None,
     font_name: Optional[str] = None,
@@ -1205,6 +1327,8 @@ def _apply_run_style(
         run.italic = True
     if strike:
         run.font.strike = True
+    if underline:
+        run.underline = True
     if highlight:
         run.font.highlight_color = WD_COLOR_INDEX.YELLOW
     if color_rgb is not None:
@@ -1222,6 +1346,7 @@ def _add_inline_formatting(
     bold: bool = False,
     italic: bool = False,
     strike: bool = False,
+    underline: bool = False,
     highlight: bool = False,
     color_rgb=None,
     font_name: Optional[str] = None,
@@ -1235,6 +1360,7 @@ def _add_inline_formatting(
         bold=bold,
         italic=italic,
         strike=strike,
+        underline=underline,
         highlight=highlight,
         color_rgb=color_rgb,
         font_name=font_name,
@@ -1257,6 +1383,7 @@ def _add_inline_formatting(
                 bold=bold,
                 italic=italic,
                 strike=strike,
+                underline=underline,
                 highlight=highlight,
                 color_rgb=color_rgb,
                 font_name='Consolas',
@@ -1292,6 +1419,7 @@ def _add_inline_formatting(
                     bold=bold,
                     italic=italic,
                     strike=strike,
+                    underline=underline,
                     highlight=highlight,
                     color_rgb=color_rgb or RGBColor(0x00, 0x66, 0xCC),
                     font_name=font_name,
@@ -1299,16 +1427,32 @@ def _add_inline_formatting(
                 )
                 run.underline = True
         elif kind == 'cspan':
-            parsed_rgb = _parse_hex_rgb(match.group('cspan_col'))
+            props = _parse_safe_span_style(match.group('cspan_style'))
+            parsed_rgb = _parse_hex_rgb(props.get('color'))
             _add_inline_formatting(
                 paragraph,
                 match.group('cspan_body'),
                 bm_counter,
                 bold=bold,
                 italic=italic,
-                strike=strike,
+                strike=strike or bool(props.get('strike', False)),
+                underline=underline or bool(props.get('underline', False)),
                 highlight=highlight,
                 color_rgb=parsed_rgb if parsed_rgb is not None else color_rgb,
+                font_name=props.get('font_family') or font_name,
+                font_size=props.get('font_size') or font_size,
+            )
+        elif kind == 'uline':
+            _add_inline_formatting(
+                paragraph,
+                match.group('uline_body'),
+                bm_counter,
+                bold=bold,
+                italic=italic,
+                strike=strike,
+                underline=True,
+                highlight=highlight,
+                color_rgb=color_rgb,
                 font_name=font_name,
                 font_size=font_size,
             )
@@ -1321,6 +1465,7 @@ def _add_inline_formatting(
                 bold=bold,
                 italic=italic,
                 strike=strike,
+                underline=underline,
                 highlight=True,
                 color_rgb=color_rgb,
                 font_name=font_name,
@@ -1334,6 +1479,7 @@ def _add_inline_formatting(
                 bold=bold,
                 italic=italic,
                 strike=True,
+                underline=underline,
                 highlight=highlight,
                 color_rgb=color_rgb,
                 font_name=font_name,
@@ -1348,6 +1494,7 @@ def _add_inline_formatting(
                 bold=True,
                 italic=True,
                 strike=strike,
+                underline=underline,
                 highlight=highlight,
                 color_rgb=color_rgb,
                 font_name=font_name,
@@ -1362,6 +1509,7 @@ def _add_inline_formatting(
                 bold=True,
                 italic=italic,
                 strike=strike,
+                underline=underline,
                 highlight=highlight,
                 color_rgb=color_rgb,
                 font_name=font_name,
@@ -1376,6 +1524,7 @@ def _add_inline_formatting(
                 bold=bold,
                 italic=True,
                 strike=strike,
+                underline=underline,
                 highlight=highlight,
                 color_rgb=color_rgb,
                 font_name=font_name,
@@ -1389,6 +1538,7 @@ def _add_inline_formatting(
                 bold=bold,
                 italic=True,
                 strike=strike,
+                underline=underline,
                 highlight=highlight,
                 color_rgb=color_rgb,
                 font_name='Cambria Math',
@@ -1461,12 +1611,26 @@ def _parse_md_table_row(line: str) -> List[str]:
     return [c.strip().replace(r'\|', '|') for c in raw_cells]
 
 
-def _add_table(doc, table_lines: list, bm_counter: Optional[List[int]] = None):
+def _add_table(doc, table_lines: list, bm_counter: Optional[List[int]] = None, theme: Optional[Dict] = None):
     """Add a styled markdown table to the document"""
     if len(table_lines) < 2:
         return
     if bm_counter is None:
         bm_counter = [0]
+
+    _t = theme or {}
+    _hdr_bg_hex = _normalize_hex(_t.get('table_header_bg', ''))
+    hdr_bg = _hdr_bg_hex[1:].upper() if _hdr_bg_hex else 'F1F5F9'
+    _hdr_fg_hex = _normalize_hex(_t.get('table_header_fg', ''))
+    hdr_fg = _parse_hex_rgb(_hdr_fg_hex) or RGBColor(0x0F, 0x17, 0x2A)
+    _row_bg_hex = _normalize_hex(_t.get('table_row_bg', ''))
+    row_bg = _row_bg_hex[1:].upper() if _row_bg_hex else None
+    _alt_bg_hex = _normalize_hex(_t.get('table_row_alt_bg', ''))
+    alt_bg = _alt_bg_hex[1:].upper() if _alt_bg_hex else 'F8FAFC'
+    _cell_fg_hex = _normalize_hex(_t.get('table_cell_fg', ''))
+    cell_fg = _parse_hex_rgb(_cell_fg_hex)
+    striped = True if theme is None else bool(theme.get('table_striped', True))
+    hdr_bold = True if theme is None else bool(theme.get('table_header_bold', True))
     
     # Parse header
     headers = _parse_md_table_row(table_lines[0])
@@ -1503,15 +1667,15 @@ def _add_table(doc, table_lines: list, bm_counter: Optional[List[int]] = None):
         p.paragraph_format.space_after = Pt(4)
         _add_inline_formatting(
             p, header, bm_counter,
-            bold=True,
-            color_rgb=RGBColor(0x0F, 0x17, 0x2A),
+            bold=hdr_bold,
+            color_rgb=hdr_fg,
         )
-        # Add subtle gray shading to header
+        # Add shading to header
         shd = cell._element.get_or_add_tcPr().makeelement(
             qn('w:shd'), {
                 qn('w:val'): 'clear',
                 qn('w:color'): 'auto',
-                qn('w:fill'): 'F1F5F9'
+                qn('w:fill'): hdr_bg
             }
         )
         cell._element.get_or_add_tcPr().append(shd)
@@ -1520,19 +1684,20 @@ def _add_table(doc, table_lines: list, bm_counter: Optional[List[int]] = None):
     for i, row in enumerate(normalized_rows):
         data_row = table.rows[i + 1]
         is_alt = (i % 2 == 1)
+        fill_hex = alt_bg if (striped and is_alt) else row_bg
         for j, cell_text in enumerate(row):
             cell = data_row.cells[j]
             p = cell.paragraphs[0]
             p.text = ''
             p.paragraph_format.space_before = Pt(3)
             p.paragraph_format.space_after = Pt(3)
-            _add_inline_formatting(p, cell_text, bm_counter)
-            if is_alt:
+            _add_inline_formatting(p, cell_text, bm_counter, color_rgb=cell_fg)
+            if fill_hex:
                 shd = cell._element.get_or_add_tcPr().makeelement(
                     qn('w:shd'), {
                         qn('w:val'): 'clear',
                         qn('w:color'): 'auto',
-                        qn('w:fill'): 'F8FAFC'
+                        qn('w:fill'): fill_hex
                     }
                 )
                 cell._element.get_or_add_tcPr().append(shd)
