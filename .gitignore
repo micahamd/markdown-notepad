@@ -2,6 +2,11 @@
 .markitdown_ai_config.json
 .markitdown_session.json
 .markitdown_chat_history/
+.markitdown_notepad_settings.json
+.markitdown_recent_files.json
+.markitdown_tts/
+.markitdown_assets/
+*_assets/
 
 # Python
 __pycache__/
@@ -25,21 +30,24 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environments
+# Virtual environments & secrets
 .env
+.env.*
+*.env
 .venv
 env/
 venv/
 ENV/
 
-# IDE
+# IDE, OS & logs
 .vscode/
 .idea/
+.Rhistory
 *.swp
 *.swo
 *~
-
-# OS
+*.log
+*.tmp
 .DS_Store
 Thumbs.db
 
@@ -47,3 +55,4 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+test_spreadsheet_ai.py
